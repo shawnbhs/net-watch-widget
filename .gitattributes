@@ -1,0 +1,10 @@
+# Normalise line endings so a Windows and a Linux checkout produce the same
+# blobs. Without this, git's autocrlf heuristics rewrite files on checkout and
+# a diff shows every line as changed.
+* text=auto eol=lf
+
+# PowerShell is happier with CRLF, and Windows tooling expects it there.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+*.png binary

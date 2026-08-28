@@ -1,0 +1,50 @@
+# ── Secrets and machine-specific config ───────────────────────────────────────
+# .env holds credential file paths for this machine. Never commit it.
+.env
+.env.local
+*.env
+
+# Anything that looks like a credential store, in case one is ever copied here.
+.credentials.json
+auth.json
+*credentials*.json
+*.pem
+*.key
+*token*.txt
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+ip_bar_log.txt
+*_log.txt
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ── Local backups and old revisions ───────────────────────────────────────────
+# Working copies kept beside the script; history belongs in git, not in files.
+*.BACKUP-*
+*.OLD-*
+*.LOG-SNAPSHOT-*
+*.bak
+*.bak-*
+*.orig
+*~
+
+# ── Editors and OS ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

@@ -1,0 +1,42 @@
+[project]
+name = "net-watch-widget"
+version = "1.0.0"
+description = "Always-on-top Windows desktop widget: network, VPN, system and AI usage at a glance"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = ["psutil>=5.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/shawnbhs/net-watch-widget"
+Issues = "https://github.com/shawnbhs/net-watch-widget/issues"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# The widget is a single dense file where each UI row is one visual line;
+# splitting those statements onto separate lines makes the layout code
+# harder to read, not easier. The rules below are style-only, and every
+# correctness rule (the F set, plus the E rules not listed here) stays on.
+select = ["E", "F", "W"]
+ignore = [
+    "E701",  # colon-joined statements: one UI row per line reads better here
+    "E702",  # semicolon-joined statements: same reason
+    "E501",  # long lines, mostly URL comments and layout constants
+    "E741",  # 'l' as a label variable, consistent throughout the UI code
+    "E401",  # grouped stdlib imports at the top of the file
+    "W291",  # trailing whitespace in the aligned constant tables
+    "W293",
+]
+
+[tool.bandit]
+# B101 assert: not used for control flow here.
+# B404/B603/B607 subprocess: every call passes a fixed argument list with
+#   shell=False. The only two calls carrying variable data are toast(), which
+#   passes it through the environment, and wifi_toggle(), whose interface name
+#   comes from `netsh wlan show interfaces` on this machine.
+# B310 urlopen: reached only through _urlopen(), which rejects any scheme
+#   outside http/https before opening. Verified with a file:// probe.
+skips = ["B101", "B404", "B603", "B607", "B310"]

@@ -1,0 +1,77 @@
+# Security CI.
+#
+# The widget is Windows-only, but every check here is static analysis or
+# history scanning, so it runs on Linux and never needs a desktop session.
+
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, to catch CVEs published against an already-pinned dependency.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install scanners
+        run: pip install --quiet semgrep bandit pip-audit ruff
+
+      - name: Install project dependencies
+        run: pip install --quiet -r requirements.txt
+
+      # One ruleset per run: a registry failure on one must not silently
+      # take the others down with it. --metrics=off disables telemetry.
+      - name: semgrep
+        run: |
+          for cfg in p/python p/security-audit p/secrets p/command-injection; do
+            echo "=== $cfg ==="
+            semgrep --config "$cfg" --metrics=off --error --quiet .
+          done
+
+      - name: bandit
+        run: bandit -r . -ll
+
+      - name: pip-audit
+        run: pip-audit --strict -r requirements.txt
+
+      # Config lives in pyproject.toml, not in flags here, so a contributor
+      # running `ruff check` locally gets exactly CI's verdict.
+      - name: ruff
+        run: ruff check .
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Non-negotiable. A secret removed in a later commit is still in
+          # the history and still valid; a shallow clone cannot see it.
+          fetch-depth: 0
+
+      # The gitleaks BINARY, not gitleaks-action: the action wraps the
+      # scanner in licensing and job-summary logic with its own failure
+      # modes. The binary needs no key and its exit code means what it says.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.21.2
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      - name: Scan full history
+        run: ./gitleaks detect --source . --no-banner --redact -v

@@ -170,6 +170,32 @@ CLAUDE_CRED_PATHS=\\wsl.localhost\Ubuntu\home\youruser\.claude\.credentials.json
 CODEX_CRED_PATHS=\\wsl.localhost\Ubuntu\home\youruser\.codex\auth.json
 ```
 
+### Staying logged in
+
+Tokens are refreshed an hour before they expire, on a timer that runs whether
+or not the usage panel is polling. Without that, a token could quietly lapse
+during a long stretch with the machine off or the network down, turning a
+background refresh into a manual re-login.
+
+If a login does expire, the note line becomes **"login expired — click to sign
+in"**. Clicking opens a console running the CLI's own login. The sign-in itself
+is a browser round-trip — the widget cannot and does not automate it, and it
+never handles your password. If the CLIs are not on your Windows PATH, set
+`AI_LOGIN_CMD_CLAUDE` / `AI_LOGIN_CMD_CODEX` in `.env`.
+
+### "credentials stale" vs "login expired"
+
+These mean different things, and the difference matters when the same account
+is stored in more than one place — a Windows profile *and* a WSL home, say.
+
+The widget uses whichever copy expires latest. If the fresh copy becomes
+unreadable (the WSL distro is stopped, a share is unmounted), only the old copy
+is left, and refreshing from its long-dead token would fail. Rather than report
+that as an expired login and send you off to redo a sign-in that was never
+broken, copies older than the 16-day refresh-token lifetime are ignored and the
+panel says **`credentials stale`** — meaning *the good file is out of reach*,
+not *your login died*.
+
 ---
 
 ## Restarting after an edit

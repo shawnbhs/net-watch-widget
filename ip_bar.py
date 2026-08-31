@@ -1,6 +1,6 @@
 import tkinter as tk
 import threading, time, urllib.request, urllib.error, urllib.parse, subprocess, json
-import sys, os, winreg, ipaddress, socket, re, base64
+import sys, os, winreg, ipaddress, socket, re, base64, shlex
 import random as _rnd
 import datetime as _dt
 import psutil
@@ -2464,6 +2464,19 @@ AI_FAIL_BACKOFF = 1800     # after an error, wait at least this long
 AI_GEO_TTL      = 120      # geo verdict cache (seconds)
 AI_HTTP_TIMEOUT = 20
 
+# Refresh a token this long BEFORE it expires rather than waiting for it to
+# die. Access tokens live hours; refresh tokens weeks. Refreshing only at the
+# moment of use works solely while the widget is running with the network up,
+# so a long idle or offline stretch could let the refresh token lapse and
+# force a genuine interactive re-login.
+AI_REFRESH_LEAD = 3600     # seconds of headroom before expiry
+AI_KEEPALIVE    = 1800     # keepalive thread check interval
+
+# A credential file older than the refresh-token lifetime cannot be revived,
+# so refreshing from one is pointless. It is also actively misleading: see
+# _pick_cred for why a stale copy must be dropped rather than merely ranked.
+AI_CRED_MAX_STALE = 16 * 86400
+
 CLAUDE_UA    = "claude-cli/2.0.32 (external, cli)"
 CLAUDE_USAGE = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_TOKEN = "https://platform.claude.com/v1/oauth/token"
@@ -2490,6 +2503,16 @@ CODEX_CRED_PATHS = cred_paths(
 NOT_CONFIGURED_CLAUDE = "please run 'claude' and log in"
 NOT_CONFIGURED_CODEX  = "please run 'codex' and log in"
 NOT_CONFIGURED = (NOT_CONFIGURED_CLAUDE, NOT_CONFIGURED_CODEX)
+
+# Command used to re-run a CLI's interactive login, launched only by an
+# explicit click on the "login expired" note. The default assumes the CLI is
+# on PATH; users who run the CLIs elsewhere (a WSL distro, a version manager,
+# a non-PATH install) override it in .env, e.g.
+#   AI_LOGIN_CMD_CLAUDE=wsl.exe -d Ubuntu -- bash -lic claude
+AI_LOGIN_CMD = {
+    "claude": env_str("AI_LOGIN_CMD_CLAUDE", "claude"),
+    "codex":  env_str("AI_LOGIN_CMD_CODEX", "codex login"),
+}
 
 # ── geo gate ──────────────────────────────────────────────────────────────────
 _geo = {"ts": 0.0, "ok": False, "cc": "?", "why": "not checked"}
@@ -2605,9 +2628,25 @@ def _write_json_atomic(path, doc):
         return False
 
 
-def _pick_cred(paths, keyfn):
-    """Return (path, doc) of the credential file with the latest expiry."""
+def _pick_cred(paths, keyfn, expiry_ms=False):
+    """Return (path, doc, why) — the credential file with the latest expiry.
+
+    With expiry_ms=True the key is a real epoch-ms expiry, and copies older
+    than the refresh-token lifetime are dropped outright instead of merely
+    ranked last.
+
+    That matters whenever the same account is stored in more than one place —
+    a Windows profile and a WSL home, two machines on a synced folder, an old
+    copy left behind by a migration. Ranking alone is safe only while every
+    path is readable. As soon as the fresh file becomes unreachable (a stopped
+    WSL distro, an unmounted share, a permissions change) the stale copy is
+    silently promoted to best candidate, and refreshing from its long-dead
+    token yields "login expired" for a login that is perfectly healthy. The
+    real fault is an unreadable file; reporting it as an expired session sends
+    the user off to redo a login that was never broken.
+    """
     best = None
+    stale = 0
     for p in paths:
         d = _read_json(p)
         if not d:
@@ -2618,11 +2657,14 @@ def _pick_cred(paths, keyfn):
             continue
         if exp is None:
             continue
+        if expiry_ms and exp / 1000.0 < time.time() - AI_CRED_MAX_STALE:
+            stale += 1
+            continue
         if best is None or exp > best[2]:
             best = (p, d, exp)
     if best:
-        return best[0], best[1]
-    return None, None
+        return best[0], best[1], None
+    return None, None, ("credentials stale or unreadable" if stale else None)
 
 
 def _http_json(url, headers, data=None, timeout=AI_HTTP_TIMEOUT):
@@ -2650,16 +2692,19 @@ def _http_json(url, headers, data=None, timeout=AI_HTTP_TIMEOUT):
 
 
 # ── Claude ────────────────────────────────────────────────────────────────────
-def _claude_token():
-    path, doc = _pick_cred(
-        CLAUDE_CRED_PATHS, lambda d: d.get("claudeAiOauth", {}).get("expiresAt", 0))
+def _claude_token(lead=AI_REFRESH_LEAD):
+    path, doc, why = _pick_cred(
+        CLAUDE_CRED_PATHS, lambda d: d.get("claudeAiOauth", {}).get("expiresAt", 0),
+        expiry_ms=True)
     if not doc:
-        return None, NOT_CONFIGURED_CLAUDE
+        return None, why or NOT_CONFIGURED_CLAUDE
     o = doc["claudeAiOauth"]
     if "user:profile" not in (o.get("scopes") or []):
         return None, "token lacks user:profile"
-    # refresh only when actually needed (rotation is destructive)
-    if o.get("expiresAt", 0) / 1000.0 - 300 > time.time():
+    # Rotation is destructive, so refresh on a deadline rather than on every
+    # call — but with real headroom (lead), not seconds. The keepalive thread
+    # passes a large lead so the swap happens well before anything expires.
+    if o.get("expiresAt", 0) / 1000.0 - lead > time.time():
         return o.get("accessToken"), None
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": o.get("refreshToken"),
@@ -2675,8 +2720,15 @@ def _claude_token():
             o["expiresAt"] = int(time.time() * 1000 + p["expires_in"] * 1000)
         _write_json_atomic(path, doc)
         return o["accessToken"], None
-    if st == 400 and "expired" in (raw or "").lower():
-        return None, "login expired \u2014 run: claude /login"
+    # Only a refusal of the grant itself proves the login is gone. A transport
+    # failure (st == 0: no route, DNS, a dropped tunnel) says nothing about the
+    # credential, and calling that "login expired" sends the user off to redo a
+    # login that was never broken.
+    if st == 0:
+        return None, "offline (%s)" % (raw or "")[:40]
+    if st in (400, 401) and any(k in (raw or "").lower()
+                                for k in ("expired", "invalid_grant", "revoked")):
+        return None, "LOGIN_EXPIRED:claude"
     return None, "refresh failed (%s)" % st
 
 
@@ -2728,11 +2780,11 @@ def fetch_claude_usage():
 
 
 # ── ChatGPT ───────────────────────────────────────────────────────────────────
-def _codex_token():
-    path, doc = _pick_cred(CODEX_CRED_PATHS,
-                           lambda d: len(json.dumps(d.get("tokens", {}))))
+def _codex_token(lead=AI_REFRESH_LEAD):
+    path, doc, why = _pick_cred(CODEX_CRED_PATHS,
+                                lambda d: len(json.dumps(d.get("tokens", {}))))
     if not doc or not doc.get("tokens"):
-        return None, None, NOT_CONFIGURED_CODEX
+        return None, None, why or NOT_CONFIGURED_CODEX
     t = doc["tokens"]
     acct = t.get("account_id") or ""
     exp = 0
@@ -2742,7 +2794,7 @@ def _codex_token():
         exp = json.loads(base64.urlsafe_b64decode(seg)).get("exp", 0)
     except Exception:
         pass
-    if exp and exp - 300 > time.time():
+    if exp and exp - lead > time.time():
         return t.get("access_token"), acct, None
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": t.get("refresh_token"),
@@ -2760,8 +2812,10 @@ def _codex_token():
         doc["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
         _write_json_atomic(path, doc)
         return t["access_token"], acct, None
-    if st == 400:
-        return None, None, "login expired \u2014 run: codex login"
+    if st == 0:
+        return None, None, "offline (%s)" % (raw or "")[:40]
+    if st in (400, 401):
+        return None, None, "LOGIN_EXPIRED:codex"
     return None, None, "refresh failed (%s)" % st
 
 
@@ -2799,6 +2853,53 @@ def fetch_gpt_usage():
     out["limit_reached"] = rl.get("limit_reached")
     out["credits"] = cr.get("balance")
     return out
+
+
+# ── proactive keepalive + interactive re-login ────────────────────────────────
+def ai_keepalive_once():
+    """Roll both tokens forward while they are still valid.
+
+    Runs on its own slow schedule, independent of the usage poll: the poll
+    refreshes only what it is about to use, so a token can still lapse during a
+    long idle stretch. Gated on the same geo verdict as everything else — a
+    refresh is an outbound request to the provider and must never leave a
+    blocked IP.
+    """
+    ok, _cc, _why = geo_verdict()
+    if not ok or AI_LATCH["blocked"]:
+        return
+    for fn in (_claude_token, _codex_token):
+        try:
+            fn(lead=AI_REFRESH_LEAD)
+        except Exception:
+            pass
+
+
+def ai_login_launch(which):
+    """Open a console running the CLI so the user can complete its OAuth login.
+
+    The login is a browser round-trip with a pasted code; it cannot be done
+    headlessly, and nothing here handles a password. All this saves is opening
+    a terminal and typing the command. The command comes from AI_LOGIN_CMD, is
+    split with shlex, and is launched without a shell, so a value in .env
+    cannot smuggle in a second command.
+    """
+    raw = (AI_LOGIN_CMD.get(which) or "").strip()
+    if not raw:
+        return False
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    try:
+        # A visible, independent console: the whole point is that the user
+        # interacts with it, so no CREATE_NO_WINDOW here.
+        subprocess.Popen(argv, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        return True
+    except Exception:
+        return False
 
 
 # ── helpers for display ───────────────────────────────────────────────────────
@@ -2925,6 +3026,7 @@ class IPBar:
         threading.Thread(target=self._loop,daemon=True).start()
         threading.Thread(target=self._hw_loop,daemon=True).start()
         threading.Thread(target=self._ai_loop,daemon=True).start()
+        threading.Thread(target=self._ai_keepalive_loop,daemon=True).start()
         self.root.mainloop()
 
     # ── UI ─────────────────────────────────────────────────────────────────────
@@ -3218,6 +3320,9 @@ class IPBar:
         self.ai_gt_w,self.ai_gt_wr,self.ai_gt_wb = airow("GPT \u00b7 week")
         self.ai_note=tk.Label(r,text="",bg=SURF,fg=SEC,font=F_SM,anchor="w")
         self.ai_note.pack(anchor="w",pady=(3,0))
+        # Becomes clickable only while _ai_login_which is set (see _ai_show).
+        self._ai_login_which=None
+        self.ai_note.bind("<Button-1>",self._ai_login_click)
 
         # ── QUICK CHECKS — two columns of readouts, then one row of pills ──
         self._sep(p); r=self._row(p,SURF,py=5)
@@ -3610,6 +3715,48 @@ class IPBar:
         self._ai_fails=0
         return AI_POLL_BASE*(1+_rnd.uniform(-AI_POLL_JITTER,AI_POLL_JITTER))
 
+    def _ai_keepalive_loop(self):
+        """Roll tokens forward on a slow clock, independent of the usage poll.
+
+        Separate from _ai_loop on purpose: the poll backs off hard after
+        failures and stops entirely when both CLIs are unconfigured, which is
+        exactly when a token would be left to rot.
+        """
+        time.sleep(20)
+        while True:
+            try: ai_keepalive_once()
+            except Exception: pass
+            time.sleep(AI_KEEPALIVE)
+
+    def _ai_login_click(self,_e=None):
+        """Open the CLI's login console, then poll until it lands."""
+        which=self._ai_login_which
+        if not which: return
+        if not ai_login_launch(which):
+            self.ai_note.config(text="cannot launch %s login \u2014 set AI_LOGIN_CMD_%s in .env"
+                                     %(which,which.upper()),fg=RED)
+            return
+        self.ai_note.config(text="finish sign-in in the console window\u2026",
+                            fg=ORG,cursor="")
+        self._ai_login_which=None
+        def watch():
+            # The CLI writes new credentials only after the browser round-trip,
+            # so poll rather than assuming the launch succeeded.
+            for _ in range(60):
+                time.sleep(10)
+                fn=_claude_token if which=="claude" else _codex_token
+                try: res=fn()
+                except Exception: continue
+                if res[0]:
+                    # Fresh token: clear the failure backoff the dead login
+                    # built up and poll immediately, rather than waiting out
+                    # the multi-hour retry interval.
+                    self._ai_fails=0
+                    try: self._ai_tick()
+                    except Exception: pass
+                    return
+        threading.Thread(target=watch,daemon=True).start()
+
     def _ai_ui_status(self,txt,col):
         def go():
             try: self.ai_st.config(text=txt,fg=col)
@@ -3717,8 +3864,18 @@ class IPBar:
                 # Setup hints are informational; only real failures go orange.
                 only_setup = bool(notes) and (cl_setup or not cl.get("err")) \
                                           and (gt_setup or not gt.get("err"))
+                # A dead login is the one error the user can act on from here,
+                # so it becomes a clickable prompt instead of a bare message.
+                self._ai_login_which=None
+                for n,note in enumerate(notes):
+                    m=re.search(r"LOGIN_EXPIRED:(\w+)",note)
+                    if m:
+                        if self._ai_login_which is None:
+                            self._ai_login_which=m.group(1)
+                        notes[n]=note[:m.start()]+"login expired \u2014 click to sign in"
                 self.ai_note.config(text=" | ".join(notes) if notes else " \u00b7 ".join(plans),
-                                    fg=(MUT if only_setup else ORG) if notes else SEC)
+                                    fg=(MUT if only_setup else ORG) if notes else SEC,
+                                    cursor="hand2" if self._ai_login_which else "")
                 self.ai_st.config(text="\u25f4 "+time.strftime("%H:%M"),
                                   fg=MUT if (not notes or only_setup) else ORG)
             except Exception: pass

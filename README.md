@@ -115,6 +115,36 @@ exactly what the list above says.
 The footer buttons do the same for the common actions: menu, lock, network
 toggle, refresh, close.
 
+### The network button
+
+The ◉ button cuts your connection: it disables every physical network adapter,
+wired **and** wireless. Click it again to bring them back. The dot is green
+while connected, red while cut, and amber for the couple of seconds a toggle is
+in flight.
+
+Each toggle raises **one UAC prompt**, because disabling an adapter needs
+administrator rights and the widget deliberately runs as a normal user rather
+than asking you to run the whole thing elevated. Declining the prompt is a
+no-op — the network is left exactly as it was.
+
+Virtual adapters are left alone: hypervisor switches (disabling one takes your
+VMs and containers offline with it) and VPN tunnel adapters (their client owns
+them). See `NET_SKIP` in `.env.example` to adjust the exclusions.
+
+If the adapters ever stay down — a crash mid-toggle, a declined restore — this
+puts them back from an **Administrator** PowerShell:
+
+```powershell
+Get-NetAdapter | Where-Object { -not $_.Virtual } | Enable-NetAdapter -Confirm:$false
+netsh wlan set autoconfig enabled=yes interface="Wi-Fi"
+```
+
+The second line matters more than it looks. `netsh wlan set autoconfig
+enabled=no` is the other common way to cut Wi-Fi, it survives a reboot, and it
+stops the interface associating even after the adapter is enabled again — an
+adapter that reads *Up* but will not connect. The widget clears it on every
+restore, so you only need this if you are recovering by hand.
+
 ---
 
 ## Configuration

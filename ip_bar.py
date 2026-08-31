@@ -2393,25 +2393,160 @@ def get_tz():
         return r.stdout.strip()
     except Exception: return ""
 
-def wifi_iface():
+NET_STATE_FILE = _expand(env_str(
+    "NET_STATE_FILE", os.path.join(os.path.expanduser("~"), ".ipbar_net_state.json")))
+
+# Adapters the cut must never touch, matched against InterfaceDescription.
+# Cutting a hypervisor's virtual switch takes the VMs and containers bridged to
+# it down with it, and VPN tunnel adapters are owned by their client, which
+# misbehaves when something else disables them out from under it. Only real,
+# physically present NICs are in scope. Override with NET_SKIP in .env; the
+# defaults suit a typical Windows desktop.
+NET_SKIP_DESC = tuple(s.strip().lower() for s in env_str(
+    "NET_SKIP",
+    "hyper-v;vmware;virtualbox;openvpn;tap-windows;wintun;bluetooth;"
+    "loopback;wan miniport;teredo").split(";") if s.strip())
+
+
+def _ps(script, timeout=25):
+    """Run PowerShell without a console window; returns (returncode, stdout)."""
     try:
-        r=subprocess.run(["netsh","wlan","show","interfaces"],
-            capture_output=True,text=True,timeout=5,creationflags=subprocess.CREATE_NO_WINDOW)
-        for line in r.stdout.splitlines():
-            if line.strip().startswith("Name") and ":" in line:
-                n=line.split(":",1)[1].strip()
-                if n: return n
-    except Exception: pass
-    return "Wi-Fi"
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        return r.returncode, (r.stdout or "").strip()
+    except Exception:
+        return -1, ""
 
-def wifi_toggle(on,iface):
-    act="no" if on else "yes"
-    subprocess.run(["netsh","wlan","set","autoconfig",f"enabled={act}",f"interface={iface}"],
-        capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
-    if on:
-        subprocess.run(["netsh","wlan","disconnect"],
-            capture_output=True,timeout=10,creationflags=subprocess.CREATE_NO_WINDOW)
 
+def _ps_elevated(script, timeout=120):
+    """Run PowerShell elevated behind a single UAC prompt.
+
+    Enabling and disabling a network adapter is an administrative act, and this
+    widget runs — and should keep running — as a normal user. So the privilege
+    is acquired per action instead of by launching the whole program elevated.
+
+    Start-Process -Verb RunAs raises the consent dialog, -Wait blocks until the
+    child exits and -PassThru yields its exit code, which is what separates the
+    two failure modes worth telling apart: a refused prompt throws in the outer
+    shell and is reported as "cancelled", while a script that ran and failed
+    comes back with a non-zero code. Declining is a normal user choice, not an
+    error, and callers treat it as a no-op.
+
+    The payload travels as -EncodedCommand (UTF-16LE base64) so quoting,
+    adapter names containing spaces, and non-ASCII characters survive the trip
+    through the outer shell unmangled.
+    """
+    enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    outer = (
+        "$ErrorActionPreference='Stop';"
+        "try{"
+        "  $p=Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait"
+        "     -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','" + enc + "';"
+        "  Write-Output ('RC=' + $p.ExitCode)"
+        "}catch{ Write-Output 'RC=CANCELLED' }"
+    )
+    rc, out = _ps(outer, timeout=timeout)
+    if "RC=CANCELLED" in out:
+        return "cancelled"
+    for line in out.splitlines():
+        if line.startswith("RC="):
+            try:
+                return int(line[3:].strip())
+            except ValueError:
+                return "cancelled"
+    return -1
+
+
+def _psq(name):
+    """Quote an adapter name for a single-quoted PowerShell string literal."""
+    return name.replace("'", "''")
+
+
+def net_adapters():
+    """Physical, present NICs as (name, status); virtual and tunnel ones excluded."""
+    rc, out = _ps(
+        "Get-NetAdapter | Where-Object { -not $_.Virtual } | "
+        "ForEach-Object { $_.Name + '|' + $_.Status + '|' + $_.InterfaceDescription }")
+    res = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        name, status, desc = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if not name or status.lower() == "not present":
+            continue
+        if any(s in desc.lower() for s in NET_SKIP_DESC):
+            continue
+        res.append((name, status))
+    return res
+
+
+def _net_state_save(names):
+    try:
+        _write_json_atomic(NET_STATE_FILE, {"cut": names, "at": time.time()})
+    except Exception:
+        pass
+
+
+def _net_state_load():
+    try:
+        with open(NET_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f).get("cut", []) or []
+    except Exception:
+        return []
+
+
+def net_cut():
+    """Disable every physical NIC, wired and wireless. Returns (ok, message)."""
+    live = [n for n, s in net_adapters() if s.lower() != "disabled"]
+    if not live:
+        return True, "already down"
+    body = "; ".join("Disable-NetAdapter -Name '%s' -Confirm:$false" % _psq(n)
+                     for n in live)
+    rc = _ps_elevated("$ErrorActionPreference='Stop'; " + body)
+    if rc == "cancelled":
+        return False, "needs admin"
+    if rc != 0:
+        return False, "cut failed"
+    # Record what was taken down so a later restore puts back exactly that set,
+    # even across a restart of the widget.
+    _net_state_save(live)
+    return True, "down"
+
+
+def net_restore():
+    """Re-enable the NICs and clear any lingering WLAN block. Returns (ok, msg)."""
+    names = list(_net_state_load())
+    for n, s in net_adapters():
+        if s.lower() == "disabled" and n not in names:
+            names.append(n)
+    if not names:
+        names = [n for n, _ in net_adapters()]
+    if not names:
+        return False, "no adapters"
+    body = "; ".join("Enable-NetAdapter -Name '%s' -Confirm:$false" % _psq(n)
+                     for n in names)
+    # Wireless needs a second undo. `netsh wlan set autoconfig enabled=no` is
+    # the other common way to cut Wi-Fi, it persists across reboots, and it
+    # keeps the interface from associating even once the adapter is enabled
+    # again — an adapter that is Up but will not connect. Clearing it here is a
+    # no-op when it was never set, and saves a baffling diagnosis when it was.
+    body += ("; Get-NetAdapter | Where-Object { $_.Status -ne 'Not Present' } |"
+             " ForEach-Object { netsh wlan set autoconfig enabled=yes"
+             " interface=\"$($_.Name)\" 2>$null | Out-Null }")
+    rc = _ps_elevated("$ErrorActionPreference='Continue'; " + body)
+    if rc == "cancelled":
+        return False, "needs admin"
+    _net_state_save([])
+    return True, "up"
+
+
+def net_is_down():
+    """True when every physical NIC is disabled."""
+    ads = net_adapters()
+    return bool(ads) and all(s.lower() == "disabled" for _, s in ads)
 def clip(txt):
     try:
         subprocess.run(["clip"],input=txt.strip().encode(),check=True,
@@ -3011,7 +3146,10 @@ class IPBar:
         self._hist=[]; self._lock=False
         self._cmp=False; self._dx=self._dy=0
         self._data={}; self._tz=""
-        self._net=True; self._wiface=None
+        # Assume online and correct asynchronously in _net_adopt: probing
+        # adapters costs a PowerShell round-trip and must not delay the
+        # first paint.
+        self._net=True; self._net_busy=False; self._wiface=None
         self._fjob=None; self._spin=False; self._sjob=None
         self._ai_last=0.0; self._ai_fails=0
         self._ch=deque([0]*20,maxlen=20)
@@ -3023,6 +3161,7 @@ class IPBar:
         reg_repoint()
         psutil.cpu_percent(interval=None)
         threading.Thread(target=self._tz_init,daemon=True).start()
+        threading.Thread(target=self._net_adopt,daemon=True).start()
         threading.Thread(target=self._loop,daemon=True).start()
         threading.Thread(target=self._hw_loop,daemon=True).start()
         threading.Thread(target=self._ai_loop,daemon=True).start()
@@ -3408,8 +3547,7 @@ class IPBar:
         self.cb=self._circle(ft,"\u2715",self.root.destroy,hover=RED)
         for w in (self.cb,self.rb,self.nb,self.lk,self.mb):
             w.pack(side="right")
-        self.nb.rest=GRN
-        self.nb.itemconfigure(self.nb.mark,fill=GRN)
+        self._net_paint()
         tk.Frame(ft,bg=HAIR,width=1,height=16).pack(side="right",padx=(0,2))
 
     def _mk_menu(self):
@@ -3494,15 +3632,63 @@ class IPBar:
             self.ff.pack(fill="x",after=self.tf)
         self.root.after(30,self._repos)
 
+    def _net_adopt(self):
+        """Correct the net dot from the machine's real state, off the UI thread.
+
+        The widget may be starting up after a cut made in a previous run, and a
+        green dot over a dead network would make the first click cut nothing
+        and look broken.
+        """
+        try:
+            down = net_is_down()
+        except Exception:
+            return
+        if down and self._net and not self._net_busy:
+            self._net = False
+            self.root.after(0, self._net_paint)
+
+    def _net_paint(self):
+        """Green connected, red cut, amber while a toggle is in flight."""
+        col = ORG if self._net_busy else (GRN if self._net else RED)
+        self.nb.rest = col
+        self.nb.itemconfigure(self.nb.mark, fill=col)
+
     def _net_tog(self):
-        iface=self._wiface or wifi_iface(); self._wiface=iface
-        wifi_toggle(self._net,iface)
-        self._net=not self._net
-        def paint():
-            self.nb.rest = GRN if self._net else RED
-            self.nb.itemconfigure(self.nb.mark,fill=self.nb.rest)
-        self.root.after(0,paint)
-        if self._net: self.root.after(4000,self._refresh_go)
+        """Cut or restore every physical NIC, wired and wireless alike.
+
+        This used to call `netsh wlan set autoconfig enabled=no`, which reaches
+        Wi-Fi and nothing else — so on a machine sitting on an Ethernet cable
+        the button appeared to do nothing whatsoever. Disabling the adapters
+        covers both, at the cost of needing administrator rights the widget
+        does not have, so each toggle raises one UAC prompt. Declining it is an
+        ordinary outcome: the network is left exactly as it was.
+        """
+        if self._net_busy:
+            return
+        self._net_busy = True
+        self.root.after(0, self._net_paint)
+        try:
+            ok, msg = net_cut() if self._net else net_restore()
+        except Exception:
+            ok, msg = False, "error"
+        finally:
+            self._net_busy = False
+
+        if ok:
+            self._net = not self._net
+        else:
+            # Re-read the world rather than trusting the flag: a partial
+            # failure can leave some adapters down and others up.
+            try:
+                self._net = not net_is_down()
+            except Exception:
+                pass
+            self.root.after(0, lambda: toast("Network", msg))
+
+        self.root.after(0, self._net_paint)
+        if ok and self._net:
+            # Adapters need a few seconds to associate and take a DHCP lease.
+            self.root.after(6000, self._refresh_go)
 
     def _flash(self,steps=None):
         if steps is None:

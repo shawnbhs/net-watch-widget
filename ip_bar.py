@@ -1,10 +1,24 @@
+# pythonw started with an absolute UNC path does not reliably place the
+# script's own directory on sys.path, and the sibling modules imported below
+# live beside this file.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+
 import tkinter as tk
+import tkinter.font as tkfont
 import threading, time, urllib.request, urllib.error, urllib.parse, subprocess, json
 import sys, os, winreg, ipaddress, socket, re, base64, shlex
 import random as _rnd
 import datetime as _dt
 import psutil
 from collections import deque
+
+# Sibling modules rather than inline code, because both are testable without a
+# display or a live network: the monitor logic was verified against injected
+# layouts and the link logic against injected states, so neither fix required
+# unplugging a real monitor or dropping a real connection to prove it works.
+import screen_geom
+import netfast
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -47,6 +61,22 @@ def env_str(key, default):
     return value or default
 
 
+def env_float(key, default):
+    """Numeric config value, falling back to the default when unparseable.
+
+    A malformed number in a config file must not stop the widget from
+    starting; a sizing knob that is slightly wrong is recoverable, a widget
+    that refuses to launch is not.
+    """
+    raw = env_str(key, "")
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
 def _expand(path):
     """Expand both '~' and %ENVVAR% so .env accepts either Windows style."""
     return os.path.expanduser(os.path.expandvars(path))
@@ -74,8 +104,11 @@ def cred_paths(key, default):
 # ── Constants ──────────────────────────────────────────────────────────────────
 REFRESH   = 3
 PING_N    = 2
+# Corner margin, authored at TARGET_PPI and scaled per panel. Equal on both
+# axes: the work area already excludes the taskbar, so an extra bottom margin
+# just parks the widget in mid-air well above the corner it is meant to hug.
 PAD_R     = 16
-PAD_B     = 52
+PAD_B     = 16
 FLASH_N   = 8
 FLASH_MS  = 150
 HIST_MAX  = 10
@@ -131,6 +164,216 @@ F_CAP = ("Segoe UI",7)             # captions / reset countdowns
 # a fixed-width right-aligned label, so digits never jitter between polls.
 F_NUM = ("Consolas",9)             # primary tabular readout (IP, latency)
 F_NUS = ("Consolas",8)             # small tabular readout (percent, loss)
+
+# Chrome faces. These used to be written inline at each call site as bare
+# tuples, which quietly opted them out of DPI rescaling: only fonts listed in
+# _FONT_NAMES become live objects, and a tuple's size is copied into the
+# widget once and never revisited. Naming them here is what lets the title,
+# the footer glyphs and the toast grow with the rest of the widget.
+F_TTL = ("Segoe UI Semibold",9)   # card title
+F_DOT = ("Segoe UI",7)            # status dot
+F_GLY = ("Segoe UI",8)            # footer circle glyphs
+F_BTN = ("Segoe UI",9)            # push button face
+F_TST = ("Segoe UI Semibold",10)  # toast headline
+F_LCK = ("Segoe MDL2 Assets",9)   # padlock glyph
+
+# --- Physical sizing -------------------------------------------------------
+#
+# Every constant above is authored for a panel of TARGET_PPI pixels per inch.
+# On a denser panel the same pixel count covers less glass, so the widget is
+# rescaled at runtime by the ratio of the real panel density to this number
+# (see IPBar._sync_scale). That keeps its physical size identical on every
+# monitor instead of merely its pixel size, which is what the eye cares about.
+#
+# 84 rather than the conventional 96 because the widget is glanceable chrome
+# read at arm's length, not a document: at 84 the primary readout subtends
+# about 0.20 degrees at a 60 cm viewing distance, which is the usual comfort
+# threshold, and the whole widget measures roughly 10 cm across on any screen.
+TARGET_PPI = env_float("WIDGET_TARGET_PPI", 84.0)
+
+# Equal physical size is the correct default, but it is not the whole story:
+# the primary panel here is a large desk monitor viewed at arm's length while
+# the secondary is a laptop screen read from closer, so a card that measures
+# right on one reads as oversized on the other. These knobs bias the computed
+# scale per monitor. Lowering TARGET_PPI instead would shrink BOTH screens,
+# which is not what is being asked for.
+SCALE_PRIMARY   = env_float("WIDGET_SCALE_PRIMARY", 1.0)
+SCALE_SECONDARY = env_float("WIDGET_SCALE_SECONDARY", 1.0)
+
+# A bias outside this band stops being a taste adjustment and becomes a
+# broken widget -- illegible at the bottom, off the screen at the top.
+_BIAS_MIN = 0.5
+_BIAS_MAX = 2.0
+
+
+def _clamp_bias(value):
+    """Coerce a configured bias into a range that still renders.
+
+    A typo in a config file must degrade to "slightly wrong size", never to a
+    widget too small to read or too large to place. NaN fails every
+    comparison, so it is rejected explicitly rather than by clamping.
+    """
+    try:
+        bias = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if bias != bias:  # NaN
+        return 1.0
+    return max(_BIAS_MIN, min(_BIAS_MAX, bias))
+
+
+def target_scale(mon):
+    """Physical scale for a monitor, with the configured per-monitor bias.
+
+    Kept separate from screen_geom.physical_scale because that function
+    answers a question about the panel ("how many pixels is a centimetre
+    here") while this one answers a question about preference ("how big should
+    the card be on that panel").
+    """
+    scale = screen_geom.physical_scale(mon, TARGET_PPI)
+    bias = SCALE_PRIMARY if (mon or {}).get("primary") else SCALE_SECONDARY
+    return scale * _clamp_bias(bias)
+
+_FONT_NAMES = ("F_IP","F_LBL","F_CTY","F_SM","F_MN","F_CMP","F_CMS",
+               "F_VAL","F_CAP","F_NUM","F_NUS",
+               "F_TTL","F_DOT","F_GLY","F_BTN","F_TST","F_LCK")
+_SCALABLE_BARS = []
+_SCALABLE_CIRCLES = []
+
+
+def _capture_pads(root):
+    """Record every authored padding in the widget tree, once.
+
+    Fonts alone do not keep the widget a constant physical size: a large part
+    of its width is fixed pixel padding, which stays put while the text grows
+    and so pulls the proportions apart on a dense panel. Walking the tree
+    beats registering each frame by hand -- a frame added later is picked up
+    for free instead of silently staying unscaled.
+
+    Returns a list of (widget, kind, {option: base_value}).
+    """
+    out = []
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        stack.extend(w.winfo_children())
+        conf = {}
+        for opt in ("padx", "pady", "ipadx", "ipady", "borderwidth",
+                    "highlightthickness", "wraplength"):
+            try:
+                val = w.cget(opt)
+            except Exception:
+                continue
+            try:
+                val = int(str(val))
+            except (TypeError, ValueError):
+                continue
+            if val:
+                conf[opt] = val
+        if conf:
+            out.append((w, "widget", conf))
+        # Geometry-manager padding is separate from widget padding and just
+        # as fixed; pack/grid both report it back as a string or tuple.
+        try:
+            mgr = w.winfo_manager()
+            info = w.pack_info() if mgr == "pack" else (
+                   w.grid_info() if mgr == "grid" else None)
+        except Exception:
+            info = None
+        if info:
+            geo = {}
+            for opt in ("padx", "pady", "ipadx", "ipady"):
+                val = info.get(opt)
+                if val in (None, "", 0, "0"):
+                    continue
+                if isinstance(val, (list, tuple)):
+                    try:
+                        pair = tuple(int(str(v)) for v in val)
+                    except (TypeError, ValueError):
+                        continue
+                    if any(pair):
+                        geo[opt] = pair
+                else:
+                    try:
+                        num = int(str(val))
+                    except (TypeError, ValueError):
+                        continue
+                    if num:
+                        geo[opt] = num
+            if geo:
+                out.append((w, mgr, geo))
+    return out
+
+
+def _scale_pads(pads, scale):
+    """Re-apply every captured padding at `scale`, from the ORIGINAL values.
+
+    Always scaling from the captured base, never from the current value, so
+    repeated monitor changes cannot compound rounding error.
+    """
+    def grow(v):
+        if isinstance(v, tuple):
+            return tuple(max(0, int(round(x * scale))) for x in v)
+        return max(0, int(round(v * scale)))
+
+    for widget, kind, base in pads:
+        try:
+            if kind == "widget":
+                widget.configure(**{k: grow(v) for k, v in base.items()})
+            elif kind == "pack":
+                widget.pack_configure(**{k: grow(v) for k, v in base.items()})
+            elif kind == "grid":
+                widget.grid_configure(**{k: grow(v) for k, v in base.items()})
+        except Exception:
+            # A widget destroyed by a mode switch must not take the rescale
+            # down with it -- the rest of the tree still needs resizing.
+            continue
+
+
+def _register_scalable_bar(canvas, base_w, base_h):
+    """Remember a Bar canvas and the size it was authored at.
+
+    Recorded against the ORIGINAL constant rather than the current width, so
+    repeated monitor changes always rescale from the authored value and cannot
+    accumulate rounding drift.
+    """
+    _SCALABLE_BARS.append((canvas, base_w, base_h))
+
+
+def _promote_fonts():
+    """Swap the F_* tuples for live tkfont.Font objects, in place.
+
+    Every widget here passes font=F_SOMETHING at construction. Tk copies a
+    tuple's values into the widget, so mutating the tuple later changes
+    nothing -- but it holds a REFERENCE to a font object, so reconfiguring
+    that object restyles every widget already using it. Promoting the
+    constants up front turns a DPI change into a handful of font
+    reconfigurations instead of a teardown and rebuild of the whole UI.
+
+    Called after a Tk root exists and before any widget is built.
+    """
+    out = {}
+    g = globals()
+    for name in _FONT_NAMES:
+        spec = g[name]
+        if isinstance(spec, tuple):
+            # Positive Tk sizes are points, so their pixel size changes with
+            # Tk's DPI context. Convert the 96-DPI authored point size to an
+            # equivalent negative pixel size; our own per-monitor pass then
+            # remains the single source of physical scaling.
+            authored=spec[1]
+            pixels=-max(1,int(round(abs(authored)*96/72))) if authored>0 else authored
+            f = tkfont.Font(family=spec[0], size=pixels)
+            for opt in spec[2:]:
+                if opt in ("bold", "normal"):
+                    f.configure(weight=opt)
+                elif opt in ("italic", "roman"):
+                    f.configure(slant=opt)
+            g[name] = f
+            out[name] = f
+        else:
+            out[name] = spec
+    return out
 
 TZ_CC = {
     "Iran Standard Time":"IR","Afghanistan Standard Time":"AF",
@@ -2291,12 +2534,21 @@ def local_ip():
     except Exception: return "?"
 
 def gateway():
+    """Default gateway, from the routing table rather than a PowerShell call.
+
+    The previous implementation spawned powershell.exe for Get-NetRoute, which
+    costs several hundred milliseconds of interpreter startup on every refresh
+    cycle for a value the routing table can answer in microseconds. That cost
+    was paid three times a second.
+    """
     try:
-        r=subprocess.run(["powershell","-Command",
-            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0'|Sort-Object RouteMetric|Select-Object -First 1).NextHop"],
-            capture_output=True,text=True,timeout=5,creationflags=subprocess.CREATE_NO_WINDOW)
-        return r.stdout.strip() or "?"
-    except Exception: return "?"
+        gw = netfast.link_state().get("gateway")
+        if gw:
+            return gw
+    except Exception:
+        pass
+    return "?"
+
 
 def ping(host):
     try:
@@ -3099,6 +3351,11 @@ class Bar(tk.Canvas):
         tk.Canvas.__init__(self, parent, width=w, height=h,
                            bg=bg, highlightthickness=0, bd=0)
         self._bw, self._bh = w, h
+        self._frac = 0.0
+        try:
+            _register_scalable_bar(self, w, h)
+        except Exception:
+            pass
         self._rail = self._capsule(0, w, TRK)
         self._fill = self._capsule(0, self._DOT, ACC)
 
@@ -3129,13 +3386,46 @@ class Bar(tk.Canvas):
             value = max(0.0, min(100.0, float(pct)))
         except (TypeError, ValueError):
             value, col = 0.0, MUT
+        # Remembered so a DPI rescale can redraw at the same fill level
+        # without waiting for the next poll to supply the value again.
+        self._frac = value / 100.0
+        self._col = col
         width = max(self._DOT, int(self._bw * value / 100.0))
         self._reshape(self._fill, width, col or ai_col(value))
 
+    def rescale(self, w, h):
+        """Redraw this bar at a new pixel size, preserving its fill level.
+
+        The capsule geometry is derived from the bar's height, so a resized
+        bar has to be rebuilt rather than merely stretched: scaling the canvas
+        alone would leave the end caps as ellipses of the old radius.
+        """
+        w = max(8, int(w))
+        h = max(2, int(h))
+        if (w, h) == (self._bw, self._bh):
+            return
+        self._bw, self._bh = w, h
+        self._DOT = max(3, int(round(h)))
+        self.configure(width=w, height=h)
+        self._reshape(self._rail, w, TRK)
+        pct = getattr(self, "_frac", 0.0) * 100.0
+        self.set(pct, getattr(self, "_col", None))
+
 
 class IPBar:
-    def __init__(self):
+    def __init__(self, run=True):
+        # DPI awareness must be declared before Tk creates the HWND.  Doing it
+        # during monitor enumeration is too late and mixes virtualised Tk
+        # coordinates with physical Win32 monitor rectangles on a 150% screen.
+        screen_geom.initialize_dpi_awareness()
         self.root=tk.Tk()
+        # Fonts become live objects BEFORE any widget is built, so a later
+        # monitor change resizes the whole UI by reconfiguring them in place
+        # rather than rebuilding it.
+        self._fonts=_promote_fonts()
+        self._scale=1.0
+        # Rendered width at scale 1.0; the yardstick the closed loop aims at.
+        self._base_px=None
         self.root.overrideredirect(True)
         self.root.attributes("-topmost",True)
         self.root.attributes("-alpha",0.97)
@@ -3144,7 +3434,7 @@ class IPBar:
 
         self._ip=None; self._ip2=None
         self._hist=[]; self._lock=False
-        self._cmp=False; self._dx=self._dy=0
+        self._cmp=False; self._dx=self._dy=0; self._dragging=False
         self._data={}; self._tz=""
         # Assume online and correct asynchronously in _net_adopt: probing
         # adapters costs a PowerShell round-trip and must not delay the
@@ -3157,15 +3447,42 @@ class IPBar:
         self._gh=deque([0]*20,maxlen=20)
 
         self._build()
+        # Scale before the first placement, never after: _repos measures the
+        # window, and measuring it before the rescale would park a
+        # differently-sized widget at the wrong corner offset.
+        self._sync_scale()
         self._repos()
         reg_repoint()
         psutil.cpu_percent(interval=None)
         threading.Thread(target=self._tz_init,daemon=True).start()
         threading.Thread(target=self._net_adopt,daemon=True).start()
+        # Both watchers are cheap pollers on their own daemon threads. They
+        # are started after the UI exists because both call back into it.
+        try:
+            screen_geom.watch_displays(self._on_display_change, interval=2.0)
+        except Exception:
+            pass
+        try:
+            self._netwatch=netfast.NetWatcher(on_change=self._on_link_change,
+                                              interval=1.0)
+            self._netwatch.start()
+        except Exception:
+            self._netwatch=None
         threading.Thread(target=self._loop,daemon=True).start()
         threading.Thread(target=self._hw_loop,daemon=True).start()
         threading.Thread(target=self._ai_loop,daemon=True).start()
         threading.Thread(target=self._ai_keepalive_loop,daemon=True).start()
+        if run:
+            self.run()
+
+    def run(self):
+        """Enter the Tk event loop.
+
+        Split out of __init__ so the widget can be constructed and inspected
+        without blocking forever -- construction that never returns cannot be
+        tested, and an untestable constructor is how the DPI bug survived as
+        long as it did.
+        """
         self.root.mainloop()
 
     # ── UI ─────────────────────────────────────────────────────────────────────
@@ -3181,15 +3498,29 @@ class IPBar:
     def _db(self,w):
         w.bind("<ButtonPress-1>",self._ds)
         w.bind("<B1-Motion>",self._dm)
+        w.bind("<ButtonRelease-1>",self._de)
 
     def _ds(self,e):
         if not self._lock:
+            self._dragging=True
             self._dx=e.x_root-self.root.winfo_x()
             self._dy=e.y_root-self.root.winfo_y()
 
     def _dm(self,e):
         if not self._lock:
             self.root.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
+
+    def _de(self,e):
+        """Drag finished: match the scale of whatever panel it landed on.
+
+        Deliberately on release rather than during motion. Rescaling mid-drag
+        would resize the window under the pointer while the pointer is holding
+        it, so the grab point would slide out from under the cursor as it
+        crossed the monitor boundary.
+        """
+        if not self._lock:
+            self._dragging=False
+            self._sync_scale()
 
     GUT = 10   # side gutter, both modes
     PAD = 4    # vertical padding inside a group
@@ -3261,7 +3592,9 @@ class IPBar:
     # that draws BOTH states as outline art matching the other footer marks;
     # the emoji codepoints render as filled blobs and the U+1F5xx escapes
     # render as tofu. Verified by rendering each candidate.
-    LOCK_FONT   = ("Segoe MDL2 Assets", 9)
+    # Read F_LCK at call time, not here: the class body executes at import,
+    # before _promote_fonts swaps the module global for a live Font, so a
+    # class attribute would permanently capture the unscalable tuple.
     LOCK_CLOSED = "\uE72E"
     LOCK_OPEN   = "\uE785"
 
@@ -3273,7 +3606,7 @@ class IPBar:
         ring = c.create_oval(cx - r, cy - r, cx + r, cy + r,
                              outline=STRK, fill=CHR)
         mark = c.create_text(cx, cy, text=glyph, fill=MUT,
-                             font=font or ("Segoe UI", 8))
+                             font=font or F_GLY)
         # Rest colour lives on the widget so a stateful button (the lock) can
         # change it; otherwise <Leave> would reset every button to MUT and
         # wipe the active colour as soon as the pointer moved away.
@@ -3284,7 +3617,23 @@ class IPBar:
         c.bind("<Leave>", lambda e: (c.itemconfigure(mark, fill=c.rest),
                                      c.itemconfigure(ring, fill=CHR)))
         c.mark, c.ring = mark, ring
+        # Registered so a DPI change resizes the footer with everything else.
+        # These circles are drawn geometry, not text, so neither the font pass
+        # nor the padding pass touches them -- left alone they stay a fixed
+        # pixel size and so shrink, relative to the card, on a dense panel.
+        _SCALABLE_CIRCLES.append(c)
         return c
+
+    @staticmethod
+    def _rescale_circle(c, scale):
+        """Redraw one footer circle at `scale`, from its authored geometry."""
+        step = max(8, int(round(IPBar.FSTEP * scale)))
+        hit = max(8, int(round(IPBar.HIT_H * scale)))
+        r = max(3.0, IPBar.RING * scale / 2.0)
+        cx, cy = step / 2.0, hit / 2.0
+        c.configure(width=step, height=hit)
+        c.coords(c.ring, cx - r, cy - r, cx + r, cy + r)
+        c.coords(c.mark, cx, cy)
 
     def _cap(self,parent,bg,text):
         """Apple section caption: quaternary label, tight, all-caps."""
@@ -3294,8 +3643,8 @@ class IPBar:
         self.tf=tk.Frame(self.card,bg=CHR,padx=self.GUT,pady=5)
         self.tf.pack(fill="x"); self._db(self.tf)
         tk.Label(self.tf,text="Net Watch",bg=CHR,fg=WHT,
-            font=("Segoe UI Semibold",9)).pack(side="left")
-        self.dot=tk.Label(self.tf,text="\u25cf",bg=CHR,fg=MUT,font=("Segoe UI",7))
+            font=F_TTL).pack(side="left")
+        self.dot=tk.Label(self.tf,text="\u25cf",bg=CHR,fg=MUT,font=F_DOT)
         self.dot.pack(side="right")
 
     def _mk_compact(self):
@@ -3427,7 +3776,7 @@ class IPBar:
         self._cap(hdr,SURF,"AI USAGE").pack(side="left")
         self.ai_st=tk.Label(hdr,text="\u2026",bg=SURF,fg=MUT,font=F_CAP)
         self.ai_st.pack(side="right")
-        self.ai_rf=tk.Label(hdr,text="\u21bb",bg=SURF,fg=MUT,font=("Segoe UI",8),
+        self.ai_rf=tk.Label(hdr,text="\u21bb",bg=SURF,fg=MUT,font=F_GLY,
                             cursor="hand2")
         self.ai_rf.pack(side="right",padx=(0,7))
         self.ai_rf.bind("<Button-1>",lambda e:self._ai_go())
@@ -3540,7 +3889,7 @@ class IPBar:
         # row belongs to exactly one button and none can shadow another.
         self.mb=self._circle(ft,"\u25a3",self._tog_cmp)
         self.lk=self._circle(ft,self.LOCK_OPEN,self._tog_lock,
-                             font=self.LOCK_FONT)
+                             font=F_LCK)
         self.nb=self._circle(ft,"\u25c9",
             lambda:threading.Thread(target=self._net_tog,daemon=True).start())
         self.rb=self._circle(ft,"\u21bb",self._refresh_go)
@@ -3552,7 +3901,7 @@ class IPBar:
 
     def _mk_menu(self):
         self._m=tk.Menu(self.root,tearoff=0,bg=BG2,fg=WHT,
-            activebackground=ACC,activeforeground=WHT,font=("Segoe UI",9),bd=0)
+            activebackground=ACC,activeforeground=WHT,font=F_BTN,bd=0)
         self._m.add_command(label="Copy Public IP",command=lambda:clip(self._d("ip")))
         self._m.add_command(label="Copy Local IP", command=lambda:clip(self._d("local")))
         self._m.add_command(label="Open on Map",   command=lambda:ourl(f"https://www.openstreetmap.org/search?query={self._d('ip')}"))
@@ -3575,10 +3924,205 @@ class IPBar:
     def _d(self,k): return self._data.get(k,"?")
 
     def _repos(self):
+        """Park the widget at the bottom-right corner of its own monitor.
+
+        Size is read AFTER any rescale, never cached across one: _apply_scale
+        changes the widget's pixel dimensions, and a corner computed from a
+        stale size hangs off the screen edge by exactly the scale factor.
+        """
         self.root.update_idletasks()
-        sw=self.root.winfo_screenwidth(); sh=self.root.winfo_screenheight()
-        w=self.root.winfo_reqwidth();    h=self.root.winfo_reqheight()
-        self.root.geometry(f"+{sw-w-PAD_R}+{sh-h-PAD_B}")
+        w=self.root.winfo_reqwidth(); h=self.root.winfo_reqheight()
+        try:
+            px,py=self._scaled_pad()
+            x,y=screen_geom.bottom_right(w,h,pad_x=px,pad_y=py,
+                                         mon=self._target_monitor())
+        except Exception:
+            sw=self.root.winfo_screenwidth(); sh=self.root.winfo_screenheight()
+            x,y=sw-w-PAD_R, sh-h-PAD_B
+        self.root.geometry(f"+{x}+{y}")
+
+    def _target_monitor(self):
+        """The monitor the widget sits on, or the primary if it is stranded.
+
+        Placement follows the window rather than always snapping to primary,
+        so dragging the widget to another screen and letting it re-park keeps
+        it there instead of yanking it back.
+        """
+        try:
+            x,y=self.root.winfo_x(), self.root.winfo_y()
+            w=self.root.winfo_width() or self.root.winfo_reqwidth()
+            h=self.root.winfo_height() or self.root.winfo_reqheight()
+            if screen_geom.rect_visible_on(x,y,w,h):
+                return screen_geom.monitor_at(x+w//2, y+h//2)
+        except Exception:
+            pass
+        return screen_geom.primary()
+
+    def _scaled_pad(self):
+        """Corner margins in the target monitor's own pixels.
+
+        A flat 16px gap is physically twice as tight on a 200 ppi panel as on
+        a 100 ppi one, so the padding scales with everything else or the
+        widget visibly hugs the corner on the denser screen.
+        """
+        s=getattr(self,"_scale",1.0)
+        return (max(1,int(round(PAD_R*s))), max(1,int(round(PAD_B*s))))
+
+    def _apply_scale(self, scale, force=False):
+        """Resize every font and bar so the widget is the same PHYSICAL size.
+
+        Returns True when something actually changed, so callers can skip a
+        needless reposition. Scale is clamped: a bad EDID reading should make
+        the widget slightly wrong, never make it fill or vanish from the
+        screen.
+        """
+        scale=max(0.6,min(4.0,float(scale)))
+        if not force and abs(scale-getattr(self,"_scale",0.0))<0.02:
+            return False
+        self._scale=scale
+        if not hasattr(self,"_base_fonts"):
+            # Captured once from the authored values. Rescaling from the
+            # CURRENT sizes would compound rounding error on every monitor
+            # change until the text drifted permanently out of proportion.
+            self._base_fonts={n:f.cget("size") for n,f in self._fonts.items()}
+        for name,f in self._fonts.items():
+            base=self._base_fonts[name]
+            size=max(1,int(round(abs(base)*scale)))
+            f.configure(size=size if base>0 else -size)
+        for circle in _SCALABLE_CIRCLES:
+            try:
+                self._rescale_circle(circle, scale)
+            except Exception:
+                pass
+        for canvas,bw,bh in _SCALABLE_BARS:
+            try:
+                canvas.rescale(int(round(bw*scale)), int(round(bh*scale)))
+            except Exception:
+                pass
+        if not hasattr(self,"_base_pads"):
+            self._base_pads=_capture_pads(self.root)
+        _scale_pads(self._base_pads, scale)
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        return True
+
+    def _sync_scale(self):
+        """Match the target monitor's scale without undoing a manual drag.
+
+        Scaling changes the requested pixel dimensions. Preserve the dropped
+        window centre across that resize and clamp only when the larger card
+        would cross the target monitor's working area.
+        """
+        try:
+            self.root.update_idletasks()
+            old_w=self.root.winfo_width() or self.root.winfo_reqwidth()
+            old_h=self.root.winfo_height() or self.root.winfo_reqheight()
+            centre=(self.root.winfo_x()+old_w/2,
+                    self.root.winfo_y()+old_h/2)
+            mon=self._target_monitor()
+            if mon is None:
+                return
+            want=target_scale(mon)
+            if not self._apply_scale(want):
+                return
+            # Font sizes are whole points, so the rendered width lands a few
+            # percent either side of the request -- enough to be visible as
+            # "this panel looks bigger". Measure what we actually got and
+            # correct once, closing the loop instead of trusting the request.
+            if self._base_px is None:
+                # Measure the unscaled width for THIS layout. _apply_scale has
+                # already moved us, so drop back to 1.0 to read the yardstick,
+                # otherwise the target compounds with the current scale and
+                # the widget grows every single sync.
+                self._apply_scale(1.0, force=True)
+                self._base_px=self.root.winfo_reqwidth()
+                self._apply_scale(want, force=True)
+            target=self._base_px*want
+            rendered=self.root.winfo_reqwidth()
+            if rendered:
+                # One measured correction avoids walking the live HWND through
+                # eight visibly different sizes on every monitor transition.
+                correction=max(0.95,min(1.05,target/rendered))
+                corrected=self._scale*correction
+                if abs(corrected-self._scale)>=0.005:
+                    self._apply_scale(corrected, force=True)
+
+            self.root.update_idletasks()
+            new_w=self.root.winfo_reqwidth(); new_h=self.root.winfo_reqheight()
+            x=int(round(centre[0]-new_w/2)); y=int(round(centre[1]-new_h/2))
+            max_x=mon["wx"]+max(0,mon["ww"]-new_w)
+            max_y=mon["wy"]+max(0,mon["wh"]-new_h)
+            x=max(mon["wx"],min(x,max_x))
+            y=max(mon["wy"],min(y,max_y))
+            self.root.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+
+    def _clamp_to_work_area(self):
+        """Keep post-refresh content growth inside the current work area."""
+        if getattr(self,"_dragging",False):
+            return
+        try:
+            self.root.update_idletasks()
+            mon=self._target_monitor()
+            if mon is None:
+                return
+            x=self.root.winfo_x(); y=self.root.winfo_y()
+            w=self.root.winfo_width() or self.root.winfo_reqwidth()
+            h=self.root.winfo_height() or self.root.winfo_reqheight()
+            max_x=mon["wx"]+max(0,mon["ww"]-w)
+            max_y=mon["wy"]+max(0,mon["wh"]-h)
+            nx=max(mon["wx"],min(x,max_x)); ny=max(mon["wy"],min(y,max_y))
+            if (nx,ny)!=(x,y):
+                self.root.geometry(f"+{nx}+{ny}")
+        except Exception:
+            pass
+
+    def _rescue_offscreen(self):
+        """Drag the window back onto a live monitor if its own is gone.
+
+        Unplugging the HDMI cable does not move the windows that were on that
+        monitor: Windows leaves them at coordinates that now belong to no
+        display, so the widget is simply invisible and unreachable with the
+        mouse. Nothing about the widget's own state changes, which is why it
+        cannot notice on its own and has to be told by a display watcher.
+
+        A position that is still reachable is left exactly where the user put
+        it. Only a stranded one is moved, and never while the window is being
+        dragged, which would fight the pointer.
+        """
+        try:
+            self.root.update_idletasks()
+            x,y=self.root.winfo_x(), self.root.winfo_y()
+            w,h=self.root.winfo_width() or self.root.winfo_reqwidth(), \
+                self.root.winfo_height() or self.root.winfo_reqheight()
+            if screen_geom.rect_visible_on(x,y,w,h):
+                return
+            px,py=self._scaled_pad()
+            nx,ny=screen_geom.bottom_right(w,h,pad_x=px,pad_y=py)
+            self.root.geometry(f"+{nx}+{ny}")
+            toast("Display changed","Widget moved back to the main screen")
+        except Exception:
+            pass
+
+    def _on_display_change(self):
+        """Display-watcher callback. Arrives on a worker thread; Tk is not
+        thread-safe, so the real work is marshalled onto the UI thread.
+
+        The delay lets the desktop settle: immediately after a hotplug Windows
+        is still resizing work areas, and a position computed mid-flight can be
+        wrong by a taskbar's height.
+        """
+        try:
+            self.root.after(400, self._rescue_offscreen)
+            # Rescale after the rescue, so the panel measured is the one the
+            # window has actually landed on.
+            self.root.after(600, self._sync_scale)
+        except Exception:
+            pass
 
     def _smenu(self,e):
         try: self._m.tk_popup(e.x_root,e.y_root)
@@ -3630,7 +4174,11 @@ class IPBar:
         else:
             self.cf.pack_forget()
             self.ff.pack(fill="x",after=self.tf)
-        self.root.after(30,self._repos)
+        # Compact and full mode are different widths, so the yardstick the
+        # scale loop measures against no longer applies -- drop it and let the
+        # next sync re-derive it for the mode now on screen.
+        self._base_px=None
+        self.root.after(30,self._sync_scale)
 
     def _net_adopt(self):
         """Correct the net dot from the machine's real state, off the UI thread.
@@ -3730,7 +4278,7 @@ class IPBar:
         w=tk.Toplevel(self.root); w.title("IP History"); w.configure(bg=BG)
         w.attributes("-topmost",True); w.resizable(False,False)
         tk.Label(w,text="IP Change History",bg=BG,fg=WHT,
-            font=("Segoe UI Semibold",10),padx=14,pady=10).pack(anchor="w")
+            font=F_TST,padx=14,pady=10).pack(anchor="w")
         if not self._hist:
             tk.Label(w,text="No changes yet.",bg=BG,fg=MUT,font=F_SM,padx=14,pady=6).pack(anchor="w")
         for ts,ip in reversed(self._hist):
@@ -3738,7 +4286,7 @@ class IPBar:
             tk.Label(row,text=ts,bg=BG,fg=MUT,font=F_MN,width=20,anchor="w").pack(side="left")
             tk.Label(row,text=ip,bg=BG,fg=ACC,font=F_MN).pack(side="left",padx=6)
         tk.Button(w,text="Close",command=w.destroy,bg=BG2,fg=WHT,
-            activebackground=BG3,activeforeground=WHT,
+            activebackground=BG3,activeforeground=WHT,font=F_BTN,
             relief="flat",bd=0,padx=14,pady=5,cursor="hand2").pack(pady=10)
 
     # ── Quick Checks ───────────────────────────────────────────────────────────
@@ -4091,6 +4639,40 @@ class IPBar:
             time.sleep(REFRESH)
             self._do_refresh()
 
+    def _on_link_change(self, old, new):
+        """React to a local link transition without waiting for the slow cycle.
+
+        _do_refresh cannot be quick: it joins two public-IP lookups with six
+        second timeouts and a ping with a fifteen second one, so on a real
+        outage every one of them blocks for its full timeout and the display
+        keeps showing a connection that died twenty seconds ago. The local link
+        state, by contrast, is known immediately and for free, so the dot and
+        the ping fields are corrected right away and the expensive enrichment
+        is merely kicked off behind it.
+        """
+        try:
+            up = bool(new.get("up"))
+            if not up:
+                def dead():
+                    self.dot.config(fg=RED)
+                    for lbl in (self.p1_l, self.p2_l):
+                        lbl.config(text="No link", fg=RED)
+                    try: self.c_pg.config(text="No link", fg=RED)
+                    except Exception: pass
+                self.root.after(0, dead)
+                toast("Network", "Link down")
+            else:
+                toast("Network", "Link restored")
+            # A returning link or a new local address both imply the public IP
+            # may have changed, and that is exactly what the user wants to be
+            # told about promptly.
+            if netfast.should_refresh_now(old, new):
+                self._refresh_go()
+            else:
+                threading.Thread(target=self._do_refresh, daemon=True).start()
+        except Exception:
+            pass
+
     def _do_refresh(self):
         res={}
         def _i():  res["ip"]=fetch_ip()
@@ -4151,6 +4733,9 @@ class IPBar:
                 self.c_isp.config(text=f"{nip2}  \u2022  {isp[:32]}" if isp else nip2)
             except Exception: pass
             self._tz_match()
+            # Real ISP/country strings can widen the card after startup.  Clamp
+            # only after Tk has recomputed the requested size, never mid-drag.
+            self.root.after_idle(self._clamp_to_work_area)
             if chg: self._flash()
         self.root.after(0,upd)
 

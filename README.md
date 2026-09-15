@@ -4,8 +4,8 @@ An always-on-top desktop widget for Windows that answers, at a glance:
 **am I on the VPN, is the connection healthy, and how much of my AI plan is
 left?**
 
-One Python file. One PowerShell command to install. Starts automatically
-with Windows and stays out of the way.
+Python gathers the data, React draws it. One PowerShell command to install.
+Starts automatically with Windows and stays out of the way.
 
 ![The widget in compact mode](docs/compact.png)
 
@@ -30,6 +30,18 @@ with Windows and stays out of the way.
 
 ## What it shows
 
+**Mini bar** — a tab docked to an edge of the screen, out of the way of
+everything: a dial each for CPU, RAM, GPU and the two AI allowances, the ping,
+and the adapter dot. It sits on the top, the left or the right edge — a row of
+dials on the top, a column of them down a side — at either end of that edge or
+in the middle of it. Click it to open the widget; drag it to move it, including
+onto a different edge. Nothing is labelled at this size — hover a dial for its
+name — because the point of it is to be glanceable, not readable.
+
+All five dials are always there, showing a dash until they have a reading, so
+the tab never changes size and never shifts under you. It is the mode the widget
+reopens in if it was the mode you left it in.
+
 **Compact mode** — a single strip: country flag and name, ping, VPN state,
 public IP, ISP, CPU / RAM / GPU, AI usage bars, clock.
 
@@ -48,15 +60,24 @@ The VPN indicator is not a guess from the IP alone: it cross-checks the
 country reported by a geo-IP lookup against Cloudflare's own edge report, and
 flags a mismatch between the two rather than trusting either one.
 
+**A changed exit address turns its card red.** If either the public IP or the
+Runflare address moves, that card gets a red border and pulses three times, then
+holds the red for a minute — long enough to still be there when you next glance
+over. Hover it to see what the address was before. Only a move between two real
+addresses counts: a failed lookup is not a move, so a network hiccup will not
+cry wolf.
+
 ---
 
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.9 or newer, with `tkinter` (included in the installer from
-  [python.org](https://www.python.org/downloads/) — tick **Add python.exe to
-  PATH** during setup)
-- One dependency, `psutil`, which the installer installs for you
+- Python 3.9 or newer from [python.org](https://www.python.org/downloads/)
+  (tick **Add python.exe to PATH** during setup)
+- Node.js 20 or newer from [nodejs.org](https://nodejs.org)
+- One Python dependency, `psutil`, which the installer installs for you
+
+`tkinter` is **not** required. Nothing here imports a Python GUI toolkit.
 
 You do **not** need an API key, an account, or an internet-facing service.
 
@@ -72,14 +93,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 That single command:
 
-1. verifies Python and `tkinter` are present,
+1. verifies Python and Node are present,
 2. installs `psutil` if it is missing,
-3. creates `.env` from `.env.example` (all settings optional),
-4. registers the widget to start automatically at login,
-5. starts it.
+3. installs the UI's dependencies and builds it — the first run downloads
+   Electron, about 100 MB,
+4. creates `.env` from `.env.example` (all settings optional),
+5. registers the widget to start automatically at login,
+6. starts it.
 
-Re-running it is safe — it updates the autostart entry and leaves an existing
-`.env` alone.
+Re-running it is safe — it rebuilds the UI, updates the autostart entry and
+leaves an existing `.env` alone.
 
 To set it up without autostart:
 
@@ -98,26 +121,58 @@ exactly what the list above says.
 
 ## Using it
 
-- **Drag** anywhere on the widget to move it. Position is remembered.
-- **Right-click** for the menu:
+- **Drag the title bar** to move it. Position is remembered.
+- **Drag the bottom-right corner** to resize it — the whole widget scales, text
+  and all. Double-click that corner to go back to normal size.
+- **Right-click anywhere** to switch between compact and full.
+- **Click a readout** — either IP, the local address, the gateway, a latency
+  figure — to copy it.
 
-| Item | Does |
-|---|---|
-| Copy Public IP / Copy Local IP | to clipboard |
-| Open on Map | opens the IP's approximate location |
-| View History | the last IP changes, with timestamps |
-| Open Log | the plain-text log file |
-| Compact / Full | switch modes |
-| Refresh | force an immediate update |
-| Toggle Lock | pin the widget so it cannot be dragged |
-| Quit | close it (autostart is unaffected) |
+The footer buttons, left to right: mini bar, compact/full, lock position,
+network toggle, refresh, quit. Hover any of them for a tooltip; the two stateful
+ones name the action they will perform, so the network button reads "Cut
+network" while you are connected and "Restore network" while you are not.
 
-The footer buttons do the same for the common actions: menu, lock, network
-toggle, refresh, close.
+### Resizing it
+
+The grip in the bottom-right corner scales the entire widget — type, icons,
+bars, the lot — rather than stretching the panels, because the layout is a
+fixed-width column of hand-picked type sizes and a wider one would only leave
+small text stranded in the middle of big panels. Double-click the grip to
+return to 100%. The size is remembered, and the mini bar inherits it.
+
+It grows to **twice** normal size, and shrinks only about 8%. The floor is a
+Windows limit rather than a preference: the frosted panel behind each card is a
+window, and Windows will not make a window shorter than 39 pixels, so below
+roughly 90% the frost behind the thinnest cards would stand slightly proud of
+them.
+
+### The mini bar
+
+The ↑ button collapses the widget to a tab on the edge of the screen.
+**Click the tab** to open it again — it returns to wherever you had dragged the
+widget, not to the edge. Locking the position stops the drag but not the click.
+
+**Drag the tab** to move it. Letting go parks it on the nearest of nine docks:
+the top, left or right edge, at the start, the middle or the end of it. It
+changes shape to suit — a row of dials along the top, a column down a side — and
+it can be carried to another monitor on the way.
+
+The tab deliberately overhangs its edge by a few pixels. Windows rounds the
+corners of the frosted panel behind it and gives no way to ask for square ones,
+so the overhang is what puts that rounding out of sight and lets the tab meet
+the edge cleanly.
+
+**Quick checks** fill themselves in a second or two after launch, and again
+whenever your public IP changes. **Run** re-runs them on demand and **Clear**
+blanks them. The five pills below open that IP in an external lookup.
+
+**AI usage** polls every 15 minutes. The ↻ beside the heading forces a poll,
+subject to a five-minute floor.
 
 ### The network button
 
-The ◉ button cuts your connection: it disables every physical network adapter,
+The power button cuts your connection: it disables every physical network adapter,
 wired **and** wireless. Click it again to bring them back. The dot is green
 while connected, red while cut, and amber for the couple of seconds a toggle is
 in flight.
@@ -230,15 +285,26 @@ not *your login died*.
 
 ## Restarting after an edit
 
-Editing the file on disk does **not** change the running widget. Restart it:
+Editing a file on disk does **not** change the running widget.
+
+Python only — `core.py` or `sidecar.py`:
 
 ```powershell
-Get-Process pythonw -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*ip_bar.py*' } | Stop-Process -Force
-Start-Process pythonw.exe "$PWD\ip_bar.py"
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Or just re-run `install.ps1`, which stops the old instance for you.
+UI only — anything under `app/src`:
+
+```powershell
+cd app
+npm run build
+npm start
+```
+
+`npm start` clears `ELECTRON_RUN_AS_NODE` before launching. Some terminals
+export it, and inherited it makes `electron.exe` behave as a plain Node binary:
+the app dies on `app is undefined`, with a stack trace that points nowhere near
+the cause.
 
 ---
 
@@ -251,6 +317,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 Removes the autostart entry and stops the widget. Delete the folder to remove
 the files, and `%USERPROFILE%\ip_bar_log.txt` for the log.
 
+The log keeps its old name so an existing history is not orphaned; `LOG_FILE`
+in `.env` moves it.
+
 ---
 
 ## Troubleshooting
@@ -259,7 +328,8 @@ the files, and `%USERPROFILE%\ip_bar_log.txt` for the log.
 Run it in a console to see the error:
 
 ```powershell
-python .\ip_bar.py
+cd app
+npm start
 ```
 
 **"Python was not found"** — Python is not on `PATH`. Reinstall from
@@ -281,12 +351,10 @@ outside a blocked one. Connect your VPN and hit Refresh.
 survived:
 
 ```powershell
-Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name IPBar
+Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name NetWatch
 ```
 
-If it is missing, re-run `install.ps1`. If the path is wrong, just launch the
-widget from its new location once — it rewrites its own autostart entry when
-it notices a mismatch.
+If it is missing or the path is wrong, re-run `install.ps1`.
 
 **Ping shows nothing.** Some networks block ICMP. Point `PING_HOST_1` at your
 own gateway instead.
@@ -318,18 +386,36 @@ own gateway instead.
 
 ## How it works
 
-One file, `ip_bar.py`, around 3,700 lines of `tkinter` with a single
-dependency. Data is gathered on background threads, so a slow lookup never
-freezes the UI; each panel updates as its own answer arrives.
+Two halves, and the split is along the seam that was always there.
+
+| | |
+|---|---|
+| `core.py` | Everything the widget knows: the geo cross-check behind the VPN verdict, the AI token handling, the adapter toggle, the country tables. Imports no GUI toolkit. |
+| `sidecar.py` | Runs those functions on a schedule and writes what they return to stdout as JSON lines. |
+| `app/` | An Electron shell and a React + Tailwind page that reads that stream. |
+| `chrome.py` | One Win32 call Electron does not expose. |
+| `netfast.py` | Local link-state detection, used by `core.gateway()`. |
+
+Data is gathered on background threads, so a slow lookup never freezes the UI;
+each panel updates as its own answer arrives.
 
 The AI usage panel refreshes every 15 minutes with jitter, backs off
 exponentially on failure, and stops entirely — no retries — when a provider
-signals a region block. Poll rates are deliberately conservative: this is a
-status widget, not a scraper.
+signals a region block. The quick checks run on an IP change and on demand,
+never on the network cycle: two of their three lookups are free-tier enrichment
+endpoints, and the cycle runs every three seconds.
 
-Autostart is self-healing. On startup the widget compares its own path
-against the stored `Run` key and rewrites it on a mismatch, so moving the
-folder needs no reinstall.
+[`app/README.md`](app/README.md) covers the parts of the UI that are not
+obvious — why the frost is a separate window per card, why the cards are 8px
+round, and what happens when you drag or switch modes.
+
+### It used to be tkinter
+
+Until recently this was one 6,455-line file, `ip_bar.py`, holding both the data
+and a hand-drawn tkinter interface: a signed-distance-field rasteriser for the
+icons, hand-measured layout, and per-monitor scaling arithmetic. The interface
+is gone. What it did is now done by flexbox and inline SVG, and `core.py` is
+the half that was never UI-shaped to begin with.
 
 ---
 

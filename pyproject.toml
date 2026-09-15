@@ -16,10 +16,9 @@ line-length = 100
 target-version = "py39"
 
 [tool.ruff.lint]
-# The widget is a single dense file where each UI row is one visual line;
-# splitting those statements onto separate lines makes the layout code
-# harder to read, not easier. The rules below are style-only, and every
-# correctness rule (the F set, plus the E rules not listed here) stays on.
+# core.py carries dense, aligned constant tables and one-line data rows that
+# read better as written. The rules below are style-only, and every correctness
+# rule (the F set, plus the E rules not listed here) stays on.
 select = ["E", "F", "W"]
 ignore = [
     "E701",  # colon-joined statements: one UI row per line reads better here
@@ -30,6 +29,13 @@ ignore = [
     "W291",  # trailing whitespace in the aligned constant tables
     "W293",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# E402, import-not-at-top-of-file. sidecar.py cannot import core until it has
+# put the project root on sys.path, so its import block is necessarily split
+# around that line. Scoped rather than added to the global ignore list, because
+# anywhere else a mid-file import really would be worth flagging.
+"sidecar.py" = ["E402"]
 
 [tool.bandit]
 # B101 assert: not used for control flow here.

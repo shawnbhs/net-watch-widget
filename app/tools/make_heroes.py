@@ -9,7 +9,7 @@ existing character art, so the output is yours to ship.
 Draws at 32x36 logical pixels and upscales 4x with nearest-neighbour, which is
 what gives it the hard-edged pixel look the rest of the pack has.
 
-    python tools/make_heroes.py && python tools/gen-metrics.py
+    python app/tools/make_heroes.py && python app/tools/gen-metrics.py
 
 Needs Pillow (pip install Pillow).
 """
@@ -35,8 +35,15 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', '
 # suit / trim / skin / cape / emblem, plus silhouette switches.
 # mask:  'helmet' full face with a visor slit
 #        'cowl'   full head covering, eye slits
+#        'visor'  wraparound band, lit edge to edge
+#        'hood'   raised hood, the face sunk in shadow inside it
 #        'domino' small mask, face shows
 #        'none'   bare face
+#
+# The roster is picked for spread rather than for taste: each entry differs
+# from every other in at least two of palette, mask and build, because at 26px
+# on a card two heroes that share a silhouette and differ only in hue are not
+# two heroes -- they are one hero the eye cannot tell apart.
 HEROES = [
     {
         'id': 'crimson', 'suit': (206, 52, 48), 'trim': (250, 196, 74),
@@ -67,6 +74,41 @@ HEROES = [
         'id': 'violet', 'suit': (126, 78, 190), 'trim': (222, 106, 190),
         'skin': (247, 206, 166), 'cape': (222, 106, 190), 'emblem': (245, 226, 255),
         'mask': 'domino', 'build': 'slim', 'eye': (44, 30, 24),
+    },
+    {
+        # Slate rather than the black the name suggests, and the cape pushed
+        # well below it. At a true near-black the suit and the cape were the
+        # same colour at 26px: the figure read as a slab with a floating silver
+        # belt, and the legs disappeared entirely. A dark hero still has to have
+        # a silhouette inside its own shadow.
+        'id': 'onyx', 'suit': (82, 86, 106), 'trim': (186, 192, 206),
+        'skin': None, 'cape': (26, 28, 38), 'emblem': (214, 222, 240),
+        'mask': 'cowl', 'build': 'bulky', 'eye': (150, 220, 255),
+    },
+    {
+        'id': 'solar', 'suit': (244, 190, 52), 'trim': (255, 246, 214),
+        'skin': None, 'cape': (236, 158, 40), 'emblem': (255, 252, 230),
+        'mask': 'visor', 'build': 'normal', 'eye': (255, 240, 180),
+    },
+    {
+        'id': 'abyss', 'suit': (28, 102, 116), 'trim': (96, 208, 206),
+        'skin': None, 'cape': None, 'emblem': (150, 240, 236),
+        'mask': 'helmet', 'build': 'slim', 'eye': (140, 246, 240),
+    },
+    {
+        'id': 'sable', 'suit': (56, 60, 54), 'trim': (124, 142, 84),
+        'skin': (224, 186, 150), 'cape': None, 'emblem': (170, 190, 120),
+        'mask': 'hood', 'build': 'slim', 'eye': (236, 240, 220),
+    },
+    {
+        'id': 'bronze', 'suit': (168, 104, 56), 'trim': (86, 166, 164),
+        'skin': (238, 198, 160), 'cape': (140, 84, 44), 'emblem': (240, 214, 170),
+        'mask': 'hood', 'build': 'bulky', 'eye': (255, 236, 196),
+    },
+    {
+        'id': 'vermeil', 'suit': (198, 46, 120), 'trim': (255, 214, 140),
+        'skin': None, 'cape': (168, 36, 102), 'emblem': (255, 236, 200),
+        'mask': 'visor', 'build': 'normal', 'eye': (255, 230, 250),
     },
 ]
 
@@ -204,6 +246,23 @@ def draw_hero(hero, pose):
         rect(d, cx - hw, head_t, cx + hw, head_b, trim)
         rect(d, cx - hw + 1, head_t + 4, cx - 1, head_t + 6, hero['eye'])
         rect(d, cx + 1, head_t + 4, cx + hw - 1, head_t + 6, hero['eye'])
+    elif mask == 'visor':
+        # A band that runs edge to edge, unlike the helmet's inset slit. At this
+        # size that full width is the whole difference between the two reading
+        # as different headgear rather than as the same helmet in another colour.
+        rect(d, cx - hw, head_t, cx + hw, head_b, suit)
+        rect(d, cx - hw, head_t, cx + hw, head_t + 2, shade(suit, 1.15))
+        rect(d, cx - hw, head_t + 3, cx + hw, head_t + 6, trim)
+        rect(d, cx - hw, head_t + 4, cx + hw, head_t + 5, hero['eye'])
+    elif mask == 'hood':
+        # The hood is a pixel proud of the head on every side, which is what
+        # makes it a hood rather than a helmet: the silhouette is bigger than
+        # the skull inside it, and the face sits back in its shadow.
+        rect(d, cx - hw - 1, head_t - 1, cx + hw + 1, head_b, trim)
+        rect(d, cx - hw - 1, head_t - 1, cx + hw + 1, head_t + 1, shade(trim, 1.22))
+        rect(d, cx - hw + 1, head_t + 3, cx + hw - 1, head_b - 1, shade(skin, 0.42))
+        rect(d, cx - hw + 2, head_t + 4, cx - 1, head_t + 5, hero['eye'])
+        rect(d, cx + 1, head_t + 4, cx + hw - 2, head_t + 5, hero['eye'])
     elif mask == 'domino':
         d.rectangle([cx - hw, head_t, cx + hw, head_t + 3], fill=shade(skin, 0.72))   # hair
         d.rectangle([cx - hw, head_t + 3, cx + hw, head_t + 6], fill=trim)            # band

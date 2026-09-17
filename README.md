@@ -257,6 +257,36 @@ Pets are hidden while the widget is collapsed to its mini bar: a tab is a single
 card, and with the topmost one reserved as the ceiling there is no ground left
 in it. Pets out on the desktop carry on regardless.
 
+### The hero pack
+
+One species, **Hero**, is not third-party art: its twelve superheroes are drawn
+from scratch by `app/tools/make_heroes.py` as parametric pixel art — a shared
+chibi body rig posed frame by frame, plus a palette and three silhouette
+switches per character (cape, head, build). They carry no third-party licence,
+and adding a thirteenth is an entry in the `HEROES` table and a re-run.
+
+| | Palette | Head | Build | Cape |
+|---|---|---|---|---|
+| crimson | red / gold | helmet | normal | — |
+| verdant | green / navy | bare | bulky | — |
+| midnight | indigo / deep blue | cowl | normal | yes |
+| frost | white / ice blue | helmet | slim | yes |
+| ember | orange / rust | domino | normal | — |
+| violet | purple / pink | domino | slim | yes |
+| onyx | slate / silver | cowl | bulky | yes |
+| solar | gold / cream | visor | normal | yes |
+| abyss | deep teal / aqua | helmet | slim | — |
+| sable | charcoal / olive | hood | slim | — |
+| bronze | copper / teal | hood | bulky | yes |
+| vermeil | magenta / warm gold | visor | normal | yes |
+
+**Marvel, DC and other licensed characters are not included and cannot be.** No
+sprite set for them exists under a licence that permits redistribution — what
+circulates online is unlicensed fan art, and this repository is public and MIT,
+so bundling it would pass the problem to everyone who clones it. The hero pack
+is here to scratch that itch honestly. If you own a pack you are entitled to
+use, the next section is all it takes to add it.
+
 ### Adding your own sprites
 
 The species list is built by scanning `app/assets/pets/` at startup, so adding a

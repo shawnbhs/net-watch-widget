@@ -12,6 +12,10 @@ const paths = {
   clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18M12 7v5l3.5 2',
   spark: 'M12 3v18M3 12h18M6.5 6.5l11 11M17.5 6.5l-11 11',
   shield: 'M12 3l7 3v5.5c0 4.2-2.9 7.8-7 9.5-4.1-1.7-7-5.3-7-9.5V6z',
+  // Four toes and a pad. Drawn as outlines rather than filled, because every
+  // other glyph here is a 2px stroke and a solid shape beside them reads as a
+  // different weight of icon.
+  paw: 'M8.6 7a1.5 2 0 1 0 0 .01M15.4 7a1.5 2 0 1 0 0 .01M4.8 11.6a1.4 1.7 0 1 0 0 .01M19.2 11.6a1.4 1.7 0 1 0 0 .01M12 12.2c-2.6 0-4.8 2.3-4.8 4.7 0 1.6 1.2 2.6 2.7 2.6.9 0 1.4-.3 2.1-.3s1.2.3 2.1.3c1.5 0 2.7-1 2.7-2.6 0-2.4-2.2-4.7-4.8-4.7Z',
 }
 
 /**

@@ -17,6 +17,7 @@ Starts automatically with Windows and stays out of the way.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Using it](#using-it)
+- [Pets](#pets)
 - [Configuration](#configuration)
 - [AI usage tracking](#ai-usage-tracking)
 - [Restarting after an edit](#restarting-after-an-edit)
@@ -66,6 +67,10 @@ holds the red for a minute — long enough to still be there when you next glanc
 over. Hover it to see what the address was before. Only a move between two real
 addresses counts: a failed lookup is not a move, so a network hiccup will not
 cry wolf.
+
+**Pets**, if you want them — pixel animals that either walk the tops of the
+cards and hop between them, or leave the widget and roam the desktop. Off until
+you add one. See [Pets](#pets).
 
 ---
 
@@ -199,6 +204,70 @@ enabled=no` is the other common way to cut Wi-Fi, it survives a reboot, and it
 stops the interface associating even after the adapter is enabled again — an
 adapter that reads *Up* but will not connect. The widget clears it on every
 restore, so you only need this if you are recovering by hand.
+
+---
+
+## Pets
+
+The widget keeps pixel pets. They are optional, off until you add one, and they
+come in two kinds.
+
+Open the **Pets** card at the bottom of the full view. **+ Add a pet** shows all
+23 species; pick one, pick a colour if it has several, and it drops in. Each pet
+gets a row of its own with a **Widget / Screen** switch:
+
+- **Widget** — it lives on the widget. It walks the top edge of a card, hops
+  between cards, and stands about on them. Its body reaches up over the card
+  above, so a pet crossing the panel will briefly pass in front of a readout.
+  That is the trade: the cards are 8px apart and there is nowhere else for it to
+  be. The topmost card is the ceiling and nothing stands on it, because there is
+  no window left above it to draw a pet in.
+- **Screen** — it leaves the widget and roams your desktop, walking and hopping
+  wherever it likes and resting just above the taskbar. This opens a second,
+  full-screen, click-through window covering your **primary display**; it exists
+  only while at least one pet is out there, and closes itself when the last one
+  comes home.
+
+The **New pets live in the** switch at the top of the card sets which of the two
+a newly added pet starts in. Nothing stops you having some of each.
+
+### Handling them
+
+| Gesture | What happens |
+|---|---|
+| Click a pet | Poke it |
+| Drag a pet | Pick it up; let go and it falls, keeping the throw |
+| Double-click a pet | Send it across — widget to desktop, or desktop back to the widget |
+| Right-click a widget pet | Hop it up one card |
+| Scroll over a widget pet | Move it up or down between cards |
+| Right-click a desktop pet | Tell it to follow your cursor, or to stop |
+
+Everything a gesture does has a button equivalent in the card, so nothing is
+drag-only.
+
+### Settings
+
+The **⋯** button in the card's header opens the tuning: **size** (16–40px, and
+it scales with the widget), **speed**, **liveliness** (how much they move about
+versus lie down), **react to the cursor**, **dance breaks**, **contact
+shadows** and **reduced motion**. These apply to every pet at once — only the
+widget/screen choice is per pet. The roster and the settings are remembered.
+
+Pets are hidden while the widget is collapsed to its mini bar: a tab is a single
+card, and with the topmost one reserved as the ceiling there is no ground left
+in it. Pets out on the desktop carry on regardless.
+
+### Adding your own sprites
+
+The species list is built by scanning `app/assets/pets/` at startup, so adding a
+folder of `<colour>_<action>_8fps.gif` clips there is enough to add a species —
+no code change. Re-measure them afterwards, or the pet will resize as it changes
+animation:
+
+```powershell
+pip install Pillow
+python app/tools/gen-metrics.py
+```
 
 ---
 
@@ -395,6 +464,7 @@ Two halves, and the split is along the seam that was always there.
 | `app/` | An Electron shell and a React + Tailwind page that reads that stream. |
 | `chrome.py` | One Win32 call Electron does not expose. |
 | `netfast.py` | Local link-state detection, used by `core.gateway()`. |
+| `app/assets/pets/` | The sprite set, scanned at startup to build the species list. |
 
 Data is gathered on background threads, so a slow lookup never freezes the UI;
 each panel updates as its own answer arrives.
@@ -407,7 +477,8 @@ endpoints, and the cycle runs every three seconds.
 
 [`app/README.md`](app/README.md) covers the parts of the UI that are not
 obvious — why the frost is a separate window per card, why the cards are 8px
-round, and what happens when you drag or switch modes.
+round, what happens when you drag or switch modes, and how the pets find the
+ground under them.
 
 ### It used to be tkinter
 
@@ -422,3 +493,6 @@ the half that was never UI-shaped to begin with.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The pet sprites come from [vscode-pets](https://github.com/tonybaloney/vscode-pets) (MIT). Per-artist
+attribution is in [app/assets/pets/CREDITS.md](app/assets/pets/CREDITS.md).

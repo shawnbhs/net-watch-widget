@@ -72,4 +72,27 @@ contextBridge.exposeInMainWorld('nw', {
   dragEnd() { ipcRenderer.send('drag-end') },
   /** Remember the hand-set widget size. Sent when the grip is released. */
   scale(value) { ipcRenderer.send('scale', value) },
+
+  /**
+   * The species list, built by scanning assets/pets in the main process.
+   *
+   * Asked for once, on mount. It is four hundred filenames' worth of structure
+   * and it cannot change while the app is running, so there is nothing to
+   * subscribe to.
+   */
+  petManifest() { return ipcRenderer.invoke('pet-manifest') },
+  /**
+   * Publish the pets that are loose on the desktop, and how they behave.
+   *
+   * The widget owns the whole roster; this is the slice of it that belongs to
+   * the overlay. Sending an empty list is how the overlay window is closed --
+   * see `syncOverlay`.
+   */
+  petsSync(state) { ipcRenderer.send('pets-sync', state) },
+  /** A loose pet was sent home from the desktop. Returns an unsubscribe. */
+  onPetHome(fn) {
+    const handler = (_e, id) => fn(id)
+    ipcRenderer.on('pet-home', handler)
+    return () => ipcRenderer.off('pet-home', handler)
+  },
 })

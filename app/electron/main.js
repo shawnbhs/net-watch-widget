@@ -22,6 +22,7 @@ const { app, BrowserWindow, ipcMain, screen, shell } = require('electron')
 const { spawn } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
+const pets = require('./pets')
 
 const ROOT = path.join(__dirname, '..', '..')
 const DEV = process.argv.includes('--dev')
@@ -115,7 +116,10 @@ function createWindow() {
   win.setVisibleOnAllWorkspaces(true)
 
   win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
-  win.on('closed', () => { win = null; destroyPanes() })
+  // The overlay goes with it. It is a window of its own, so leaving it open
+  // would both keep `window-all-closed` from firing and leave pets wandering a
+  // desktop whose widget no longer exists.
+  win.on('closed', () => { win = null; destroyPanes(); pets.closeOverlay() })
 
   win.on('move', onWindowMove)
 
@@ -143,10 +147,14 @@ function createWindow() {
         : process.argv.includes('--mini')
           ? 'Mini bar'
           : (process.argv.find((a) => a.startsWith('--click='))?.slice(8) ?? '')
-      if (click) {
-        const wait = Number(process.argv.find((a) => a.startsWith('--wait='))?.slice(7) || 700)
+      // Comma-separated, and pressed in order, because some states are simply
+      // not one click deep: adding a pet is "Add a pet" and then a species, and
+      // a diagnostic that could only reach the first of those could never
+      // photograph a pet at all.
+      const wait = Number(process.argv.find((a) => a.startsWith('--wait='))?.slice(7) || 700)
+      for (const step of click.split(',').filter(Boolean)) {
         await win.webContents.executeJavaScript(
-          `(() => { const t = ${JSON.stringify(click)};`
+          `(() => { const t = ${JSON.stringify(step)};`
           + ' const el = document.querySelector(`[aria-label="${t}"],[title^="${t}"]`)'
           + '   || [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === t);'
           + ' if (!el) return false;'
@@ -840,6 +848,22 @@ ipcMain.on('panes', (_e, rects) => {
   syncPanes(rects)
 })
 ipcMain.on('panes-hide', () => hidePanes())
+
+// ── pets ──────────────────────────────────────────────────────────────────────
+//
+// The widget owns the roster; the overlay only ever draws the part of it that
+// has been let loose on the desktop. That split is why every message here runs
+// one way -- widget to overlay -- with the single exception of `pets-home`,
+// which is a pet being handed back.
+
+ipcMain.handle('pet-manifest', () => pets.getManifest())
+ipcMain.handle('pets-bounds', () => pets.overlayBounds())
+ipcMain.on('pets-sync', (_e, state) => pets.syncOverlay(state))
+ipcMain.on('pets-interactive', (_e, v) => pets.setInteractive(Boolean(v)))
+ipcMain.on('pets-home', (_e, id) => {
+  if (win && !win.isDestroyed()) win.webContents.send('pet-home', id)
+})
+
 ipcMain.on('cmd', (_e, cmd) => {
   if (cmd?.cmd === 'quit') { app.quit(); return }
   if (cmd?.cmd === 'open' && cmd.url) { shell.openExternal(cmd.url); return }
@@ -936,6 +960,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('before-quit', () => {
     savePosition()
     destroyPanes()
+    pets.closeOverlay()
     toSidecar({ cmd: 'quit' })
     if (sidecar && !sidecar.killed) setTimeout(() => sidecar.kill(), 250)
   })

@@ -8,3 +8,5 @@
 *.bat text eol=crlf
 
 *.png binary
+
+*.gif binary

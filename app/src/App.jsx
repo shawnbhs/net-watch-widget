@@ -7,11 +7,16 @@ import { Ring } from './components/Ring.jsx'
 import { IconButton, NetDot } from './components/Footer.jsx'
 import { SectionIcon } from './components/Icons.jsx'
 import { CountryChip } from './components/Country.jsx'
+import { PetsCard } from './components/Pets.jsx'
+import { PetsProvider, useOverlaySync } from './pets/store.jsx'
+import { PetLayer } from './pets/PetLayer.jsx'
 
 export default function App() {
   return (
     <PaneProvider>
-      <Widget />
+      <PetsProvider>
+        <Widget />
+      </PetsProvider>
     </PaneProvider>
   )
 }
@@ -209,6 +214,12 @@ function Widget() {
   const ipChanged = useChanged(s.net?.ip)
   const rfChanged = useChanged(s.net?.ip2)
 
+  // Publishes the pets that have been let loose, which is what opens and closes
+  // the desktop overlay window. Watched from here for the same reason the
+  // address alerts are: the roster outlives every view switch, and the overlay
+  // must not blink out because the widget was collapsed to its tab.
+  useOverlaySync()
+
   // Hide the frost before the new layout renders, not after, and keep it hidden
   // for the whole transition. A pane is an OS window: repositioning one lands
   // about a tenth of a second behind the page, so a frost that tried to follow
@@ -293,46 +304,61 @@ function Widget() {
   // frost's rounded corners are cut off -- any padding outside the card would
   // put those corners back on screen.
   return (
-    <div
-      ref={shell}
-      className={mini ? 'w-fit' : 'w-[372px] px-1 py-2'}
-      style={{ zoom: scale }}
-      data-flat={moving || animating || resizing}
-      onContextMenu={(e) => { e.preventDefault(); if (mini) swapTab(); else swapMode() }}
-    >
-      {mini ? (
-        <MiniBar
-          s={s}
-          edge={edge}
-          locked={locked}
-          onExpand={swapTab}
-          changed={ipChanged.on ? ipChanged : rfChanged}
-        />
-      ) : (
-        <div className="flex flex-col gap-2">
-          <TitleCard s={s} locked={locked} />
-          <ModeBox compact={compact} shell={shell} onSettled={onSettled}>
-            {compact
-              ? <Compact s={s} copy={copy} ipChanged={ipChanged} />
-              : <Full s={s} copy={copy} ipChanged={ipChanged} rfChanged={rfChanged} />}
-          </ModeBox>
-          <FooterCard
+    <>
+      <div
+        ref={shell}
+        className={mini ? 'w-fit' : 'w-[372px] px-1 py-2'}
+        style={{ zoom: scale }}
+        data-flat={moving || animating || resizing}
+        onContextMenu={(e) => { e.preventDefault(); if (mini) swapTab(); else swapMode() }}
+      >
+        {mini ? (
+          <MiniBar
             s={s}
-            compact={compact}
+            edge={edge}
             locked={locked}
-            spinning={spinning}
-            onToggleCompact={swapMode}
-            onToggleMini={swapTab}
-            onToggleLock={() => setLocked((l) => !l)}
-            onRefresh={refresh}
-            scale={scale}
-            onScale={setScale}
-            onScaleStart={() => { suspend(); setResizing(true) }}
-            onScaleEnd={() => { setResizing(false); resume() }}
+            onExpand={swapTab}
+            changed={ipChanged.on ? ipChanged : rfChanged}
           />
-        </div>
-      )}
-    </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            <TitleCard s={s} locked={locked} />
+            <ModeBox compact={compact} shell={shell} onSettled={onSettled}>
+              {compact
+                ? <Compact s={s} copy={copy} ipChanged={ipChanged} />
+                : <Full s={s} copy={copy} ipChanged={ipChanged} rfChanged={rfChanged} />}
+            </ModeBox>
+            <FooterCard
+              s={s}
+              compact={compact}
+              locked={locked}
+              spinning={spinning}
+              onToggleCompact={swapMode}
+              onToggleMini={swapTab}
+              onToggleLock={() => setLocked((l) => !l)}
+              onRefresh={refresh}
+              scale={scale}
+              onScale={setScale}
+              onScaleStart={() => { suspend(); setResizing(true) }}
+              onScaleEnd={() => { setResizing(false); resume() }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Outside the shell on purpose, and outside its `zoom` with it.
+
+          The pets walk on the card rectangles the panes are measured from, and
+          those are `getBoundingClientRect` values -- already scaled. A layer
+          inside the shell would be laying out in unscaled units and the two
+          would agree only at scale 1. Being a sibling also keeps it out of the
+          ResizeObserver that sizes the window to its content, which a
+          full-window layer would otherwise peg to the screen.
+
+          Hidden while tabbed: a tab is one card, and with the topmost excluded
+          as the pets' ceiling there is no ground left in it to stand on. */}
+      <PetLayer enabled={!mini} scale={scale} />
+    </>
   )
 }
 
@@ -598,6 +624,10 @@ function Full({ s, copy, ipChanged, rfChanged }) {
 
       <AiCard ai={s.ai} rise={rise} />
       <ChecksCard checks={s.checks} ip={s.net?.ip} rise={rise} />
+      {/* Last of the cards, just above the footer: it is the one row here that
+          is a control rather than a readout, so it sits with the controls
+          rather than interrupting the run of numbers. */}
+      <PetsCard rise={rise} />
     </>
   )
 }

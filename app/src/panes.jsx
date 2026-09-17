@@ -44,6 +44,17 @@ export function PaneProvider({ children }) {
   const nodes = useRef(new Map())
   const frame = useRef(0)
   const last = useRef('')
+  /**
+   * The last batch, and who else wants to see it.
+   *
+   * The pets walk on the tops of these same rectangles, and they need them in
+   * the same coordinates and at the same moment the frost does -- a pet reading
+   * a card's position from a second, later measurement would visibly lag the
+   * card it is standing on whenever the layout moved. So the one pass that
+   * already runs feeds both.
+   */
+  const rects = useRef([])
+  const subs = useRef(new Set())
   // While a layout is animating, every measurement is of a shape the cards are
   // only passing through. Sending those would march the panes across the screen
   // a frame behind, which is the one thing the frost cannot do smoothly.
@@ -52,12 +63,12 @@ export function PaneProvider({ children }) {
   const flush = useCallback(() => {
     frame.current = 0
     if (suspended.current) return
-    const rects = []
+    const batch = []
     for (const [id, node] of nodes.current) {
       if (!node || !node.isConnected) continue
       const r = layoutRect(node)
       if (r.w < 2 || r.h < 2) continue
-      rects.push({ id, ...r })
+      batch.push({ id, ...r })
     }
 
     // Visual order, not registration order. Panes are handed out by position in
@@ -66,14 +77,16 @@ export function PaneProvider({ children }) {
     // and every pane gets reassigned to a different card. The set of rectangles
     // is the same either way, so nothing looked wrong, but it moved every window
     // instead of the few that actually changed.
-    rects.sort((a, b) => a.y - b.y || a.x - b.x)
+    batch.sort((a, b) => a.y - b.y || a.x - b.x)
     // Card geometry is stable between data updates, and every send costs an IPC
     // hop plus a SetWindowPos per pane. Skipping an identical batch is what
     // keeps an idle widget genuinely idle.
-    const sig = JSON.stringify(rects)
+    const sig = JSON.stringify(batch)
     if (sig === last.current) return
     last.current = sig
-    window.nw?.panes(rects)
+    rects.current = batch
+    for (const fn of subs.current) fn(batch)
+    window.nw?.panes(batch)
   }, [])
 
   const schedule = useCallback(() => {
@@ -146,8 +159,15 @@ export function PaneProvider({ children }) {
     }
   }, [schedule])
 
+  /** Watch the measured card rectangles. Returns an unsubscribe. */
+  const watch = useCallback((fn) => {
+    subs.current.add(fn)
+    if (rects.current.length) fn(rects.current)
+    return () => subs.current.delete(fn)
+  }, [])
+
   return (
-    <PaneCtx.Provider value={{ register, schedule, blank, suspend, resume }}>
+    <PaneCtx.Provider value={{ register, schedule, blank, suspend, resume, watch }}>
       {children}
     </PaneCtx.Provider>
   )
@@ -171,6 +191,17 @@ export function usePaneSync(dep) {
 export function usePaneBlank() {
   const ctx = useContext(PaneCtx)
   return useCallback(() => ctx?.blank(), [ctx])
+}
+
+/**
+ * Subscribe to the measured card rectangles.
+ *
+ * `fn` must be stable, or every render resubscribes. The pet layer holds it in
+ * a ref for exactly that reason.
+ */
+export function usePaneRects(fn) {
+  const ctx = useContext(PaneCtx)
+  useEffect(() => ctx?.watch(fn), [ctx, fn])
 }
 
 /** Suspend and resume geometry reporting around an animation. */

@@ -1,4 +1,7 @@
 @import "tailwindcss";
+/* Shared with the desktop overlay, which is a separate document and imports it
+   on its own — so the pets look the same wherever they happen to be standing. */
+@import "./pets/pets.css";
 
 /* Design tokens lifted from the imported Net Watch design, with one deliberate
    change: every font size is scaled down. The design was drawn at 17-19px for a
@@ -193,4 +196,75 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .nw-card { transition: none; }
+}
+
+/* ── pets ──────────────────────────────────────────────────────────────────── */
+
+/* The layer the widget's pets walk on.
+
+   Fixed and full-window rather than placed inside the shell, because it has to
+   share a coordinate space with the card rectangles the panes are measured in —
+   and those are `getBoundingClientRect` values, which the shell's `zoom` has
+   already been applied to. It is also transparent to the mouse: a full-window
+   layer that took clicks would swallow every one of them meant for a card. Only
+   the sprites themselves take the pointer, which is what makes a pet draggable
+   without the widget behind it going deaf. */
+.nw-pets {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* The pets card's own controls.
+
+   A native range and a native checkbox on a dark translucent panel come out as
+   Windows' own light-grey chrome, which is the one thing on this widget that
+   would not be made of glass. Both are restyled from scratch rather than
+   tinted, because the accent colour is the only part of the default either
+   one lets you change. */
+.nw-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  outline: none;
+}
+
+.nw-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: linear-gradient(to bottom, #3d95ff, #1f77f0);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  cursor: pointer;
+}
+
+.nw-check {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border-radius: 3px;
+  border: 1px solid var(--color-edge-soft);
+  background: rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+}
+
+/* The tick is an inline SVG rather than a ::before glyph or a pair of clipped
+   gradients. Both of those were tried: an `appearance: none` input does not
+   reliably establish a containing block for a pseudo-element, and two gradients
+   at 12px land a pixel out and read as a slash rather than a tick. */
+.nw-check:checked {
+  border-color: rgba(255, 255, 255, 0.45);
+  background-color: #2a86f5;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2 4.8 8.5 9.5 3.6' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-size: 12px 12px;
+  background-repeat: no-repeat;
 }

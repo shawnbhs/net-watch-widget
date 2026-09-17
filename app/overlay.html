@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Net Watch pets</title>
+    <style>
+      /* No frost, no cards, no colour: this document is a transparent sheet
+         over the desktop and the only thing ever drawn on it is a sprite. */
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+      #stage {
+        position: absolute;
+        inset: 0;
+        /* The window is click-through at the OS level; this keeps the stage
+           itself out of the way so only the sprites answer the pointer. */
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script type="module" src="/src/pets/overlay.js"></script>
+  </body>
+</html>

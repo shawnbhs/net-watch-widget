@@ -279,8 +279,8 @@ country · **Local / gateway** and both **ping targets** · **Hardware** and
 **Timezone** · **AI usage**: Claude 5h/week/model and GPT 5h/week, each with a
 countdown, plus the plan line · **Quick checks**: ASN, ISP, proxy/VPN,
 datacenter, hostname, DNS leak and a connection score, with five external
-lookups · a footer carrying the local and Tehran clocks, the VPN chip and the
-controls.
+lookups · **Pets**: the species picker, the roster, and where each pet lives ·
+a footer carrying the local and Tehran clocks, the VPN chip and the controls.
 
 The two Runflare and IP-address cards can disagree about the country -- that is
 the point of the second lookup, and an Iranian exit is detected from the address
@@ -312,6 +312,79 @@ of the other.
 
 ---
 
+## The pets, and where they find the ground
+
+The pets are one feature drawn by two renderers in two processes, and the reason
+is the same window constraint the frost has: this window is **sized to its own
+content**. A pet let loose on the desktop cannot live in it, because there is no
+desktop inside it — the window is 372px wide and moves when the widget is
+dragged.
+
+So there are two worlds, sharing `src/pets/engine.js` and nothing else:
+
+| | Widget pets | Desktop pets |
+|---|---|---|
+| Where they are drawn | `src/pets/PetLayer.jsx`, in this window | `overlay.html`, a second full-screen window |
+| Ground | the top edge of every card | none — they roam and hop between heights |
+| Who owns the roster | `src/pets/store.jsx` | nobody: it is handed the list |
+
+### The ground is the pane geometry, reused
+
+A widget pet walks on the top edge of a card, and it reads those edges from the
+**same measurement pass the acrylic panes use** — `panes.jsx` gained a
+subscription, not a second `getBoundingClientRect` loop. That is not only
+frugality. A pet reading a card's position from a later, separate measurement
+would visibly lag the card it is standing on every time the layout moved, in
+exactly the way a pane would.
+
+Two consequences fall out of it for free. A card that stops existing — a switch
+to compact view, where every `id` changes — leaves its pet standing on nothing,
+so the pet falls and lands on whatever is below; that is both the honest
+animation and the one that needed no special case. And under the widget's `zoom`
+the rectangles are already scaled, which is why the pet layer is a **sibling of
+the shell rather than a child of it**: it has to share that coordinate space,
+and a layer inside the shell would be laying out in unscaled units.
+
+Being a sibling also keeps it out of the `ResizeObserver` that sizes the window
+to its content — a full-window layer inside the shell would peg the widget to
+the screen.
+
+### Why the topmost card is a ceiling
+
+A pet's body reaches *up* from its feet, so standing on a card means overlapping
+the card above. On the topmost card there is nothing above but the edge of a
+window sized to exactly its content, and the pet would be sliced off by it. So
+the topmost rectangle is dropped from the platform list, and the pet size is
+capped at 40px — the thinnest cards here, the title and the footer, are 43px.
+
+### The desktop overlay
+
+`electron/pets.js` owns a second `BrowserWindow`: full-screen, transparent,
+always-on-top, and **click-through by default**. Left solid it would make the
+desktop unusable, so it runs with
+`setIgnoreMouseEvents(true, { forward: true })` — clicks fall through while
+mousemove keeps arriving, which is what lets the page hit-test its own pets and
+ask for the window to be made solid only while the cursor is over one.
+
+The window's existence follows the roster rather than a setting: it is created
+when the first pet is let loose and destroyed when the last one comes home. A
+full-screen always-on-top window that exists for no reason is the sort of thing
+that turns up in a bug report about something else entirely.
+
+Messages run one way — the widget owns the roster and publishes the loose half
+of it — with a single exception: a pet double-clicked on the desktop reports
+itself, and the widget moves it home. The overlay never edits the list it draws.
+
+### The sprites are not bundled
+
+`app/assets/pets/` is 4.9MB of GIF referenced by names built at runtime from the
+manifest, so it sits outside the vite build and is loaded by a relative
+`file://` path from `dist/`. Putting it through the bundler would copy every
+frame into `dist/` on every build for no benefit. `electron/pets.js` scans the
+folder at startup, which is why dropping a new species in needs no code change.
+
+---
+
 ## Files
 
 | Path | What it is |
@@ -321,7 +394,13 @@ of the other.
 | `src/panes.jsx` | Measures cards, batches rectangles to the main process |
 | `src/useSidecar.js` | Folds the JSON-line stream into one state object |
 | `src/App.jsx` | Layout: the tab, and the compact and full modes |
-| `src/components/` | Card, bar, ring, icon button, country chip |
+| `src/components/` | Card, bar, ring, icon button, country chip, pets card |
+| `electron/pets.js` | Sprite manifest, and the full-screen pet overlay window |
+| `src/pets/engine.js` | One pet and its world: sprites, physics, the state machine |
+| `src/pets/PetLayer.jsx` | The widget's pets, walking the card tops |
+| `src/pets/store.jsx` | The roster, its persistence, and the push to the overlay |
+| `src/pets/overlay.js` | The desktop overlay page — no React, no Tailwind |
+| `tools/gen-metrics.py` | Re-measures sprite bounding boxes after adding art |
 | `scripts/shot.py` | Screenshot tool — see its docstring before using it |
 
 ---
@@ -341,6 +420,10 @@ Photographing a transparent always-on-top window has three traps, all of which
 
 `--shot` sidesteps all three by rendering the page directly to `page.png`,
 composited over an opaque colour so white-on-transparent text is readable.
+
+`--click=` takes a comma-separated list of control labels and presses them in
+order, because some states are not one click deep — photographing a pet means
+"+  Add a pet" and then a species.
 
 `--compact` and `--mini` press the corresponding footer button before the
 capture, and `--click=<label>` presses anything else by its `aria-label`.

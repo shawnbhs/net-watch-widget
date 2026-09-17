@@ -1,0 +1,39 @@
+/* What a pet looks like, in both of the documents that draw one.
+   The widget imports this through index.css; the desktop overlay imports it
+   directly, because it is a separate page in a separate window and shares
+   nothing else with the widget's stylesheet. */
+
+.pet-sprite {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: auto;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-drag: none;
+  /* The art is 8fps pixel art scaled to an arbitrary height; smoothing it turns
+     a crisp sprite into a smudge. */
+  image-rendering: pixelated;
+  will-change: transform;
+}
+
+.pet-sprite.is-held {
+  cursor: grabbing;
+}
+
+/* A contact shadow, not a drop shadow: an ellipse on the ground the pet is
+   standing on, which the pet's own render moves and fades as it leaves it. */
+.pet-shadow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  border-radius: 50%;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 0, 0, 0.45) 0%,
+    rgba(0, 0, 0, 0.22) 55%,
+    rgba(0, 0, 0, 0) 78%
+  );
+  will-change: transform, opacity;
+}

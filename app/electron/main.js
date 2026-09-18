@@ -71,7 +71,9 @@ function createWindow() {
   // size is remembered for exactly that frame; the fallbacks are only ever used
   // by a profile that has never been collapsed.
   const guess = tabSize
-    ?? (tabEdge === 'top' ? { width: 330, height: 62 } : { width: 66, height: 300 })
+    ?? (HORIZONTAL_EDGES.includes(tabEdge)
+      ? { width: 330, height: 62 }
+      : { width: 66, height: 300 })
   const start = tabbed
     ? tabBounds(guess.width, guess.height, freePos)
     : { ...FULL_SIZE, ...freePos }
@@ -579,10 +581,25 @@ const TAB_INSET = 16
  * arithmetic and stays here. That split is why the main process tells the page
  * about an edge change and nothing else.
  *
- * There is no bottom edge on purpose: that is where the taskbar lives, and a
- * tab that overhangs it would sit on top of the Start button.
+ * The bottom edge was left out at first on the grounds that the taskbar lives
+ * there and a tab overhanging it would sit on top of the Start button. That
+ * reasoning was wrong: every dock is computed against `screen.workArea`, which
+ * already has the taskbar subtracted from it, so the bottom of the work area is
+ * the top of the taskbar and nothing ever overlaps it. The bleed is the only
+ * part that crosses that line, and ten pixels of a tab tucked behind the
+ * taskbar is exactly the effect the bleed exists to produce. Bottom is a real
+ * edge, and it behaves as top does -- a horizontal row, with the same three
+ * stops along it.
  */
-const EDGES = ['top', 'left', 'right']
+const EDGES = ['top', 'bottom', 'left', 'right']
+/**
+ * The two edges a tab lies along as a row rather than a column.
+ *
+ * The shape is the renderer's business, but the arithmetic here has to agree
+ * with it: which axis the tab is placed along, and which of its two dimensions
+ * the stops are measured against, both follow from this and nothing else.
+ */
+const HORIZONTAL_EDGES = ['top', 'bottom']
 /**
  * How much nearer another edge has to be before the tab leaves the one it is
  * on, as a fraction of the screen. The boundaries between three edges are
@@ -648,24 +665,40 @@ function alongStop(origin, extent, size) {
   return origin + Math.round((extent - size) / 2)
 }
 
-/** Where the tab sits: hard against its edge, at its place along it. */
+/**
+ * Where the tab sits: hard against its edge, at its place along it.
+ *
+ * `at` is the point that decides *which display* this is all measured on, and
+ * it is not optional on any path that follows a drag. Left to its default it
+ * falls back to the window's own centre, which during and just after a gesture
+ * is the one place that cannot be trusted -- see `workAreaAt`.
+ *
+ * Each edge pins one coordinate and lets `alongStop` choose the other. The
+ * pinned one is pushed TAB_BLEED px past the work area, outwards: negative at
+ * the top and left, past the far corner at the bottom and right, so the tab
+ * hangs off the screen by the same amount whichever edge it is on.
+ */
 function tabBounds(width, height, at) {
   const area = workAreaAt(at)
-  if (tabEdge === 'top') {
-    return {
-      x: alongStop(area.x, area.width, width),
-      y: area.y - TAB_BLEED,
-      width,
-      height,
-    }
-  }
-  return {
-    x: tabEdge === 'left'
-      ? area.x - TAB_BLEED
-      : area.x + area.width + TAB_BLEED - width,
-    y: alongStop(area.y, area.height, height),
-    width,
-    height,
+  switch (tabEdge) {
+    case 'top':
+      return { x: alongStop(area.x, area.width, width), y: area.y - TAB_BLEED, width, height }
+    case 'bottom':
+      return {
+        x: alongStop(area.x, area.width, width),
+        y: area.y + area.height + TAB_BLEED - height,
+        width,
+        height,
+      }
+    case 'left':
+      return { x: area.x - TAB_BLEED, y: alongStop(area.y, area.height, height), width, height }
+    default:
+      return {
+        x: area.x + area.width + TAB_BLEED - width,
+        y: alongStop(area.y, area.height, height),
+        width,
+        height,
+      }
   }
 }
 
@@ -677,9 +710,16 @@ function tabBounds(width, height, at) {
  * much less screen to cross vertically.
  */
 function resolveEdge(point) {
-  const area = workAreaAt()
+  // The pointer's display, not the window's. The two disagree by half a tab
+  // for the whole of every drag -- the hand is in the middle of the thing it is
+  // carrying -- and on a multi-monitor desktop half a tab is enough to land the
+  // two on opposite sides of a seam. When that happens the pointer is compared
+  // against some *other* screen's rectangle, and the edge it picks is an edge
+  // of a screen the user is not pointing at.
+  const area = workAreaAt(point)
   const near = {
     top: (point.y - area.y) / area.height,
+    bottom: (area.y + area.height - point.y) / area.height,
     left: (point.x - area.x) / area.width,
     right: (area.x + area.width - point.x) / area.width,
   }
@@ -694,8 +734,11 @@ function resolveEdge(point) {
 
 /** Which of the three places along that edge the pointer is nearest. */
 function resolveAlong(point, width, height) {
-  const area = workAreaAt()
-  const horizontal = tabEdge === 'top'
+  // The pointer's display, for the same reason as `resolveEdge`: the stop is
+  // measured as an offset into a particular screen's work area, so getting the
+  // screen wrong puts the tab at the right stop on the wrong monitor.
+  const area = workAreaAt(point)
+  const horizontal = HORIZONTAL_EDGES.includes(tabEdge)
   const pos = horizontal ? point.x : point.y
   const origin = horizontal ? area.x : area.y
   const extent = horizontal ? area.width : area.height
@@ -760,7 +803,7 @@ function snapTab() {
   }
   dropPoint = null
   resolveAlong(point, b.width, b.height)
-  win.setBounds(tabBounds(b.width, b.height))
+  win.setBounds(tabBounds(b.width, b.height, point))
 }
 
 function savePosition() {
@@ -841,11 +884,61 @@ function toSidecar(cmd) {
   try { sidecar.stdin.write(JSON.stringify(cmd) + '\n') } catch { /* gone */ }
 }
 
+// ── renderer arguments ────────────────────────────────────────────────────────
+//
+// Everything below this line arrives from the renderer, and the renderer is the
+// one part of this app that can be wrong about a number. A pointer leaving the
+// window mid-drag, a monitor whose scale factor changes under the gesture, a
+// measurement taken while an element is still laying out -- each of those has
+// produced a NaN delta here.
+//
+// Passing one on is not a glitch. Electron's geometry setters are native: they
+// reject a non-integer argument by throwing out of the IPC dispatcher rather
+// than out of the handler that called them, so there is nothing to catch, and
+// an uncaught throw there takes down the entire main process behind a dialog.
+// The widget dies on a stray mouse move. So a message that cannot be trusted is
+// dropped -- noted in the trace, invisible on screen -- and the window keeps the
+// geometry it already had.
+
+const MAX_COORD = 1e6 // outside any real desktop, still comfortably finite
+
+/** A finite number, or null. */
+function finiteNum(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+/** A finite screen coordinate or delta, rounded, or null. */
+function finiteCoord(v) {
+  const n = finiteNum(v)
+  return n === null || Math.abs(n) > MAX_COORD ? null : Math.round(n)
+}
+
+/** A finite, positive extent, rounded, or null. A window is never 0 wide. */
+function finiteSize(v) {
+  const n = finiteNum(v)
+  return n === null || n < 0 || n > MAX_COORD ? null : Math.max(1, Math.round(n))
+}
+
+/** Schemes `open` may hand to the OS. See the handler for why this is closed. */
+const OPEN_SCHEMES = new Set(['http:', 'https:'])
+
 // ── renderer IPC ──────────────────────────────────────────────────────────────
 
 ipcMain.on('panes', (_e, rects) => {
-  trace('panes', rects.length, rects.map((r) => `${r.id}@${r.y}+${r.h}`).join(' '))
-  syncPanes(rects)
+  // `rects` is read for .length and .forEach immediately, and every field flows
+  // into a pane's setBounds. A non-array throws; a NaN field survives as far as
+  // the native call and then throws there. Drop the bad rows, keep the rest --
+  // one card failing to measure should not blank the frost behind all of them.
+  if (!Array.isArray(rects)) { trace('panes', 'dropped: not an array'); return }
+  const clean = rects.filter((r) => r
+    && finiteCoord(r.x) !== null && finiteCoord(r.y) !== null
+    && finiteSize(r.w) !== null && finiteSize(r.h) !== null)
+  if (clean.length !== rects.length) {
+    trace('panes', 'dropped', rects.length - clean.length, 'of', rects.length)
+  }
+  trace('panes', clean.length, clean.map((r) => `${r.id}@${r.y}+${r.h}`).join(' '))
+  syncPanes(clean)
 })
 ipcMain.on('panes-hide', () => hidePanes())
 
@@ -866,7 +959,18 @@ ipcMain.on('pets-home', (_e, id) => {
 
 ipcMain.on('cmd', (_e, cmd) => {
   if (cmd?.cmd === 'quit') { app.quit(); return }
-  if (cmd?.cmd === 'open' && cmd.url) { shell.openExternal(cmd.url); return }
+  if (cmd?.cmd === 'open' && cmd.url) {
+    // openExternal hands the string to the OS, which will launch ANY registered
+    // protocol handler -- ms-msdt:, search-ms:, smb:// (which leaks an NTLM hash
+    // to whatever host it names), or any third-party app's own scheme. Every
+    // real caller here opens an ordinary web lookup, so anything that is not
+    // http(s) is either a bug or an attempt, and neither should reach the shell.
+    let scheme = null
+    try { scheme = new URL(String(cmd.url)).protocol } catch { /* unparseable */ }
+    if (!OPEN_SCHEMES.has(scheme)) { trace('cmd', 'refused open', cmd.url); return }
+    shell.openExternal(String(cmd.url))
+    return
+  }
   toSidecar(cmd)
 })
 /**
@@ -878,10 +982,18 @@ ipcMain.on('cmd', (_e, cmd) => {
  * width's offset for a frame, and the expanded widget at the screen edge for a
  * frame, which is the whole thing this shell exists to avoid.
  */
-ipcMain.on('resize', (_e, { width, height, tab }) => {
+ipcMain.on('resize', (_e, msg) => {
   if (!win || win.isDestroyed()) return
-  const w = Math.round(width)
-  const h = Math.round(height)
+  const tab = msg?.tab
+  const w = finiteSize(msg?.width)
+  const h = finiteSize(msg?.height)
+  // A size that is not a number would be written to disk as the tab's remembered
+  // geometry, so a single bad measurement would survive the restart that fixes
+  // everything else. Drop it and keep the last good one.
+  if (w === null || h === null) {
+    trace('resize', 'dropped', String(msg?.width), String(msg?.height))
+    return
+  }
   trace('resize', `${win.getBounds().height} -> ${h}${tab ? ' (tab)' : ''}`)
 
   if (tab) {
@@ -903,8 +1015,13 @@ ipcMain.on('resize', (_e, { width, height, tab }) => {
     // along it, measured against where the tab was actually let go of.
     if (dropPoint) {
       resolveAlong(dropPoint, w, h)
+      const at = dropPoint
       dropPoint = null
-      win.setBounds(tabBounds(w, h))
+      // `at`, not the default. By the time this arrives the window has been
+      // reshaped where it lay -- a 480px row has become an 82px column -- so
+      // its centre has moved, and it is the one coordinate in the whole
+      // gesture guaranteed not to be where the drop happened.
+      win.setBounds(tabBounds(w, h, at))
       savePosition()
       return
     }
@@ -924,12 +1041,26 @@ ipcMain.on('resize', (_e, { width, height, tab }) => {
   }
   win.setBounds({ ...win.getBounds(), width: w, height: h })
 })
-ipcMain.on('drag', (_e, { dx, dy, x: px, y: py }) => {
+ipcMain.on('drag', (_e, msg) => {
   if (!win || win.isDestroyed()) return
+  const dx = finiteCoord(msg?.dx)
+  const dy = finiteCoord(msg?.dy)
+  // This is the one that killed the app: setPosition is native and rejects a
+  // NaN by throwing past this handler, so the crash arrived as a main-process
+  // dialog in the middle of an ordinary drag. A frame with no usable delta is
+  // simply not a move.
+  if (dx === null || dy === null) {
+    trace('drag', 'dropped', String(msg?.dx), String(msg?.dy))
+    return
+  }
   dragging = true
-  if (px != null && py != null) pointer = { x: px, y: py }
+  // The pointer position is optional and independent: a bad one must not cost
+  // us the move, it only means this frame does not update the edge guess.
+  const px = finiteCoord(msg?.x)
+  const py = finiteCoord(msg?.y)
+  if (px !== null && py !== null) pointer = { x: px, y: py }
   const [x, y] = win.getPosition()
-  win.setPosition(Math.round(x + dx), Math.round(y + dy))
+  win.setPosition(x + dx, y + dy)
 })
 ipcMain.on('scale', (_e, value) => {
   const n = Number(value)

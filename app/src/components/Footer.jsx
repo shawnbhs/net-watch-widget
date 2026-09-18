@@ -15,6 +15,9 @@ const paths = {
   power: 'M12 3v9M7.5 6.5a7 7 0 1 0 9 0',
   refresh: 'M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4',
   close: 'M6 6l12 12M18 6L6 18',
+  // A double-headed diagonal arrow between two corner brackets: the drag
+  // gesture itself, rather than a copy of the grip in the corner of the frame.
+  resize: 'M20 4L4 20M14 4h6v6M10 20H4v-6',
 }
 
 /** Round glass button. `tone` overrides the icon colour (the power dot). */

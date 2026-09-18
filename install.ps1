@@ -68,6 +68,10 @@ if ($Uninstall) {
             Write-Ok "autostart entry '$name' removed"
         }
     }
+    if ([Environment]::GetEnvironmentVariable('NET_WATCH_PYTHON', 'User')) {
+        [Environment]::SetEnvironmentVariable('NET_WATCH_PYTHON', $null, 'User')
+        Write-Ok 'sidecar interpreter setting removed'
+    }
     Write-Host ''
     Write-Host 'Uninstalled. Files were left in place; delete this folder to remove them.'
     Write-Host ''
@@ -93,10 +97,28 @@ Write-Ok 'sidecar.py, core.py and app\ found'
 # pythonw.exe runs the sidecar without a console window. python.exe would leave
 # a black box on screen for as long as the widget is up.
 $pythonw = $null
-foreach ($candidate in @('pythonw.exe', 'python.exe')) {
-    $found = Get-Command $candidate -ErrorAction SilentlyContinue
-    if ($found) {
-        $pythonw = Join-Path (Split-Path -Parent $found.Source) 'pythonw.exe'
+
+# Ask the py launcher first. PATH's first python is whatever a venv, Conda
+# prompt or bundled runtime put there, and pinning the widget to one of those
+# breaks the moment it is removed. 'py -0p' marks the default install '*'.
+if (Get-Command py.exe -ErrorAction SilentlyContinue) {
+    $default = (& py.exe -0p 2>$null | Where-Object { $_ -match '\*' } |
+                Select-Object -First 1)
+    if ($default -match '([A-Za-z]:\\[^\r\n]*python\.exe)') {
+        $candidate = Join-Path (Split-Path -Parent $Matches[1]) 'pythonw.exe'
+        if (Test-Path -LiteralPath $candidate) { $pythonw = $candidate }
+    }
+}
+
+# Fallback: PATH, skipping anything inside a virtual environment.
+if (-not $pythonw) {
+    foreach ($candidate in @('pythonw.exe', 'python.exe')) {
+        $found = Get-Command $candidate -ErrorAction SilentlyContinue
+        if (-not $found) { continue }
+        $dir = Split-Path -Parent $found.Source
+        if (Test-Path -LiteralPath (Join-Path $dir 'activate')) { continue }
+        if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $dir) 'pyvenv.cfg')) { continue }
+        $pythonw = Join-Path $dir 'pythonw.exe'
         break
     }
 }
@@ -109,12 +131,26 @@ if (-not $pythonw -or -not (Test-Path -LiteralPath $pythonw)) {
 $python = Join-Path (Split-Path -Parent $pythonw) 'python.exe'
 
 $version = (& $python -c 'import sys; print(sys.version.split()[0])' 2>&1 |
-            Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) {
+            Select-Object -First 1 | ForEach-Object { $_.ToString().Trim() })
+# Validate the output, not $LASTEXITCODE: it still holds an earlier command's
+# status when python itself printed a version and exited cleanly.
+if ($version -notmatch '^\d+\.\d+') {
     Write-Err "Could not run $python"
+    Write-Host "       $version"
     exit 1
 }
 Write-Ok "Python $version at $pythonw"
+
+# The app spawns the sidecar as a bare 'pythonw.exe' unless NET_WATCH_PYTHON
+# says otherwise, and a bare name resolves through PATH -- which on a machine
+# with a venv, a uv runtime or the Store build is NOT the interpreter psutil
+# was just installed into. The sidecar would then die on ImportError while the
+# window still opened, showing a widget with no data. Pin it explicitly.
+# User scope so autostart at login inherits it; the process copy is for the
+# launch at the end of this script, which will not see the User value.
+[Environment]::SetEnvironmentVariable('NET_WATCH_PYTHON', $pythonw, 'User')
+$env:NET_WATCH_PYTHON = $pythonw
+Write-Ok 'sidecar interpreter pinned for the app'
 
 # No tkinter check any more: the interface is Electron, and core.py imports no
 # GUI toolkit at all.
@@ -159,11 +195,25 @@ try {
 } finally {
     Pop-Location
 }
+# npm 12 blocks package install scripts by default, so electron's postinstall
+# -- the step that actually downloads the ~100 MB binary -- never runs and the
+# dist folder stays empty. Run the downloader directly rather than handing the
+# user a command to copy.
+if (-not (Test-Path -LiteralPath $Electron)) {
+    Write-Step 'Fetching the Electron binary (its install script was blocked)'
+    Push-Location $AppDir
+    try {
+        & node 'node_modules\electron\install.js'
+    } finally {
+        Pop-Location
+    }
+}
 if (-not (Test-Path -LiteralPath $Electron)) {
     Write-Err "Electron binary missing at $Electron"
     Write-Host '       Try:  cd app; node node_modules\electron\install.js'
     exit 1
 }
+Write-Ok 'Electron binary present'
 
 # ── 5. Configuration ──────────────────────────────────────────────────────────
 Write-Step 'Checking configuration'

@@ -51,10 +51,92 @@ const INTRO_MS = 900
 const SCALE_MIN = 0.92
 const SCALE_MAX = 2
 
-function clampScale(v) {
+/**
+ * Where the widget starts when nothing has been remembered.
+ *
+ * A touch over 1:1. The panel's type is small by design, which on a high-DPI
+ * screen reads as cramped on first launch; a few percent fixes that without
+ * the result looking like it was scaled by accident.
+ */
+const SCALE_DEFAULT = 1.08
+
+/**
+ * Screen edge left clear when fitting the widget to the monitor.
+ *
+ * Enough that the widget is never flush against the taskbar or the top of the
+ * screen at its largest, and enough to absorb the pixel or two that rounding a
+ * zoomed layout back to whole device pixels can add.
+ */
+const FIT_MARGIN = 48
+
+function clampScale(v, max = SCALE_MAX) {
   const n = Number(v)
-  if (!Number.isFinite(n)) return 1
-  return Math.min(SCALE_MAX, Math.max(SCALE_MIN, Math.round(n * 100) / 100))
+  if (!Number.isFinite(n)) return SCALE_DEFAULT
+  // The floor wins over the fitted ceiling: a screen too small for even the
+  // minimum is still better served by a widget that renders correctly and
+  // overhangs than by one squeezed below where its frost stops matching.
+  const ceiling = Math.max(SCALE_MIN, Math.min(SCALE_MAX, Number(max) || SCALE_MAX))
+  return Math.min(ceiling, Math.max(SCALE_MIN, Math.round(n * 100) / 100))
+}
+
+/**
+ * The largest scale at which the widget still fits the monitor it is on.
+ *
+ * `screen.availWidth/availHeight` are the work area of the display the window
+ * is currently on, already in CSS pixels, so the whole calculation can be done
+ * here without asking the main process anything. The unscaled content size is
+ * the measured box divided back by the scale it was drawn at -- `zoom` is a
+ * layout scale, so the rect is already multiplied by it.
+ *
+ * Rounded *down* to the hundredth the slider works in, so the fitted maximum
+ * is always a size that fits rather than the first one that does not.
+ */
+function fitScale(node, scale) {
+  const r = node?.getBoundingClientRect()
+  if (!r) return SCALE_MAX
+  const w = r.width / scale
+  const h = r.height / scale
+  if (!(w > 0) || !(h > 0)) return SCALE_MAX
+  const availW = (window.screen?.availWidth ?? window.innerWidth) - FIT_MARGIN
+  const availH = (window.screen?.availHeight ?? window.innerHeight) - FIT_MARGIN
+  const fit = Math.min(availW / w, availH / h)
+  if (!Number.isFinite(fit)) return SCALE_MAX
+  return Math.max(SCALE_MIN, Math.min(SCALE_MAX, Math.floor(fit * 100) / 100))
+}
+
+/**
+ * Keeps the fitted ceiling current.
+ *
+ * Re-measured on a window resize -- which is also what a move to a second
+ * monitor looks like from here -- and whenever `mode` changes, because the full
+ * view is a great deal taller than the compact one and a limit computed from
+ * the wrong layout is the whole bug: scaled up with the Pets card present, the
+ * widget grew past the bottom of the screen.
+ *
+ * The measurement is deferred by a frame so it reads the layout the mode
+ * switch actually produced rather than the one it is leaving.
+ */
+function useScaleLimit(shell, scale, mode) {
+  const [max, setMax] = useState(SCALE_MAX)
+  const scaleRef = useRef(scale)
+  scaleRef.current = scale
+
+  useEffect(() => {
+    if (mode === null) return undefined
+    let raf = 0
+    const measure = () => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => setMax(fitScale(shell.current, scaleRef.current)))
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => {
+      cancelAnimationFrame(raf)
+      window.removeEventListener('resize', measure)
+    }
+  }, [shell, mode])
+
+  return max
 }
 
 function resizeTo(node, tab, delta = 0) {
@@ -183,9 +265,15 @@ function Widget() {
   const [mini, setMini] = useState(() => Boolean(window.nw?.startTab))
   // Which screen edge the tab belongs to. The main process owns the dock and
   // tells the page only when the *edge* changes, because that is the only part
-  // of it the page draws differently -- a row of dials on the top, a column on
-  // a side. Where it sits along that edge never reaches here.
-  const [edge, setEdge] = useState(() => window.nw?.startEdge ?? 'top')
+  // of it the page draws differently -- a row of dials on the top or the
+  // bottom, a column on a side. Where it sits along that edge never reaches
+  // here. Any of the four edges can arrive, including from `--nw-edge=` on the
+  // first frame; an unknown value falls back to the top rather than rendering
+  // an undefined padding class.
+  const [edge, setEdge] = useState(() => (
+    ['top', 'bottom', 'left', 'right'].includes(window.nw?.startEdge)
+      ? window.nw.startEdge
+      : 'top'))
   useEffect(() => window.nw?.onDock?.(setEdge), [])
   const [locked, setLocked] = useState(false)
   const [spinning, setSpinning] = useState(false)
@@ -195,6 +283,11 @@ function Widget() {
   // match their cards, without either one being told the factor.
   const [scale, setScale] = useState(() => clampScale(window.nw?.startScale))
   const [resizing, setResizing] = useState(false)
+  // Free-resize mode: the corner grip is always there, but a status readout is
+  // not a window anyone expects to have a resize border, so the affordance is
+  // easy to miss. This turns it into something you cannot miss -- a full-width
+  // handle across the footer -- without adding a second way to do the sum.
+  const [resizeMode, setResizeMode] = useState(false)
   const shell = useRef(null)
 
   const [animating, setAnimating] = useState(false)
@@ -202,6 +295,18 @@ function Widget() {
   const moving = useMoving()
   usePaneSync(animating)
   usePaneSync(scale)
+
+  // How large this widget may be drawn on this screen, in this view. `null`
+  // during the mode animation, because a box that is mid-tween is not a height
+  // worth deriving a limit from.
+  const fitMax = useScaleLimit(shell, scale, animating ? null : `${mini}:${compact}`)
+
+  // Nothing may sit above the fitted ceiling, whoever put it there -- a
+  // remembered scale from a larger monitor, or a view switch from compact into
+  // the much taller full one at a size only the compact view could afford.
+  useEffect(() => {
+    setScale((v) => clampScale(v, fitMax))
+  }, [fitMax])
 
   // Watched here rather than inside the views, and that is the whole of it
   // working. Compact, Full and the tab are mounted and destroyed as you switch
@@ -325,7 +430,7 @@ function Widget() {
             <TitleCard s={s} locked={locked} />
             <ModeBox compact={compact} shell={shell} onSettled={onSettled}>
               {compact
-                ? <Compact s={s} copy={copy} ipChanged={ipChanged} />
+                ? <Compact s={s} copy={copy} ipChanged={ipChanged} rfChanged={rfChanged} />
                 : <Full s={s} copy={copy} ipChanged={ipChanged} rfChanged={rfChanged} />}
             </ModeBox>
             <FooterCard
@@ -338,7 +443,10 @@ function Widget() {
               onToggleLock={() => setLocked((l) => !l)}
               onRefresh={refresh}
               scale={scale}
+              maxScale={fitMax}
               onScale={setScale}
+              resizeMode={resizeMode}
+              onToggleResize={() => setResizeMode((r) => !r)}
               onScaleStart={() => { suspend(); setResizing(true) }}
               onScaleEnd={() => { setResizing(false); resume() }}
             />
@@ -495,12 +603,36 @@ function TitleCard({ s, locked }) {
   )
 }
 
+/**
+ * A 12-hour wall clock, zero-padded: '01:30 pm'.
+ *
+ * Built by hand rather than left to `toLocaleTimeString`, because the two
+ * things that matter here are exactly the two a locale is free to change its
+ * mind about: whether the hour is padded, and whether the suffix is there at
+ * all. Seconds are dropped -- the row they sit in is tight, and a clock that is
+ * read at a glance is not read to the second.
+ */
+function clock12(d) {
+  const h = d.getHours()
+  const h12 = h % 12 === 0 ? 12 : h % 12
+  return `${String(h12).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} `
+    + (h < 12 ? 'am' : 'pm')
+}
+
 /** Local wall clock, and Tehran alongside it when the sidecar has reported it. */
 function Clocks({ now, tehran }) {
   return (
     <span className="flex shrink-0 items-baseline gap-1.5">
-      <span className="glass-text text-[11px] tabular-nums text-ink-2">
-        {now.toLocaleTimeString('en-GB', { hour12: false })}
+      {/* A fixed slot, not a fitted one. The title card's width is measured and
+          pushed to the main process, so anything that changes it moves the
+          window -- and a 12-hour clock changes width twice a day, at 9 to 10
+          and again at am to pm. The minimum is comfortably wider than the
+          longest reading, so in practice the box is simply always this wide. */}
+      <span
+        className="glass-text min-w-[62px] shrink-0 whitespace-nowrap text-right text-[11px]
+                   tabular-nums text-ink-2"
+      >
+        {clock12(now)}
       </span>
       {tehran && (
         <>
@@ -992,9 +1124,15 @@ const DRAG_SLOP = 4
  * with it, because a moving window hides its panes. A dash in a dial is also
  * the more honest picture: the reading is missing, not the machine.
  *
- * The edge decides the shape. On the top it is a row; on the left or the right
- * it is a column, because a 330px-wide bar down the side of a screen is not a
- * tab, it is a wall. Nothing else changes -- same dials, same order.
+ * The edge decides the shape. On the top or the bottom it is a row; on the left
+ * or the right it is a column, because a 330px-wide bar down the side of a
+ * screen is not a tab, it is a wall. Nothing else changes -- same dials, same
+ * order.
+ *
+ * Corner rounding needs no per-edge case. The card is rounded on all four
+ * corners and the window overhangs its screen edge by `TAB_BLEED`, so the two
+ * corners that would give the dock away are cut off by the screen itself --
+ * whichever edge that happens to be.
  *
  * The lopsided padding. The window sits `TAB_BLEED` px *past* its edge so that
  * DWM's rounded corners on the frost behind this card are cut off by the screen
@@ -1013,9 +1151,19 @@ const DRAG_SLOP = 4
    off the screen, the ordinary inset everywhere else. */
 const TAB_PAD = {
   top: 'px-2.5 pt-[20px] pb-[10px]',
+  bottom: 'px-2.5 pb-[20px] pt-[10px]',
   left: 'py-2.5 pl-[20px] pr-[10px]',
   right: 'py-2.5 pr-[20px] pl-[10px]',
 }
+
+/* Which edges lay the dials out as a row.
+
+   A membership test rather than a comparison against 'top', because the bottom
+   edge is the top edge's mirror and wants the same row. The obvious
+   `edge !== 'top'` would have drawn the bottom tab as a column -- a 330px-wide
+   wall standing on the taskbar -- and it is the kind of mistake that only shows
+   up after the dock itself already works. */
+const HORIZONTAL_EDGES = ['top', 'bottom']
 
 function MiniBar({ s, edge, locked, onExpand, changed }) {
   const net = s.net
@@ -1028,7 +1176,7 @@ function MiniBar({ s, edge, locked, onExpand, changed }) {
   const codex = aiDial(gt, [['sess_pct', '5h'], ['week_pct', 'week']])
   const rise = useRise()
   const drag = useRef(null)
-  const column = edge !== 'top'
+  const column = !HORIZONTAL_EDGES.includes(edge)
 
   const onDown = (e) => {
     if (e.button !== 0) return
@@ -1126,7 +1274,20 @@ function MiniBar({ s, edge, locked, onExpand, changed }) {
 
 /* ── compact ───────────────────────────────────────────────────────────────── */
 
-function Compact({ s, copy, ipChanged }) {
+/**
+ * The summary view: the same readings as the full panel, one line each.
+ *
+ * Three cards where there was one. The exit address is the headline and keeps
+ * the full width; Runflare and the LAN share the row below it, because they are
+ * each two short values and a half-width card holds both comfortably. That
+ * pairing is what keeps this view a summary -- stacked full-width they would
+ * cost as much height as the full view they exist to be an alternative to.
+ *
+ * Every card carries its own `c-`-prefixed id. The ids are what the main
+ * process places the frost panes from, so a repeat of a full-view id would put
+ * two cards' glass in one place and leave a card without any.
+ */
+function Compact({ s, copy, ipChanged, rfChanged }) {
   const net = s.net
   const hw = s.hw
   const cl = s.ai?.claude
@@ -1149,6 +1310,34 @@ function Compact({ s, copy, ipChanged }) {
           </span>
         </div>
       </Card>
+
+      <Pair>
+        <Card id="c-rf" {...rise('55ms', 'pb-2')} {...alertProps(rfChanged, 'Runflare exit')}>
+          <CardHead icon="signal" tight right={<CountryChip code={net?.code2} small />}>
+            Runflare
+          </CardHead>
+          <Figure value={net?.ip2 ?? '…'} onCopy={copy(net?.ip2)} />
+          {/* Wrapped, never clipped: a country name that ran off the end of a
+              half-width card would be indistinguishable from a different
+              country with the same first few letters. */}
+          <div className="glass-text mt-1 break-words px-3 text-[10px] leading-snug text-ink-2">
+            {net?.country2 ?? '…'}
+          </div>
+        </Card>
+
+        <Card id="c-lan" {...rise('55ms', 'pb-2')}>
+          <CardHead icon="route" tight>Local / gateway</CardHead>
+          <Figure value={net?.local ?? '…'} onCopy={copy(net?.local)} />
+          <div className="mt-1 flex items-baseline gap-2 px-3">
+            <span className="glass-text shrink-0 text-[9.5px] uppercase tracking-wide text-faint">
+              GW
+            </span>
+            <span className="glass-text min-w-0 break-all text-[10px] tabular-nums text-muted">
+              {net?.gw ?? '…'}
+            </span>
+          </div>
+        </Card>
+      </Pair>
 
       <Card id="c-hw" {...rise('70ms', 'py-2')}>
         <div className="flex gap-3 px-3">
@@ -1214,41 +1403,67 @@ function Meter({ label, value, fallback }) {
  */
 const SCALE_BASE = 372      // the shell's unscaled width, which the drag adjusts
 
-function ResizeGrip({ scale, onScale, onStart, onEnd }) {
+/**
+ * The drag itself, shared by the corner grip and the wide handle.
+ *
+ * One implementation with two affordances on it, rather than two sets of
+ * arithmetic that would drift apart the first time either end of the range
+ * moved. Both are clamped by the same fitted ceiling and the same platform
+ * floor, so neither route can be used to break the layout.
+ */
+function useScaleDrag({ scale, onScale, onStart, onEnd, max }) {
   const drag = useRef(null)
+  const latest = useRef(scale)
+  latest.current = scale
 
-  const onDown = (e) => {
+  const onPointerDown = (e) => {
     if (e.button !== 0) return
     drag.current = { x: e.screenX, y: e.screenY, from: scale }
     e.currentTarget.setPointerCapture(e.pointerId)
     onStart()
   }
-  const onMove = (e) => {
+  const onPointerMove = (e) => {
     const d = drag.current
     if (!d) return
-    // A corner grip answers to both axes, so the travel is the diagonal
-    // projection rather than one axis picked arbitrarily.
+    // Both axes, so the same gesture works from a corner and from a bar: the
+    // travel is the diagonal projection rather than one axis picked
+    // arbitrarily.
     const travel = ((e.screenX - d.x) + (e.screenY - d.y)) / 2
-    onScale(clampScale((SCALE_BASE * d.from + travel) / SCALE_BASE))
+    onScale(clampScale((SCALE_BASE * d.from + travel) / SCALE_BASE, max))
   }
-  const onUp = (e) => {
+  const onPointerUp = (e) => {
     if (!drag.current) return
     drag.current = null
     e.currentTarget.releasePointerCapture?.(e.pointerId)
     onEnd()
-    window.nw?.scale(scale)        // remembered only once the drag is over
+    window.nw?.scale(latest.current)   // remembered only once the drag is over
   }
+  const onDoubleClick = () => {
+    const v = clampScale(SCALE_DEFAULT, max)
+    onScale(v)
+    window.nw?.scale(v)
+  }
+
+  return {
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel: onPointerUp,
+    onDoubleClick,
+  }
+}
+
+function ResizeGrip({ scale, onScale, onStart, onEnd, max, active }) {
+  const handlers = useScaleDrag({ scale, onScale, onStart, onEnd, max })
 
   return (
     <span
-      className="absolute bottom-[2px] right-[2px] grid h-[15px] w-[15px] cursor-nwse-resize
-                 place-items-center text-faint transition hover:text-ink-2"
-      title={`Drag to resize · double-click to reset (${Math.round(scale * 100)}%)`}
-      onPointerDown={onDown}
-      onPointerMove={onMove}
-      onPointerUp={onUp}
-      onPointerCancel={onUp}
-      onDoubleClick={() => { onScale(1); window.nw?.scale(1) }}
+      className={'absolute bottom-[2px] right-[2px] grid h-[15px] w-[15px] cursor-nwse-resize '
+        + 'place-items-center transition hover:text-ink-2 '
+        + (active ? 'text-accent' : 'text-faint')}
+      title={`Drag to resize · double-click to reset (${Math.round(scale * 100)}% `
+        + `of ${Math.round(max * 100)}% max)`}
+      {...handlers}
     >
       <svg viewBox="0 0 16 16" className="h-[11px] w-[11px]" stroke="currentColor" strokeWidth="1.4">
         <path d="M15 9 9 15M15 13l-2 2" strokeLinecap="round" />
@@ -1257,9 +1472,43 @@ function ResizeGrip({ scale, onScale, onStart, onEnd }) {
   )
 }
 
+/**
+ * The wide handle the Resize button reveals.
+ *
+ * Same drag, a target the width of the card instead of fifteen pixels in a
+ * corner, and it says what size it is at and how large this screen will let it
+ * get. Everything scales with it because the mechanism is CSS `zoom`, which is
+ * a layout scale -- the type grows with the boxes rather than being stretched.
+ */
+function ResizeBand({ scale, onScale, onStart, onEnd, max }) {
+  const handlers = useScaleDrag({ scale, onScale, onStart, onEnd, max })
+  const atMax = scale >= max - 0.001
+  const atMin = scale <= SCALE_MIN + 0.001
+
+  return (
+    <div
+      className="mx-3 mt-2 flex cursor-nwse-resize select-none items-center justify-center gap-2
+                 rounded-[7px] border border-white/35 bg-white/[0.14] py-[5px]
+                 transition duration-150 hover:bg-white/20"
+      title="Drag anywhere along this bar to resize the widget · double-click to reset"
+      {...handlers}
+    >
+      <SectionIcon name="resize" />
+      <span className="glass-text text-[10px] font-medium tabular-nums text-ink-2">
+        {`Drag to resize · ${Math.round(scale * 100)}%`}
+      </span>
+      <span className="glass-text text-[9.5px] tabular-nums text-faint">
+        {atMax ? 'largest this screen fits'
+          : atMin ? 'smallest usable'
+            : `max ${Math.round(max * 100)}%`}
+      </span>
+    </div>
+  )
+}
+
 function FooterCard({
   s, compact, locked, spinning, onToggleCompact, onToggleMini, onToggleLock, onRefresh,
-  scale, onScale, onScaleStart, onScaleEnd,
+  scale, maxScale, onScale, resizeMode, onToggleResize, onScaleStart, onScaleEnd,
 }) {
   const rise = useRise()
   const { up, busy } = s.netstate ?? { up: true, busy: false }
@@ -1269,9 +1518,20 @@ function FooterCard({
       <ResizeGrip
         scale={scale}
         onScale={onScale}
+        max={maxScale}
+        active={resizeMode}
         onStart={onScaleStart}
         onEnd={onScaleEnd}
       />
+      {resizeMode && (
+        <ResizeBand
+          scale={scale}
+          onScale={onScale}
+          max={maxScale}
+          onStart={onScaleStart}
+          onEnd={onScaleEnd}
+        />
+      )}
       <div className="flex items-center gap-1.5 py-2 pl-3 pr-[18px]">
         {/* The dot reports the adapters, so it reads at the start of the row
             rather than crowded against the button that toggles them. */}
@@ -1282,6 +1542,12 @@ function FooterCard({
 
         <span className="flex-1" />
 
+        <IconButton
+          icon="resize"
+          label="Resize"
+          active={resizeMode}
+          onClick={onToggleResize}
+        />
         <IconButton
           icon="mini"
           label="Mini bar"

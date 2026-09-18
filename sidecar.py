@@ -59,6 +59,30 @@ _LOCK = threading.Lock()
 _STOP = threading.Event()
 
 
+def clock12(when=None, seconds=False):
+    """Format a time of day as a short 12-hour clock: '1:30 pm', '12:04 am'.
+
+    The hour is built arithmetically rather than with strftime's `%-I`
+    (unpadded hour), because `%-I` is a glibc extension: on Windows, where
+    this sidecar runs, it raises ValueError. `%I` works everywhere but pads
+    to '01:30', which reads wrong for a clock, and `%p` is locale-dependent
+    and upper-case. Doing it by hand gives the same answer on every platform.
+
+    `when` is a struct_time or a datetime (core.tehran_now() returns one);
+    None means now. The output is deliberately terse -- no padding, lower-case
+    am/pm, no extra words -- because the widget measures these strings and
+    resizes its window to fit them.
+    """
+    if when is None:
+        when = time.localtime()
+    tm = when.timetuple() if hasattr(when, "timetuple") else when
+    suffix = "am" if tm.tm_hour < 12 else "pm"
+    hour = tm.tm_hour % 12 or 12
+    if seconds:
+        return "%d:%02d:%02d %s" % (hour, tm.tm_min, tm.tm_sec, suffix)
+    return "%d:%02d %s" % (hour, tm.tm_min, suffix)
+
+
 def emit(kind, **fields):
     """Write one message. Never lets a serialisation failure kill the thread."""
     try:
@@ -165,10 +189,10 @@ def refresh_once():
          isp=isp, vpn=vpn, changed=changed,
          ping1=p1, ping2=p2, loss1=l1, loss2=l2,
          ping1_ms=core.pms(p1), ping2_ms=core.pms(p2),
-         clock=time.strftime("%H:%M:%S"))
+         clock=clock12(seconds=True))
 
     try:
-        emit("tehran", time=core.tehran_now().strftime("%H:%M"))
+        emit("tehran", time=clock12(core.tehran_now()))
     except Exception:
         pass
 
@@ -425,7 +449,7 @@ def ai_tick(fails, last, manual):
         codex=_ai_payload(codex, ("sess_pct", "week_pct"),
                           ("sess_reset_ts", "week_reset_ts"),
                           limit_reached=bool(codex.get("limit_reached"))),
-        polled_at=time.strftime("%H:%M"),
+        polled_at=clock12(),
         retry=max(claude.get("retry", 0), codex.get("retry", 0)))
     emit("ai", stale=False, age=0, **payload)
     # Only a reading with something in it is worth remembering: caching a pair

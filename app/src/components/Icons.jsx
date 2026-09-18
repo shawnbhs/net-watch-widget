@@ -12,6 +12,9 @@ const paths = {
   clock: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18M12 7v5l3.5 2',
   spark: 'M12 3v18M3 12h18M6.5 6.5l11 11M17.5 6.5l-11 11',
   shield: 'M12 3l7 3v5.5c0 4.2-2.9 7.8-7 9.5-4.1-1.7-7-5.3-7-9.5V6z',
+  // A double-headed diagonal arrow between two corner brackets: the drag
+  // gesture itself, rather than a copy of the grip in the corner of the frame.
+  resize: 'M20 4L4 20M14 4h6v6M10 20H4v-6',
   // Four toes and a pad. Drawn as outlines rather than filled, because every
   // other glyph here is a 2px stroke and a solid shape beside them reads as a
   // different weight of icon.
@@ -33,13 +36,16 @@ export function SectionIcon({ name, size = 19 }) {
     >
       <svg
         viewBox="0 0 24 24"
-        style={{ width: Math.round(size * 0.58), height: Math.round(size * 0.58) }}
         fill="none"
         stroke="currentColor"
         strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
-        style={{ color: 'var(--color-ink)' }}
+        style={{
+          width: Math.round(size * 0.58),
+          height: Math.round(size * 0.58),
+          color: 'var(--color-ink)',
+        }}
       >
         <path d={paths[name] ?? paths.globe} />
       </svg>

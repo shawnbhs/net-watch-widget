@@ -771,6 +771,35 @@ let pointer = null
 let dropPoint = null
 
 /**
+ * The tab's size as the page measured it, not as Windows hands it back.
+ *
+ * Reading a window's own bounds and setting them again is not the no-op it
+ * looks like on a fractional-scale display. Bounds are DIPs, the window is
+ * really device pixels, and the round trip rounds twice: at scaleFactor 1.65
+ * every window on this machine comes back one or two DIPs larger than it was
+ * asked for. Feed that answer into the next dock and the size grows again, and
+ * again, once per drop.
+ *
+ * On the top and left edges that is invisible, because the coordinate those
+ * docks pin -- `area.y - TAB_BLEED`, `area.x - TAB_BLEED` -- does not mention
+ * the size at all. The bottom and right docks pin the *far* edge instead, by
+ * subtracting the size from it, so every phantom pixel of height comes straight
+ * back out as position: each drop on the bottom edge placed the tab another
+ * pixel higher, which is the gap that opened above the taskbar and then grew,
+ * and the jitter on repeated attempts was that same drift seen one step at a
+ * time.
+ *
+ * `tabSize` is the renderer's own measurement of the mini bar and it is the
+ * same number every time, so docking from it is idempotent. The window's bounds
+ * remain the fallback for the one moment tabSize can be missing -- a drag
+ * finished before the page has ever reported a tab size -- where being a pixel
+ * out is better than not docking.
+ */
+function tabExtent(fallback) {
+  return tabSize ?? { width: fallback.width, height: fallback.height }
+}
+
+/**
  * Put the tab on a dock when the drag ends.
  *
  * Nine resting places, and no others: the tab belongs to a screen edge, not to
@@ -793,6 +822,7 @@ let dropPoint = null
 function snapTab() {
   if (!win || win.isDestroyed()) return
   const b = win.getBounds()
+  const size = tabExtent(b)
   const point = pointer ?? { x: b.x + b.width / 2, y: b.y + b.height / 2 }
   const before = tabEdge
   tabEdge = resolveEdge(point)
@@ -802,8 +832,8 @@ function snapTab() {
     return
   }
   dropPoint = null
-  resolveAlong(point, b.width, b.height)
-  win.setBounds(tabBounds(b.width, b.height, point))
+  resolveAlong(point, size.width, size.height)
+  win.setBounds(tabBounds(size.width, size.height, point))
 }
 
 function savePosition() {

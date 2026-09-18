@@ -48,7 +48,7 @@ const INTRO_MS = 900
  * is the direction that works properly: 2x is exact, and so is everything
  * between.
  */
-const SCALE_MIN = 0.92
+const SCALE_MIN = 0.79
 const SCALE_MAX = 2
 
 /**
@@ -69,13 +69,33 @@ const SCALE_DEFAULT = 1.08
  */
 const FIT_MARGIN = 48
 
+/**
+ * The ceiling a fitted measurement is actually allowed to impose.
+ *
+ * A fitted maximum below the floor is not a ceiling, it is a screen that cannot
+ * hold this layout at any size it still renders correctly at -- the full view on
+ * a high-DPI monitor is exactly that. Honouring such a number would pin the
+ * ceiling onto the floor and leave the range a single point, which is what froze
+ * the resize drag in the full view while the shorter compact view kept working.
+ *
+ * So a ceiling that has collapsed past the floor is discarded rather than
+ * clamped up: the widget is going to overhang whatever is chosen, so the choice
+ * is handed back to the person making it and the whole range stays reachable.
+ */
+function scaleCeiling(max) {
+  const fitted = Math.min(SCALE_MAX, Number(max) || SCALE_MAX)
+  return fitted >= SCALE_MIN ? fitted : SCALE_MAX
+}
+
 function clampScale(v, max = SCALE_MAX) {
   const n = Number(v)
   if (!Number.isFinite(n)) return SCALE_DEFAULT
   // The floor wins over the fitted ceiling: a screen too small for even the
   // minimum is still better served by a widget that renders correctly and
-  // overhangs than by one squeezed below where its frost stops matching.
-  const ceiling = Math.max(SCALE_MIN, Math.min(SCALE_MAX, Number(max) || SCALE_MAX))
+  // overhangs than by one squeezed below where its frost stops matching. When
+  // that happens the fitted ceiling is dropped entirely rather than folded onto
+  // the floor, so the drag still has somewhere to go -- see scaleCeiling.
+  const ceiling = scaleCeiling(max)
   return Math.min(ceiling, Math.max(SCALE_MIN, Math.round(n * 100) / 100))
 }
 
@@ -90,6 +110,11 @@ function clampScale(v, max = SCALE_MAX) {
  *
  * Rounded *down* to the hundredth the slider works in, so the fitted maximum
  * is always a size that fits rather than the first one that does not.
+ *
+ * The result is the *true* fit and is deliberately not raised to SCALE_MIN: a
+ * layout taller than the screen genuinely fits at nothing the widget can draw,
+ * and saying so honestly is what lets the consumer tell that case apart from a
+ * real ceiling. scaleCeiling is where that decision is made.
  */
 function fitScale(node, scale) {
   const r = node?.getBoundingClientRect()
@@ -101,7 +126,7 @@ function fitScale(node, scale) {
   const availH = (window.screen?.availHeight ?? window.innerHeight) - FIT_MARGIN
   const fit = Math.min(availW / w, availH / h)
   if (!Number.isFinite(fit)) return SCALE_MAX
-  return Math.max(SCALE_MIN, Math.min(SCALE_MAX, Math.floor(fit * 100) / 100))
+  return Math.min(SCALE_MAX, Math.floor(fit * 100) / 100)
 }
 
 /**
@@ -301,6 +326,12 @@ function Widget() {
   // worth deriving a limit from.
   const fitMax = useScaleLimit(shell, scale, animating ? null : `${mini}:${compact}`)
 
+  // What the resize controls are actually allowed to enforce and to report. The
+  // measurement above is the honest fit, which in the full view on a high-DPI
+  // screen lands under the floor; scaleCeiling turns that into a ceiling the
+  // control can still be dragged within instead of a range one value wide.
+  const maxScale = scaleCeiling(fitMax)
+
   // Nothing may sit above the fitted ceiling, whoever put it there -- a
   // remembered scale from a larger monitor, or a view switch from compact into
   // the much taller full one at a size only the compact view could afford.
@@ -424,6 +455,11 @@ function Widget() {
             locked={locked}
             onExpand={swapTab}
             changed={ipChanged.on ? ipChanged : rfChanged}
+            scale={scale}
+            maxScale={maxScale}
+            onScale={setScale}
+            onScaleStart={() => { suspend(); setResizing(true) }}
+            onScaleEnd={() => { setResizing(false); resume() }}
           />
         ) : (
           <div className="flex flex-col gap-2">
@@ -443,7 +479,7 @@ function Widget() {
               onToggleLock={() => setLocked((l) => !l)}
               onRefresh={refresh}
               scale={scale}
-              maxScale={fitMax}
+              maxScale={maxScale}
               onScale={setScale}
               resizeMode={resizeMode}
               onToggleResize={() => setResizeMode((r) => !r)}
@@ -1165,7 +1201,10 @@ const TAB_PAD = {
    up after the dock itself already works. */
 const HORIZONTAL_EDGES = ['top', 'bottom']
 
-function MiniBar({ s, edge, locked, onExpand, changed }) {
+function MiniBar({
+  s, edge, locked, onExpand, changed,
+  scale, maxScale, onScale, onScaleStart, onScaleEnd,
+}) {
   const net = s.net
   const hw = s.hw
   const cl = s.ai?.claude
@@ -1265,10 +1304,114 @@ function MiniBar({ s, edge, locked, onExpand, changed }) {
         >
           {ping.text}
         </span>
+        <TabAddress ip={net?.ip} column={column} />
         <NetDot up={up} busy={busy} />
         <VpnChip vpn={net?.vpn} tab />
+        <TabResizeGrip
+          column={column}
+          scale={scale}
+          onScale={onScale}
+          max={maxScale}
+          onStart={onScaleStart}
+          onEnd={onScaleEnd}
+        />
       </div>
     </Card>
+  )
+}
+
+/**
+ * The exit address, in the tab.
+ *
+ * It is the reading the widget exists for, so it belongs on the strip and not
+ * only behind a click -- but the strip is two different shapes. On the top and
+ * bottom edges there is width to spare and the address reads as one ordinary
+ * line. On the left and right edges the tab is a narrow column, and a dotted
+ * quad laid out sideways there would either be cut off or would widen the whole
+ * window; so it is stacked instead, an octet per line with the joining dot on a
+ * line of its own.
+ *
+ * Every line is centred rather than padded into place. A dot is one glyph wide
+ * against three digits, and any alignment that is not real text centring leaves
+ * it stuck against one side of the column instead of sitting between the two
+ * numbers it joins.
+ *
+ * Nothing is ever truncated. The row is `whitespace-nowrap` and the tab sizes
+ * itself to its content, so a longer address widens the strip rather than
+ * disappearing off the end of it; the column form already wraps by
+ * construction.
+ */
+function TabAddress({ ip, column }) {
+  const live = ip && ip !== '?' && ip !== 'Error'
+  const text = live ? ip : '…'
+
+  if (!column) {
+    return (
+      <span
+        className="glass-text shrink-0 whitespace-nowrap text-center text-[11.5px]
+                   tabular-nums text-ink-2"
+        title="Exit address"
+      >
+        {text}
+      </span>
+    )
+  }
+
+  // Split on the dots rather than rendering them with the octets, because the
+  // separator is its own line here and a joined string cannot be centred a
+  // piece at a time.
+  const parts = live ? text.split('.') : [text]
+  return (
+    <span
+      className="glass-text flex shrink-0 flex-col items-center text-center text-[11.5px]
+                 leading-[1.05] tabular-nums text-ink-2"
+      title="Exit address"
+    >
+      {parts.map((part, i) => (
+        <span key={`${part}-${i}`} className="block w-full text-center">
+          {i > 0 && <span className="block w-full text-center text-faint">.</span>}
+          {part}
+        </span>
+      ))}
+    </span>
+  )
+}
+
+/**
+ * The tab's resize handle.
+ *
+ * The same `useScaleDrag` the corner grip and the footer band use, so dragging,
+ * double-click to reset and remembering the size on release all behave exactly
+ * as they do in the expanded views -- there is one scale and one way of
+ * changing it.
+ *
+ * What is different is that the tab's own card already owns the pointer: it
+ * moves the window on a drag and expands the widget on a click. So every event
+ * this handle takes is stopped here rather than allowed to bubble, otherwise a
+ * resize would slide the tab along its edge and then open the panel on release.
+ */
+function TabResizeGrip({ column, scale, onScale, onStart, onEnd, max }) {
+  const handlers = useScaleDrag({ scale, onScale, onStart, onEnd, max })
+  const stop = (fn) => (e) => { e.stopPropagation(); fn(e) }
+
+  return (
+    <span
+      className={'grid shrink-0 cursor-nwse-resize place-items-center rounded-[5px] '
+        + 'text-faint transition hover:bg-white/15 hover:text-ink-2 '
+        + (column ? 'h-[16px] w-[20px]' : 'h-[20px] w-[16px]')}
+      title={`Drag to resize the widget · double-click to reset `
+        + `(${Math.round(scale * 100)}% of ${Math.round(max * 100)}% max)`}
+      onPointerDown={stop(handlers.onPointerDown)}
+      onPointerMove={stop(handlers.onPointerMove)}
+      onPointerUp={stop(handlers.onPointerUp)}
+      onPointerCancel={stop(handlers.onPointerCancel)}
+      onDoubleClick={stop(handlers.onDoubleClick)}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <svg viewBox="0 0 16 16" className="h-[11px] w-[11px]" stroke="currentColor" strokeWidth="1.4">
+        <path d="M15 9 9 15M15 13l-2 2" strokeLinecap="round" />
+      </svg>
+    </span>
   )
 }
 

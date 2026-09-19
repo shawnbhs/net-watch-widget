@@ -190,22 +190,52 @@ let pending = null
 let ignoring = null
 
 /**
- * The whole of the primary display, not its work area.
+ * The whole desktop -- every display, not just the primary one.
  *
- * A pet wandering the desktop should be able to walk in front of the taskbar --
- * that is where a desktop pet belongs. `workBottom` rides along as a fraction so
- * the renderer can still keep the *resting* floor above it, which is where a pet
- * reads as standing on something rather than floating over the clock.
+ * The overlay used to be the primary display's rectangle, which made "let a pet
+ * roam the desktop" quietly mean "roam *this* desktop": a pet could not be
+ * dragged onto a second monitor because there was no window over it to drag
+ * into. So the window is the bounding box of every display, and a pet walks
+ * between screens the same way it walks anywhere else.
+ *
+ * Full display bounds rather than work areas, because a pet wandering the
+ * desktop should be able to pass in front of the taskbar -- that is where a
+ * desktop pet belongs. Where it comes to *rest* is a different question, and
+ * one each screen answers for itself: monitors do not share a taskbar, or a
+ * height, or even a top edge. Hence `displays`, each with its own floor,
+ * already converted into the overlay's own coordinates so the renderer never
+ * has to know where on the desktop it happens to be.
+ *
+ * `workBottom` stays for the single frame before this arrives, when the page
+ * has only its own window to go on.
  */
 function overlayBounds() {
-  const d = screen.getPrimaryDisplay()
-  const workBottom = (d.workArea.y - d.bounds.y + d.workArea.height) / d.bounds.height
+  const all = screen.getAllDisplays()
+  const x = Math.min(...all.map((d) => d.bounds.x))
+  const y = Math.min(...all.map((d) => d.bounds.y))
+  const right = Math.max(...all.map((d) => d.bounds.x + d.bounds.width))
+  const bottom = Math.max(...all.map((d) => d.bounds.y + d.bounds.height))
+
+  const primary = screen.getPrimaryDisplay()
+  const workBottom =
+    (primary.workArea.y - primary.bounds.y + primary.workArea.height) / primary.bounds.height
+
   return {
-    x: d.bounds.x,
-    y: d.bounds.y,
-    width: d.bounds.width,
-    height: d.bounds.height,
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
     workBottom: Math.min(1, Math.max(0.5, workBottom)),
+    displays: all.map((d) => ({
+      id: d.id,
+      x: d.bounds.x - x,
+      y: d.bounds.y - y,
+      width: d.bounds.width,
+      height: d.bounds.height,
+      // Where a pet stands: the bottom of this screen's work area, so it rests
+      // on the taskbar's top edge rather than over the clock.
+      floor: d.workArea.y - y + d.workArea.height,
+    })),
   }
 }
 
@@ -266,7 +296,17 @@ function createOverlay() {
   overlay.loadFile(path.join(__dirname, '..', 'dist', 'overlay.html'))
   // `showInactive`, not `show`: letting the pets steal focus would pull it off
   // whatever the person is actually typing into.
-  overlay.once('ready-to-show', () => overlay.showInactive())
+  overlay.once('ready-to-show', () => {
+    overlay.showInactive()
+    // Windows clamps a window to one monitor's work area *as it is created*,
+    // so the rectangle asked for above never fully arrives: measured here, a
+    // request for the full 1440-tall display came back 1392 -- the taskbar
+    // strip shaved off -- and on a multi-monitor desktop every screen past the
+    // primary one would go the same way, which is the whole of what kept pets
+    // on the main display. Re-applying the same bounds once the window exists
+    // is not subject to that clamp, and does stick.
+    overlay.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height })
+  })
   overlay.webContents.on('did-finish-load', () => {
     if (pending) overlay.webContents.send('pets', pending)
   })

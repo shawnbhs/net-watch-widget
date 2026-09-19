@@ -48,6 +48,19 @@ contextBridge.exposeInMainWorld('nw', {
     return () => ipcRenderer.off('dock', handler)
   },
   /** True while the window is being moved and the frost is hidden. */
+  /**
+   * The widget is now on a different monitor.
+   *
+   * Anything measured against the screen -- above all the largest scale that
+   * still fits -- has to be measured again, and a plain window move gives the
+   * page nothing else to go on.
+   */
+  onDisplay(fn) {
+    const handler = (_e, info) => fn(info)
+    ipcRenderer.on('display', handler)
+    return () => ipcRenderer.off('display', handler)
+  },
+
   onMoving(fn) {
     const handler = (_e, value) => fn(value)
     ipcRenderer.on('moving', handler)

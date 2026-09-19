@@ -19,15 +19,45 @@ import {
 
 const KEY = 'netwatch.pets.v1'
 
+/**
+ * The range of a single pet's size multiplier.
+ *
+ * A multiplier rather than a height, so the global Size slider stays the master
+ * control: moving it still resizes the whole roster and keeps whatever relative
+ * differences have been set. The top of the range is 4 so that one pet can be
+ * taken to roughly the global ceiling on its own -- at the default 26px, x4 is
+ * 104px -- without having to drag the global slider up and everyone else with
+ * it.
+ */
+export const PET_SIZE_MIN = 0.5
+export const PET_SIZE_MAX = 4
+export const PET_SIZE_STEP = 0.1
+
+/** One pet's multiplier, clamped to the range and defaulting to 1. */
+export function petSize(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 1
+  return Math.min(PET_SIZE_MAX, Math.max(PET_SIZE_MIN, Math.round(n * 10) / 10))
+}
+
 const DEFAULT_OPTS = {
   /**
    * Drawn height in CSS px, before the widget's own scale.
    *
-   * 26 rather than PetRail's 56, and the ceiling is 40, because a widget pet
-   * stands on a card's top edge and its body reaches up over the card above it.
-   * The thinnest cards here -- the title and the footer -- are 43px, so a pet
-   * taller than that would stand clear of the topmost card and be clipped by
-   * the window, which is sized to exactly its content.
+   * 26 rather than PetRail's 56, because a widget pet stands on a card's top
+   * edge and its body reaches up over the card above it. The thinnest cards
+   * here -- the title and the footer -- are 43px, so past roughly that height a
+   * widget pet stands clear of the topmost card and the window, which is sized
+   * to exactly its content, cuts off whatever rises above it.
+   *
+   * The slider nevertheless runs to 100. The clipping is a real effect but it
+   * is not a malfunction, and it only applies to the half of the roster that
+   * lives on the cards: a pet set loose on the desktop has a whole screen over
+   * its head and nothing to be clipped by, and the overlay scales this figure
+   * up by 1.7 besides. Capping the control at what the widget can show would
+   * hold the desktop pets to a limit that is none of their business, so the
+   * ceiling is left where the bigger of the two views can use it and the
+   * default stays at a size the smaller one displays whole.
    */
   size: 26,
   speed: 1,
@@ -46,7 +76,12 @@ function load() {
     if (!raw) return EMPTY
     const saved = JSON.parse(raw)
     return {
-      pets: Array.isArray(saved.pets) ? saved.pets.filter((p) => p?.speciesId) : [],
+      // `size` is normalised on the way in rather than on the way out: a roster
+      // saved before per-pet sizing existed has no such field, and one hand-
+      // edited in localStorage can have anything in it.
+      pets: Array.isArray(saved.pets)
+        ? saved.pets.filter((p) => p?.speciesId).map((p) => ({ ...p, size: petSize(p.size) }))
+        : [],
       defaultMode: saved.defaultMode === 'screen' ? 'screen' : 'widget',
       opts: { ...DEFAULT_OPTS, ...(saved.opts || {}) },
     }
@@ -102,6 +137,7 @@ export function PetsProvider({ children }) {
           speciesId,
           color,
           mode: mode ?? s.defaultMode,
+          size: 1,
         }],
       }))
     },
@@ -120,6 +156,13 @@ export function PetsProvider({ children }) {
         pets: s.pets.map((p) => (
           p.id === id ? { ...p, mode: p.mode === 'screen' ? 'widget' : 'screen' } : p
         )),
+      }))
+    },
+    setPetSize(id, size) {
+      const next = petSize(size)
+      setState((s) => ({
+        ...s,
+        pets: s.pets.map((p) => (p.id === id ? { ...p, size: next } : p)),
       }))
     },
     setDefaultMode(mode) { setState((s) => ({ ...s, defaultMode: mode })) },
@@ -167,8 +210,8 @@ export function useOverlaySync() {
       .filter((p) => p.mode === 'screen')
       .map(resolve)
       .filter(Boolean)
-      .map(({ id, species, variant, speciesId, color }) => ({
-        id, speciesId, color, species, variant,
+      .map(({ id, species, variant, speciesId, color, size }) => ({
+        id, speciesId, color, species, variant, size: petSize(size),
       }))
     return { pets: loose, opts }
   }, [pets, opts, resolve, ready])

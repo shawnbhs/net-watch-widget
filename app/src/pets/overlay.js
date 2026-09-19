@@ -1,5 +1,5 @@
 import './pets.css'
-import { ASSET_BASE, World, bindPointer } from './engine.js'
+import { ASSET_BASE, OVERLAY_SIZE_FACTOR, World, bindPointer } from './engine.js'
 
 /**
  * The desktop overlay: the pets that were set loose.
@@ -32,7 +32,11 @@ function fit(b) {
   // `ground` keeps a resting pet above the taskbar. The window itself covers
   // the whole display, so a pet can still walk in front of it mid-hop -- which
   // is where a desktop pet belongs -- it simply does not choose to stand there.
+  // It is the fallback: once `displays` arrives each screen supplies its own
+  // floor, which is the only way a pet can rest correctly on a second monitor
+  // whose taskbar is somewhere else entirely.
   world.ground = b?.workBottom ?? 1
+  world.setDisplays(b?.displays)
   world.setSize(window.innerWidth, window.innerHeight)
 }
 
@@ -89,27 +93,35 @@ window.addEventListener('pointerup', () => { held = false })
 window.nwPets.onState((state) => {
   if (!state) return
   if (state.opts) {
-    // The widget's size slider is tuned for a 26px pet standing on a card. Out
-    // here there is a whole screen and nothing to be in scale with, so it is
-    // taken as a proportion of a size that reads properly on a desktop rather
-    // than as an absolute.
-    world.setOpts({ ...state.opts, size: Math.round(state.opts.size * 1.7) })
+    // See OVERLAY_SIZE_FACTOR: a loose pet is drawn larger than a card-bound
+    // one, because out here it has nothing to be in scale with.
+    world.setOpts({
+      ...state.opts,
+      size: Math.round(state.opts.size * OVERLAY_SIZE_FACTOR),
+    })
   }
 
   const keep = new Set()
   for (const row of state.pets ?? []) {
     keep.add(row.id)
-    if (world.byId(row.id)) continue
+    const live = world.byId(row.id)
+    if (live) { live.setSizeFactor(row.size); continue }
     // A new arrival walks on from the edge it is nearest, rather than fading in
     // over the middle of somebody's screen.
     const fromLeft = Math.random() < 0.5
+    const x = fromLeft ? 24 : world.w - 24
+    // The floor of the screen it is walking onto, not a fraction of the whole
+    // desktop: across two monitors that fraction is a line through the middle
+    // of nothing in particular.
+    const { floor } = world.screenSpan(x, world.h)
     world.add({
       id: row.id,
       species: row.species,
       variant: row.variant,
       mode: 'free',
-      x: fromLeft ? 24 : world.w - 24,
-      y: world.h * world.ground - 8,
+      size: row.size,
+      x,
+      y: floor - 8,
       dir: fromLeft ? 1 : -1,
     })
   }

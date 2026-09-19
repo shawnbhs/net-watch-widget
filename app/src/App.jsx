@@ -44,12 +44,32 @@ const INTRO_MS = 900
  * proud of them by a pixel or two. 0.92 is the first hundredth that measures
  * clean on every card.
  *
- * The ceiling is where the full view stops fitting on a 1080p screen. Growing
- * is the direction that works properly: 2x is exact, and so is everything
- * between.
+ * The ceiling is not a taste limit either, and it is no longer 2x. What the
+ * widget is actually allowed to grow to is whatever the monitor can hold --
+ * `fitScale` measures that, and on every real display it binds long before the
+ * number below does. SCALE_MAX is only the rail that catches a nonsense
+ * measurement: a card caught mid-layout reporting a 1px box would otherwise
+ * produce a fit in the thousands and a window the size of a city.
+ *
+ * It was 2 because the full view stops fitting a 1080p screen at about there,
+ * which is a true statement about one layout on one monitor and was never a
+ * reason the *compact* view or the tab could not go further. On this 1440p
+ * screen the full view fits at ~1.7 and is limited by the screen either way;
+ * the shorter views are the ones that were being held back.
  */
 const SCALE_MIN = 0.79
-const SCALE_MAX = 2
+const SCALE_MAX = 12
+
+/**
+ * The ceiling used when there is no usable fitted measurement.
+ *
+ * Two quite different cases, both meaning "the screen has not told us anything
+ * we can grow by": the layout has not been measured yet, and the layout was
+ * measured and does not fit even at the floor. Neither should hand the person
+ * the full rail -- an unmeasured widget is not licence to zoom to 12x -- so
+ * both fall back to what the ceiling used to be, which is known to be sane.
+ */
+const SCALE_MAX_UNFITTED = 2
 
 /**
  * Where the widget starts when nothing has been remembered.
@@ -83,8 +103,8 @@ const FIT_MARGIN = 48
  * is handed back to the person making it and the whole range stays reachable.
  */
 function scaleCeiling(max) {
-  const fitted = Math.min(SCALE_MAX, Number(max) || SCALE_MAX)
-  return fitted >= SCALE_MIN ? fitted : SCALE_MAX
+  const fitted = Math.min(SCALE_MAX, Number(max) || SCALE_MAX_UNFITTED)
+  return fitted >= SCALE_MIN ? fitted : SCALE_MAX_UNFITTED
 }
 
 function clampScale(v, max = SCALE_MAX) {
@@ -98,6 +118,22 @@ function clampScale(v, max = SCALE_MAX) {
   const ceiling = scaleCeiling(max)
   return Math.min(ceiling, Math.max(SCALE_MIN, Math.round(n * 100) / 100))
 }
+
+/**
+ * The work area of the monitor the widget is on, as the main process last
+ * reported it.
+ *
+ * Module scope rather than state because it is not rendered -- it only feeds
+ * the next measurement -- and because the listener that maintains it is torn
+ * down and rebuilt every time the view changes, which a value living inside
+ * that effect would not survive.
+ *
+ * `window.screen` would seem to be the obvious source and cannot be trusted
+ * for this: dragging the widget between two monitors of the same scale factor
+ * leaves `availWidth`/`availHeight` reporting the screen it came from, so the
+ * fitted ceiling never moves. Electron's main process reads the OS directly.
+ */
+let screenArea = null
 
 /**
  * The largest scale at which the widget still fits the monitor it is on.
@@ -118,31 +154,39 @@ function clampScale(v, max = SCALE_MAX) {
  */
 function fitScale(node, scale) {
   const r = node?.getBoundingClientRect()
-  if (!r) return SCALE_MAX
+  if (!r) return SCALE_MAX_UNFITTED
   const w = r.width / scale
   const h = r.height / scale
-  if (!(w > 0) || !(h > 0)) return SCALE_MAX
-  const availW = (window.screen?.availWidth ?? window.innerWidth) - FIT_MARGIN
-  const availH = (window.screen?.availHeight ?? window.innerHeight) - FIT_MARGIN
+  if (!(w > 0) || !(h > 0)) return SCALE_MAX_UNFITTED
+  const availW = (screenArea?.width ?? window.screen?.availWidth ?? window.innerWidth) - FIT_MARGIN
+  const availH = (screenArea?.height ?? window.screen?.availHeight ?? window.innerHeight) - FIT_MARGIN
   const fit = Math.min(availW / w, availH / h)
-  if (!Number.isFinite(fit)) return SCALE_MAX
+  if (!Number.isFinite(fit)) return SCALE_MAX_UNFITTED
   return Math.min(SCALE_MAX, Math.floor(fit * 100) / 100)
 }
 
 /**
  * Keeps the fitted ceiling current.
  *
- * Re-measured on a window resize -- which is also what a move to a second
- * monitor looks like from here -- and whenever `mode` changes, because the full
- * view is a great deal taller than the compact one and a limit computed from
- * the wrong layout is the whole bug: scaled up with the Pets card present, the
- * widget grew past the bottom of the screen.
+ * Re-measured on three things. A window resize. A `mode` change, because the
+ * full view is a great deal taller than the compact one and a limit computed
+ * from the wrong layout is the whole bug: scaled up with the Pets card
+ * present, the widget grew past the bottom of the screen. And a move to
+ * another monitor, which the main process has to announce.
+ *
+ * That last one used to be folded into the first, on the reasoning that a
+ * move between screens looks like a resize from in here. It does not, unless
+ * the two screens differ in scale factor: carry the widget from a 2560x1440
+ * monitor to a 1600x900 one at the same scale factor and its CSS size is
+ * unchanged, no resize fires, and the ceiling stays the one the bigger screen
+ * justified -- so the widget can still be dragged to a size the screen it is
+ * now on cannot hold.
  *
  * The measurement is deferred by a frame so it reads the layout the mode
  * switch actually produced rather than the one it is leaving.
  */
 function useScaleLimit(shell, scale, mode) {
-  const [max, setMax] = useState(SCALE_MAX)
+  const [max, setMax] = useState(SCALE_MAX_UNFITTED)
   const scaleRef = useRef(scale)
   scaleRef.current = scale
 
@@ -155,9 +199,16 @@ function useScaleLimit(shell, scale, mode) {
     }
     measure()
     window.addEventListener('resize', measure)
+    const offDisplay = window.nw?.onDisplay?.((info) => {
+      if (info?.width > 0 && info?.height > 0) {
+        screenArea = { width: info.width, height: info.height }
+      }
+      measure()
+    })
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener('resize', measure)
+      offDisplay?.()
     }
   }, [shell, mode])
 

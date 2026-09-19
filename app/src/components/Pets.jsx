@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import { Card, CardHead } from './Glass.jsx'
-import { usePets } from '../pets/store.jsx'
-import { ASSET_BASE } from '../pets/engine.js'
+import {
+  PET_SIZE_MAX, PET_SIZE_MIN, PET_SIZE_STEP, usePets,
+} from '../pets/store.jsx'
+import { ASSET_BASE, OVERLAY_SIZE_FACTOR } from '../pets/engine.js'
 
 /**
  * The pets row.
@@ -50,6 +52,24 @@ function ModeSwitch({ value, onChange, small }) {
   )
 }
 
+/**
+ * The height a pet will actually be drawn at, in CSS px.
+ *
+ * Three things multiply together and only one of them is on screen, so the
+ * slider quotes the answer: the global size, this pet's own factor, and the
+ * species' scale -- a cat and a crab drawn at the same nominal height do not
+ * occupy the same space, and the manifest corrects for that. A pet out on the
+ * desktop is larger again by OVERLAY_SIZE_FACTOR.
+ *
+ * The widget's own zoom is deliberately not in here. It scales the whole
+ * interface, the global slider's own "26 px" ignores it too, and a figure that
+ * moved every time the window was resized would be unreadable.
+ */
+function petPx(factor, size, full, mode) {
+  const base = mode === 'screen' ? Math.round(size * OVERLAY_SIZE_FACTOR) : size
+  return Math.round(base * factor * (full?.species.scale ?? 1))
+}
+
 /** A labelled slider. `format` turns the raw value into the read-out. */
 function Slider({ label, value, min, max, step, onChange, format }) {
   return (
@@ -96,13 +116,14 @@ function Check({ label, checked, onChange, hint }) {
 export function PetsCard({ rise }) {
   const {
     manifest, ready, pets, defaultMode, opts,
-    add, remove, setMode, setDefaultMode, setOpts, clear, resolve,
+    add, remove, setMode, setPetSize, setDefaultMode, setOpts, clear, resolve,
   } = usePets()
 
   const [picking, setPicking] = useState(false)
   const [tuning, setTuning] = useState(false)
   const [chosen, setChosen] = useState(null)     // species id, while picking
   const [colour, setColour] = useState(null)
+  const [sizing, setSizing] = useState(null)     // pet id, while resizing one
 
   const species = manifest.find((s) => s.id === chosen) || null
 
@@ -255,38 +276,69 @@ export function PetsCard({ rise }) {
           {pets.map((row) => {
             const full = resolve(row)
             return (
-              <li key={row.id} className="flex items-center gap-2 px-3 py-[2px]">
-                {/* Nothing rather than an empty `src`, which a file:// page
-                    resolves back to the document itself. */}
-                {full ? (
-                  <img
-                    src={ASSET_BASE + full.variant.icon}
-                    alt=""
-                    className="h-[16px] w-[16px] shrink-0 object-contain"
-                    style={{ imageRendering: 'pixelated' }}
+              <li key={row.id}>
+                <div className="flex items-center gap-2 px-3 py-[2px]">
+                  {/* Nothing rather than an empty `src`, which a file:// page
+                      resolves back to the document itself. */}
+                  {full ? (
+                    <img
+                      src={ASSET_BASE + full.variant.icon}
+                      alt=""
+                      className="h-[16px] w-[16px] shrink-0 object-contain"
+                      style={{ imageRendering: 'pixelated' }}
+                    />
+                  ) : <span className="h-[16px] w-[16px] shrink-0" />}
+                  {/* The name is the disclosure. A row carries three controls
+                      already, and a fourth button for something adjusted once
+                      and then left alone would cost every row the width. */}
+                  <button
+                    type="button"
+                    onClick={() => setSizing((id) => (id === row.id ? null : row.id))}
+                    title="Resize this pet"
+                    aria-expanded={sizing === row.id}
+                    className="glass-text min-w-0 flex-1 truncate text-left text-[10.5px]
+                               text-ink-2 transition hover:text-ink"
+                  >
+                    {full ? full.species.label : row.speciesId}
+                    {full && full.species.variants.length > 1 && (
+                      <span className="text-faint"> · {full.variant.label}</span>
+                    )}
+                    {row.size !== 1 && (
+                      <span className="text-faint tabular-nums"> · {row.size}x</span>
+                    )}
+                  </button>
+                  <ModeSwitch
+                    small
+                    value={row.mode}
+                    onChange={(m) => setMode(row.id, m)}
                   />
-                ) : <span className="h-[16px] w-[16px] shrink-0" />}
-                <span className="glass-text min-w-0 flex-1 truncate text-[10.5px] text-ink-2">
-                  {full ? full.species.label : row.speciesId}
-                  {full && full.species.variants.length > 1 && (
-                    <span className="text-faint"> · {full.variant.label}</span>
-                  )}
-                </span>
-                <ModeSwitch
-                  small
-                  value={row.mode}
-                  onChange={(m) => setMode(row.id, m)}
-                />
-                <button
-                  type="button"
-                  onClick={() => remove(row.id)}
-                  title="Remove this pet"
-                  aria-label={`Remove ${full?.species.label ?? 'pet'}`}
-                  className="shrink-0 px-[2px] text-[12px] leading-none text-faint
-                             transition hover:text-bad"
-                >
-                  &#10005;
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => remove(row.id)}
+                    title="Remove this pet"
+                    aria-label={`Remove ${full?.species.label ?? 'pet'}`}
+                    className="shrink-0 px-[2px] text-[12px] leading-none text-faint
+                               transition hover:text-bad"
+                  >
+                    &#10005;
+                  </button>
+                </div>
+                {sizing === row.id && (
+                  <div className="pl-[18px]">
+                    <Slider
+                      label="Size"
+                      value={row.size}
+                      min={PET_SIZE_MIN}
+                      max={PET_SIZE_MAX}
+                      step={PET_SIZE_STEP}
+                      onChange={(v) => setPetSize(row.id, v)}
+                      // Both numbers, because neither answers the question on
+                      // its own: the multiplier is what is being set, and the
+                      // pixels are what will actually be on the card.
+                      format={(v) => `${v.toFixed(1)}x · ${petPx(v, opts.size, full, row.mode)} px`}
+                    />
+                  </div>
+                )}
               </li>
             )
           })}
@@ -297,10 +349,10 @@ export function PetsCard({ rise }) {
       {tuning && (
         <div className="mt-1.5 border-t border-edge-soft pt-1.5">
           <Slider
-            label="Size"
+            label="Size · all pets"
             value={opts.size}
             min={16}
-            max={40}
+            max={100}
             step={1}
             onChange={(size) => setOpts({ size })}
             format={(v) => `${v} px`}

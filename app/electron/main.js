@@ -124,6 +124,9 @@ function createWindow() {
   win.on('closed', () => { win = null; destroyPanes(); pets.closeOverlay() })
 
   win.on('move', onWindowMove)
+  // The first report, for a page that has not moved yet: without it the
+  // renderer has nothing but `window.screen` until the widget is first dragged.
+  win.webContents.on('did-finish-load', checkDisplay)
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) =>
     console.error('[load failed]', code, desc, url))
@@ -519,9 +522,50 @@ let moveIdle = null
  */
 let dragging = false
 
+/**
+ * The display the widget was last seen on.
+ *
+ * Moving a window between two monitors of the *same* scale factor changes
+ * nothing the page can observe: its CSS size is identical, so no resize event
+ * fires. `useScaleLimit` listens for exactly that event and nothing else, so
+ * it would go on enforcing the ceiling it worked out for the monitor the
+ * widget has just left -- 3.09x, say, computed on a 2560x1440 screen, still
+ * being offered after the widget is dragged onto a 1600x900 one. Where the two
+ * monitors differ in scale factor the page does see a resize, which is why
+ * this held together for as long as it did.
+ */
+let lastDisplayId = null
+
+function checkDisplay() {
+  if (!win || win.isDestroyed()) return
+  const b = win.getBounds()
+  // The window's centre, not its origin: a widget straddling a seam belongs to
+  // whichever screen most of it is on, which is also the screen its own
+  // `window.screen` will report.
+  const d = screen.getDisplayNearestPoint({
+    x: b.x + Math.round(b.width / 2),
+    y: b.y + Math.round(b.height / 2),
+  })
+  if (d.id === lastDisplayId) return
+  lastDisplayId = d.id
+  trace('display', d.id, JSON.stringify(d.workArea))
+  // The work area travels with the message rather than being left for the page
+  // to look up. `window.screen` is the obvious source and it is not a reliable
+  // one: measured here, moving the widget from a 2560x1440 monitor onto a
+  // 1600x900 one left `screen.availHeight` still reporting 1392, so the widget
+  // went on believing it could grow to a size that screen cannot show. The
+  // main process is asking the OS directly and has no such lag.
+  win.webContents.send('display', {
+    id: d.id,
+    width: d.workArea.width,
+    height: d.workArea.height,
+  })
+}
+
 function onWindowMove() {
   if (!win || win.isDestroyed()) return
   trace('move', JSON.stringify(win.getBounds()))
+  checkDisplay()
   if (!dragging) {
     repositionPanes()
     return

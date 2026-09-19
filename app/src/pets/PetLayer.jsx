@@ -95,7 +95,7 @@ export function PetLayer({ enabled, scale }) {
     for (const row of wanted) {
       keep.add(row.id)
       const live = w.byId(row.id)
-      if (live) { live.setMode('platform'); continue }
+      if (live) { live.setMode('platform'); live.setSizeFactor(row.size); continue }
       const full = resolve(row)
       if (!full) continue
       // New arrivals drop in from above rather than appearing. A pet that
@@ -108,6 +108,7 @@ export function PetLayer({ enabled, scale }) {
         variant: full.variant,
         mode: 'platform',
         platformId: null,
+        size: row.size,
         x: w.w * (0.25 + Math.random() * 0.5),
         y: -20,
       })
@@ -116,7 +117,10 @@ export function PetLayer({ enabled, scale }) {
       pet.setClip('air')
     }
     for (const live of [...w.pets]) if (!keep.has(live.id)) w.remove(live.id)
-  }, [wanted.map((p) => `${p.id}:${p.speciesId}:${p.color}`).join('|'), ready, enabled, resolve])
+  }, [
+    wanted.map((p) => `${p.id}:${p.speciesId}:${p.color}:${p.size}`).join('|'),
+    ready, enabled, resolve,
+  ])
 
   // ── gestures ────────────────────────────────────────────────────────────────
 

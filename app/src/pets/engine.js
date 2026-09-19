@@ -52,7 +52,32 @@ const CLIP_CHAIN = {
 /** States during which a pet neither starts nor answers a meeting. */
 const BUSY = new Set(['held', 'air', 'hop', 'land'])
 
+/**
+ * How much bigger a loose pet is drawn than the same pet on a card.
+ *
+ * The size slider is tuned for a pet standing on a 43px card. Out on the
+ * desktop there is nothing for it to be in scale with, so the figure is taken
+ * as a proportion of a size that reads properly there instead of as an
+ * absolute. It lives here rather than in the overlay because the widget's own
+ * roster has to quote the resulting pixels back to the user, and two copies of
+ * this number would eventually disagree.
+ */
+export const OVERLAY_SIZE_FACTOR = 1.7
+
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v)
+/**
+ * A pet's own size multiplier, sanitised.
+ *
+ * Applied on top of the world's size and the species' own scale, so it says
+ * "this one is bigger than the others" rather than "this one is 40px" -- the
+ * global slider then still moves the whole roster and keeps those differences.
+ * A missing value is 1 because every pet saved before this existed has none,
+ * and 1 is what they were being drawn at.
+ */
+const petFactor = (v) => {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? clamp(n, 0.1, 8) : 1
+}
 const rand = (lo, hi) => lo + Math.random() * (hi - lo)
 const pick = (arr) => arr[(Math.random() * arr.length) | 0]
 
@@ -87,6 +112,9 @@ export class Pet {
     // A touch of per-pet variation, so two of the same species do not march
     // in lockstep down the same card.
     this.tempo = rand(0.82, 1.22)
+
+    /** This pet's own multiplier on the world size. See `petFactor`. */
+    this.sizeFactor = petFactor(spec.size)
 
     this.k = 1            // px per source pixel, constant per pet
     this.action = 'idle'
@@ -141,9 +169,25 @@ export class Pet {
    * changing animation never resizes the character.
    */
   applySize() {
-    const target = this.world.petHeight() * this.species.scale
+    const target = this.world.petHeight() * this.species.scale * this.sizeFactor
     this.k = target / (this.variant.baseH || target)
     this.layoutClip()
+  }
+
+  /**
+   * Resize this pet alone.
+   *
+   * A no-op when the factor has not moved, because this is called for every
+   * pet on every roster change and `layoutClip` writes to the DOM.
+   */
+  setSizeFactor(size) {
+    const f = petFactor(size)
+    if (f === this.sizeFactor) return
+    this.sizeFactor = f
+    this.applySize()
+    // A platform pet's feet stay put while its body grows upward, but a free
+    // one that just got taller can end up with its feet below its own floor.
+    if (this.mode === 'platform') this.snap()
   }
 
   /**
@@ -405,13 +449,45 @@ export class Pet {
 
   // ── free roaming ────────────────────────────────────────────────────────────
 
+  /**
+   * Where this pet may wander.
+   *
+   * Left and right are the whole desktop, deliberately: clamping a pet to the
+   * screen it is on is what "pets only appear on the main monitor" was, and a
+   * pet that cannot cross a seam cannot be dragged across one either. Up and
+   * down come from the screen under it instead, and are re-read on every call,
+   * so crossing that seam changes which floor it is standing on.
+   */
   roamBounds() {
+    const { top, floor } = this.world.screenSpan(this.x, this.y)
     return {
       x1: this.w * 0.6,
       x2: this.world.w - this.w * 0.6,
-      y1: this.h + 24,
-      y2: this.world.h * this.world.ground - 6,
+      y1: top + this.h + 24,
+      y2: floor - 6,
     }
+  }
+
+  /**
+   * Put a loose pet back on the floor of the screen it is actually over.
+   *
+   * Walking across a seam can move the ground without the pet moving at all:
+   * two monitors need not be the same height or share a bottom edge, so the
+   * floor it left is not the floor it arrives on. Left alone it either hangs
+   * in the air over a taller neighbour or drops into the dead rectangle under
+   * a shorter one and vanishes -- which is exactly what happened the first
+   * time a pet was let across.
+   *
+   * A hop rather than a snap, because stepping up onto a screen is a thing a
+   * pet does and teleporting is not.
+   */
+  settleToFloor() {
+    const b = this.roamBounds()
+    if (this.y >= b.y1 - 1 && this.y <= b.y2 + 1) return
+    const y = clamp(this.y, b.y1, b.y2)
+    this.hopToId = null
+    this.hopTo(this.x, y, Math.min(120, Math.abs(y - this.y) * 0.45 + this.h * 0.6))
+    this.target = null
   }
 
   pickRoamTarget() {
@@ -635,6 +711,9 @@ export class Pet {
         this.dir = dx > 0 ? 1 : -1
         this.vxNow = this.dir * this.speedPx() * (dash ? 2.4 : 1)
         this.x = clamp(this.x + this.vxNow * dt, b.x1, b.x2)
+        // `b` was read before this step; crossing a screen boundary during it
+        // is what makes the floor underneath stale.
+        this.settleToFloor()
         this.curiosity(dt)
         break
       }
@@ -832,8 +911,22 @@ export class World {
     }
     /** Multiplies the drawn size, for a widget that has been scaled by hand. */
     this.scale = scale
-    /** Where a loose pet's resting floor is, as a fraction of the height. */
+    /**
+     * Where a loose pet's resting floor is, as a fraction of the height.
+     * Only consulted when `displays` is empty -- the first frame, before the
+     * main process has said what the desktop actually looks like.
+     */
     this.ground = ground
+
+    /**
+     * The screens this world covers, in its own coordinates.
+     *
+     * The overlay spans every monitor, so "the floor" is not one number: each
+     * screen has its own taskbar, its own height and its own top edge. A pet
+     * takes the floor of whichever screen it is currently over, which is what
+     * lets it walk across a seam and keep standing on something.
+     */
+    this.displays = []
 
     this.w = 0
     this.h = 0
@@ -847,6 +940,51 @@ export class World {
   }
 
   petHeight() { return this.opts.size * this.scale }
+
+  /**
+   * The screen a point is on, or the one it belongs to if it is on none.
+   *
+   * The bounding box of a set of monitors is not always covered by them: a
+   * short screen beside a tall one leaves a rectangle under it that is part of
+   * the desktop's extent and part of no display. A pet walking out of the tall
+   * screen at its own floor height crosses straight into that rectangle, where
+   * nothing is drawn and it simply disappears.
+   *
+   * Which is why horizontal position decides first. A pet walks along x, so
+   * once it is past the seam it is on the new screen and should be standing on
+   * *its* floor, even though it is still nearer the old screen's rectangle --
+   * one pixel past the edge of a 1440-tall monitor is a whole 500px nearer to
+   * it than to the 900-tall one it has just walked onto. Straight nearest-rect
+   * matching answers that question the wrong way round and leaves the pet in
+   * the gap; asking "whose column is this?" first does not.
+   */
+  displayAt(x, y) {
+    if (!this.displays.length) return null
+    const spans = (d) => x >= d.x && x < d.x + d.width
+
+    let column = null
+    let columnDy = Infinity
+    let nearest = null
+    let nearestDist = Infinity
+
+    for (const d of this.displays) {
+      const dx = x < d.x ? d.x - x : x > d.x + d.width ? x - (d.x + d.width) : 0
+      const dy = y < d.y ? d.y - y : y > d.y + d.height ? y - (d.y + d.height) : 0
+      if (dx === 0 && dy === 0) return d
+      if (spans(d) && dy < columnDy) { columnDy = dy; column = d }
+      const dist = dx * dx + dy * dy
+      if (dist < nearestDist) { nearestDist = dist; nearest = d }
+    }
+    return column ?? nearest
+  }
+
+  /** The top edge and resting floor of the screen under a point. */
+  screenSpan(x, y) {
+    const d = this.displayAt(x, y)
+    return d
+      ? { top: d.y, floor: d.floor }
+      : { top: 0, floor: this.h * this.ground }
+  }
 
   setSize(w, h) {
     if (w === this.w && h === this.h) return
@@ -863,6 +1001,28 @@ export class World {
         p.y = clamp(before[i].yf * h, b.y1, b.y2)
       } else p.snap()
     })
+  }
+
+  /**
+   * Replace the set of screens.
+   *
+   * Free pets are re-clamped here rather than left to drift back on their own,
+   * because a display change is exactly the moment a pet can end up standing
+   * somewhere that no longer exists -- a monitor unplugged out from under it,
+   * or a taskbar that moved to the other edge without the desktop's overall
+   * size changing at all, which `setSize` would not even see.
+   */
+  setDisplays(list) {
+    this.displays = (Array.isArray(list) ? list : []).filter((d) => (
+      d && Number.isFinite(d.x) && Number.isFinite(d.y)
+      && d.width > 0 && d.height > 0 && Number.isFinite(d.floor)
+    ))
+    for (const p of this.pets) {
+      if (p.mode !== 'free') continue
+      const b = p.roamBounds()
+      p.x = clamp(p.x, b.x1, b.x2)
+      p.y = clamp(p.y, b.y1, b.y2)
+    }
   }
 
   setScale(scale) {

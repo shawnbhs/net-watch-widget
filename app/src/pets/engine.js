@@ -28,6 +28,15 @@
  */
 export const ASSET_BASE = '../assets/pets/'
 
+/**
+ * How far apart two card tops must be to count as different levels.
+ *
+ * Two cards in the same row are laid out at the same y, but a pixel of
+ * rounding on a zoomed layout can make them differ by one; anything inside
+ * this is the same shelf.
+ */
+const LEVEL_EPS = 2
+
 const GRAVITY = 2600      // px/s^2 while airborne
 const AIR_DRAG = 0.86     // horizontal damping per second in the air
 const BASE_SPEED = 26     // px/s for a 56px pet at speed 1.0
@@ -265,12 +274,42 @@ export class Pet {
     this.setClip('land')
   }
 
+  /**
+   * The card one level up (-1) or down (+1), or null.
+   *
+   * Levels, not list positions. Cards sit two to a row -- ip beside rf, lan
+   * beside ping, hw beside tz -- so in a list sorted by y the entry next to
+   * this one is as often the card *beside* the pet as the card above or below
+   * it. Walking that list by index produced a leap to the same height, which
+   * is not a level change and does not read as one; worse, the two cards in a
+   * row are each other's neighbour, so a pet could hop ip->rf->ip->rf without
+   * ever leaving the row. That is the loop this used to fall into.
+   *
+   * Among the cards that do sit at the nearest other level, the one nearest
+   * in x wins, so the hop stays as vertical as the layout allows.
+   */
+  levelStep(delta) {
+    const here = this.platform
+    if (!here) return null
+    const roomy = (p) => p.x2 - p.x1 > this.w * 1.5
+    const side = this.world.platforms.filter((p) => (
+      roomy(p) && (delta < 0 ? p.y < here.y - LEVEL_EPS : p.y > here.y + LEVEL_EPS)
+    ))
+    if (!side.length) return null
+    // The nearest level in that direction, then the closest card on it.
+    const level = side.reduce((best, p) => (
+      Math.abs(p.y - here.y) < Math.abs(best.y - here.y) ? p : best
+    )).y
+    const row = side.filter((p) => Math.abs(p.y - level) <= LEVEL_EPS)
+    return row.reduce((best, p) => (
+      Math.abs(p.x1 + p.x2 - 2 * this.x) < Math.abs(best.x1 + best.x2 - 2 * this.x) ? p : best
+    ))
+  }
+
   /** Move one platform up (-1) or down (+1) in visual order. */
   step(delta) {
     if (this.mode === 'free') return false
-    const ordered = this.world.platforms.slice().sort((a, b) => a.y - b.y)
-    const here = ordered.findIndex((p) => p.id === this.platformId)
-    const next = ordered[clamp(here + delta, 0, ordered.length - 1)]
+    const next = this.levelStep(delta)
     if (!next || next.id === this.platformId) return false
     this.hopToPlatform(next)
     return true
@@ -524,12 +563,7 @@ export class Pet {
 
   /** A card to hop to: one step up or down, and only if it is wide enough. */
   pickHopTarget() {
-    const ordered = this.world.platforms.slice().sort((a, b) => a.y - b.y)
-    if (ordered.length < 2) return null
-    const here = ordered.findIndex((p) => p.id === this.platformId)
-    if (here < 0) return null
-    const candidates = [ordered[here - 1], ordered[here + 1]]
-      .filter((p) => p && p.x2 - p.x1 > this.w * 1.5)
+    const candidates = [this.levelStep(-1), this.levelStep(1)].filter(Boolean)
     return candidates.length ? pick(candidates) : null
   }
 

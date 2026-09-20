@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Card, CardHead } from './Glass.jsx'
 import {
-  PET_SIZE_MAX, PET_SIZE_MIN, PET_SIZE_STEP, usePets,
+  PET_NAME_MAX, PET_SIZE_MAX, PET_SIZE_MIN, PET_SIZE_STEP, usePets,
 } from '../pets/store.jsx'
 import { ASSET_BASE, OVERLAY_SIZE_FACTOR } from '../pets/engine.js'
 
@@ -116,7 +116,7 @@ function Check({ label, checked, onChange, hint }) {
 export function PetsCard({ rise }) {
   const {
     manifest, ready, pets, defaultMode, opts,
-    add, remove, setMode, setPetSize, setDefaultMode, setOpts, clear, resolve,
+    add, remove, setMode, setPetSize, setPetName, setDefaultMode, setOpts, clear, resolve,
   } = usePets()
 
   const [picking, setPicking] = useState(false)
@@ -124,6 +124,11 @@ export function PetsCard({ rise }) {
   const [chosen, setChosen] = useState(null)     // species id, while picking
   const [colour, setColour] = useState(null)
   const [sizing, setSizing] = useState(null)     // pet id, while resizing one
+  // Typed before the species is picked, because one of the two add paths does
+  // not pause for a second click: a species with a single variant is added the
+  // moment its tile is clicked. A name box that only appeared next to the Add
+  // button would be unreachable for exactly those pets.
+  const [naming, setNaming] = useState('')
 
   const species = manifest.find((s) => s.id === chosen) || null
 
@@ -135,17 +140,19 @@ export function PetsCard({ rise }) {
     setColour(sp.variants[0]?.color ?? null)
     // One variant is not a choice, so adding it is one click, not two.
     if (sp.variants.length === 1) {
-      add(sp.id, sp.variants[0].color)
+      add(sp.id, sp.variants[0].color, undefined, naming)
       setChosen(null)
+      setNaming('')
       setPicking(false)
     }
   }
 
   const place = () => {
     if (!species || !colour) return
-    add(species.id, colour)
+    add(species.id, colour, undefined, naming)
     setChosen(null)
     setColour(null)
+    setNaming('')
     setPicking(false)
   }
 
@@ -205,6 +212,21 @@ export function PetsCard({ rise }) {
 
       {picking && ready && (
         <>
+          <div className="mt-1.5 px-3">
+            <input
+              type="text"
+              value={naming}
+              maxLength={PET_NAME_MAX}
+              spellCheck={false}
+              onChange={(e) => setNaming(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && species && colour) place() }}
+              placeholder="Name this pet (optional)"
+              aria-label="Name for the pet you are about to add"
+              className="glass-text w-full rounded-[6px] border border-edge-soft bg-white/[0.06]
+                         px-2 py-[3px] text-[10px] text-ink outline-none transition
+                         placeholder:text-faint focus:border-white/35"
+            />
+          </div>
           <div
             className="mt-1.5 grid max-h-[104px] grid-cols-7 gap-1 overflow-y-auto px-3"
             role="listbox"
@@ -294,12 +316,16 @@ export function PetsCard({ rise }) {
                   <button
                     type="button"
                     onClick={() => setSizing((id) => (id === row.id ? null : row.id))}
-                    title="Resize this pet"
+                    title={full
+                      ? `${full.species.label} · ${full.variant.label}`
+                        + `${row.name ? ` — named ${row.name}` : ''}`
+                        + ' · click to rename or resize'
+                      : 'Click to rename or resize'}
                     aria-expanded={sizing === row.id}
                     className="glass-text min-w-0 flex-1 truncate text-left text-[10.5px]
                                text-ink-2 transition hover:text-ink"
                   >
-                    {full ? full.species.label : row.speciesId}
+                    {row.name || (full ? full.species.label : row.speciesId)}
                     {full && full.species.variants.length > 1 && (
                       <span className="text-faint"> · {full.variant.label}</span>
                     )}
@@ -325,6 +351,25 @@ export function PetsCard({ rise }) {
                 </div>
                 {sizing === row.id && (
                   <div className="pl-[18px]">
+                    {/* Rename lives here rather than behind a click on the name
+                        itself: that click already opens this panel, and one
+                        control cannot mean two things. */}
+                    <div className="px-3 pt-[3px]">
+                      <input
+                        type="text"
+                        value={row.name}
+                        maxLength={PET_NAME_MAX}
+                        spellCheck={false}
+                        onChange={(e) => setPetName(row.id, e.target.value)}
+                        onBlur={(e) => setPetName(row.id, e.target.value.trim())}
+                        placeholder={full ? full.species.label : 'Name'}
+                        aria-label={`Name for this ${full?.species.label ?? 'pet'}`}
+                        className="glass-text w-full rounded-[6px] border border-edge-soft
+                                   bg-white/[0.06] px-2 py-[2px] text-[10px] text-ink
+                                   outline-none transition placeholder:text-faint
+                                   focus:border-white/35"
+                      />
+                    </div>
                     <Slider
                       label="Size"
                       value={row.size}

@@ -33,6 +33,30 @@ export const PET_SIZE_MIN = 0.5
 export const PET_SIZE_MAX = 4
 export const PET_SIZE_STEP = 0.1
 
+/**
+ * The longest name a pet may carry.
+ *
+ * The roster row is one line in a card barely 300px wide, and the name shares
+ * it with a mode switch and a remove button. Past this the name is not a name
+ * any more, it is a paragraph that pushes the controls off the row.
+ */
+export const PET_NAME_MAX = 24
+
+/**
+ * A pet's own name: length-capped, and '' when it has none.
+ *
+ * Deliberately does NOT trim. This runs on every keystroke of the rename
+ * field, and trimming there makes a space impossible to type: the value goes
+ * back to the input with the trailing space already gone, so `Sir ` becomes
+ * `Sir` and the next letter lands against it -- you get `SirHops` and cannot
+ * see why. Trimming belongs at the points where a name is committed once:
+ * when a pet is added, and when the rename field is left.
+ */
+export function petName(v) {
+  if (typeof v !== 'string') return ''
+  return v.slice(0, PET_NAME_MAX)
+}
+
 /** One pet's multiplier, clamped to the range and defaulting to 1. */
 export function petSize(v) {
   const n = Number(v)
@@ -80,7 +104,9 @@ function load() {
       // saved before per-pet sizing existed has no such field, and one hand-
       // edited in localStorage can have anything in it.
       pets: Array.isArray(saved.pets)
-        ? saved.pets.filter((p) => p?.speciesId).map((p) => ({ ...p, size: petSize(p.size) }))
+        ? saved.pets
+          .filter((p) => p?.speciesId)
+          .map((p) => ({ ...p, size: petSize(p.size), name: petName(p.name).trim() }))
         : [],
       defaultMode: saved.defaultMode === 'screen' ? 'screen' : 'widget',
       opts: { ...DEFAULT_OPTS, ...(saved.opts || {}) },
@@ -129,7 +155,7 @@ export function PetsProvider({ children }) {
   }, [state])
 
   const actions = useMemo(() => ({
-    add(speciesId, color, mode) {
+    add(speciesId, color, mode, name) {
       setState((s) => ({
         ...s,
         pets: [...s.pets, {
@@ -138,6 +164,7 @@ export function PetsProvider({ children }) {
           color,
           mode: mode ?? s.defaultMode,
           size: 1,
+          name: petName(name).trim(),
         }],
       }))
     },
@@ -163,6 +190,13 @@ export function PetsProvider({ children }) {
       setState((s) => ({
         ...s,
         pets: s.pets.map((p) => (p.id === id ? { ...p, size: next } : p)),
+      }))
+    },
+    setPetName(id, name) {
+      const next = petName(name)
+      setState((s) => ({
+        ...s,
+        pets: s.pets.map((p) => (p.id === id ? { ...p, name: next } : p)),
       }))
     },
     setDefaultMode(mode) { setState((s) => ({ ...s, defaultMode: mode })) },

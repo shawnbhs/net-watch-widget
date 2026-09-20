@@ -17,7 +17,7 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
 import threading, time, urllib.request, urllib.error, urllib.parse, subprocess, json
-import sys, os, winreg, ipaddress, socket, re, base64, shlex
+import sys, os, winreg, ipaddress, socket, re, base64, shlex, hashlib
 import datetime as _dt
 import psutil
 
@@ -3030,22 +3030,78 @@ def fetch_gpt_usage():
 
 # ── proactive keepalive + interactive re-login ────────────────────────────────
 def ai_keepalive_once():
-    """Roll both tokens forward while they are still valid.
+    """Roll every registered token forward while it is still valid.
 
     Runs on its own slow schedule, independent of the usage poll: the poll
     refreshes only what it is about to use, so a token can still lapse during a
     long idle stretch. Gated on the same geo verdict as everything else — a
     refresh is an outbound request to the provider and must never leave a
-    blocked IP.
+    blocked IP. That gate is not about tidiness: a refresh sent from a blocked
+    country risks the account, not merely the reading, so it fails closed and
+    stays that way.
+
+    With the vault populated this walks the accounts; with the vault missing or
+    empty it falls back to the original two credential files, so the widget
+    behaves exactly as it did before the vault existed.
     """
     ok, _cc, _why = geo_verdict()
     if not ok or AI_LATCH["blocked"]:
+        return
+    if _vault_keepalive():
         return
     for fn in (_claude_token, _codex_token):
         try:
             fn(lead=AI_REFRESH_LEAD)
         except Exception:
             pass
+
+
+def _vault_keepalive(lead=AI_REFRESH_LEAD):
+    """Refresh the vault's accounts. Returns False when there is no vault.
+
+    Accounts whose refresh token is provably beyond saving are skipped rather
+    than retried every half hour: hammering a dead grant earns nothing but a
+    pattern of failed requests against an account that already needs a human
+    with a browser.
+    """
+    if not ai_vault_ready():
+        return False
+    try:
+        accts = _vault.list_accounts() or []
+    except Exception:
+        return False
+    if not accts:
+        return False
+    now = time.time()
+    for a in accts:
+        pid = a.get("provider") or ""
+        if not _provider_is_live(pid):
+            continue
+        cred = a.get("cred")
+        try:
+            if _prov.is_unrecoverable(pid, cred):
+                continue
+        except Exception:
+            pass
+        try:
+            exp = _prov.cred_expiry(pid, cred)
+        except Exception:
+            exp = None
+        if exp is not None and exp - lead > now:
+            continue
+        try:
+            new, _why = _prov.refresh_cred(pid, cred)
+        except Exception:
+            new = None
+        if new and not _vault_store_cred(a.get("id"), new):
+            # The provider has already invalidated the old refresh token, and
+            # the replacement did not reach the disk. There is nothing useful
+            # left to do with this account here: the credential in memory is
+            # the only live copy and this thread is not the one that renders
+            # anything, so _vault_store_cred's latch carries the failure over
+            # to the next poll, which reports it as an error row.
+            continue
+    return True
 
 
 def ai_login_launch(which):
@@ -3073,6 +3129,770 @@ def ai_login_launch(which):
         return True
     except Exception:
         return False
+
+
+# ── multi-account vault ───────────────────────────────────────────────────────
+# The single-credential path above answers one question — "what does the CLI
+# currently hold?" — and that is exactly the question that breaks when a user
+# has two accounts with the same provider, because the CLI holds one login at a
+# time and a second `claude` login overwrites the first. The vault below owns a
+# copy of each credential so a login survives the next login, and the provider
+# registry keeps protocol details out of this file.
+#
+# Both modules are imported defensively. They are newer than the widget and a
+# user pulling a partial checkout, or an antivirus quarantining one file, must
+# not blank the panel: with either module missing every entry point here turns
+# into a no-op and the original two-credential path above continues to run.
+try:
+    import aiaccounts as _vault
+except Exception:
+    _vault = None
+try:
+    import aiproviders as _prov
+except Exception:
+    _prov = None
+
+# How long to wait for an interactive login to land in the CLI's credential
+# file. The user has to open a browser, sign in, and paste a code back, so the
+# window is minutes rather than seconds; the poll is slow because the only
+# thing that changes in that window is one small file.
+AI_LOGIN_WAIT = 300
+AI_LOGIN_POLL = 2.0
+
+# Seconds between two accounts' usage requests. The original code slept a
+# random 1.5-5s between the Claude and Codex calls so they never landed at the
+# same instant; with an unbounded number of accounts a fixed, documented gap is
+# easier to reason about than a random one, and it keeps a five-account poll
+# from looking like a burst.
+AI_ACCT_SPACING = 2.0
+
+
+def ai_vault_ready():
+    """True when both new modules imported and can be used."""
+    return _vault is not None and _prov is not None
+
+
+def ai_providers_list():
+    """The provider registry, copied so a caller cannot mutate the module's."""
+    if _prov is None:
+        return []
+    try:
+        return [dict(p) for p in (_prov.PROVIDERS or [])]
+    except Exception:
+        return []
+
+
+def ai_provider_login_error(pid):
+    """Why this provider cannot be logged into, or None when it can be.
+
+    Answering this before a login is launched matters because launching one is
+    not a cheap mistake: it opens a visible console and then waits minutes for
+    a human to finish a browser round-trip. If the provider name is not in the
+    registry, or is in it only as a future plan, that wait would never end and
+    would be indistinguishable to the user from a login that quietly failed.
+    """
+    if _prov is None:
+        return "provider registry unavailable"
+    try:
+        meta = _prov.provider(pid) or {}
+    except Exception:
+        meta = {}
+    if not meta:
+        return "unknown provider: %s" % (pid or "?")
+    if (meta.get("status") or "planned") != "live":
+        return "not supported yet"
+    return None
+
+
+def _provider_is_live(pid):
+    """Whether this provider has a working implementation behind it.
+
+    The registry deliberately lists providers that are not implemented yet, so
+    the picker can show what is coming without this file hardcoding vendor
+    names. Those must never be polled: a request would be pointless and the
+    registry already says what to display instead.
+    """
+    if _prov is None:
+        return False
+    try:
+        meta = _prov.provider(pid) or {}
+    except Exception:
+        return False
+    return (meta.get("status") or "planned") == "live"
+
+
+def _cli_cred_paths(pid):
+    """Where a provider's CLI keeps its own credential file.
+
+    Only the two CLIs the widget has ever read are known here, and their paths
+    still come from .env, so this adds no personal path to a public file. A
+    provider with no known path simply cannot be imported from a CLI — it can
+    still be added by hand once its login flow exists.
+    """
+    if pid == "claude":
+        return tuple(CLAUDE_CRED_PATHS)
+    if pid == "codex":
+        return tuple(CODEX_CRED_PATHS)
+    return ()
+
+
+def _cred_fingerprint(cred):
+    """A short digest of a credential, used to notice that it changed.
+
+    A digest rather than the credential because this value is compared, logged
+    and passed around, and a refresh token that reaches a log is a credential
+    leak. Sixteen hex characters is far more than enough to tell two files
+    apart, and reveals nothing about either.
+    """
+    try:
+        blob = json.dumps(cred, sort_keys=True, separators=(",", ":")).encode()
+    except Exception:
+        return ""
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _newest_cli_cred(pid):
+    """(path, cred) for the freshest credential the provider's CLI holds.
+
+    Ranked by real expiry when the provider can read one, and by file mtime
+    only as a last resort, for the same reason _pick_cred exists: when the same
+    account lives in a Windows profile and a WSL home, picking the stale copy
+    reports a perfectly healthy login as expired.
+    """
+    best = None
+    for p in _cli_cred_paths(pid):
+        d = _read_json(p)
+        if not d:
+            continue
+        try:
+            exp = _prov.cred_expiry(pid, d) if _prov else None
+        except Exception:
+            exp = None
+        if exp is None:
+            try:
+                key = (0, os.path.getmtime(p))
+            except OSError:
+                key = (0, 0)
+        else:
+            key = (1, exp)
+        if best is None or key > best[0]:
+            best = (key, p, d)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+# ── first-run import, once and only once ──────────────────────────────────────
+def _migrate_marker():
+    """Path of the fallback marker file beside the vault, or None."""
+    if _vault is None:
+        return None
+    try:
+        base = _vault.accounts_file()
+    except Exception:
+        return None
+    return (base + ".imported") if base else None
+
+
+def _migrated_already():
+    """Whether the one-time CLI import has run before.
+
+    Recorded in the vault document, with a marker file as a fallback for the
+    case where the vault itself cannot be written. Either witness is enough,
+    because the failure this guards against is re-import: an account the user
+    deliberately deleted reappearing at the next launch is worse than skipping
+    an import that had nothing to add.
+    """
+    if _vault is None:
+        return True
+    try:
+        if (_vault.load() or {}).get("imported_from_cli"):
+            return True
+    except Exception:
+        pass
+    m = _migrate_marker()
+    return bool(m and os.path.exists(m))
+
+
+def _mark_migrated():
+    """Record that the import happened, in the vault or beside it.
+
+    The vault is tried first and then READ BACK, because save() normalises the
+    document it is handed and is free to drop a key it does not know about —
+    which is exactly what happens today. A write that is assumed to have stuck
+    and did not is the worst outcome available here: every launch would
+    re-import, and an account the user deliberately deleted would come back
+    each time. So the flag is only trusted once it survives a round trip, and
+    a marker file beside the vault carries it otherwise.
+    """
+    stamp = int(time.time())
+    try:
+        doc = _vault.load() or {}
+        doc["imported_from_cli"] = stamp
+        _vault.save(doc)
+        if (_vault.load() or {}).get("imported_from_cli"):
+            return True
+    except Exception:
+        pass
+    m = _migrate_marker()
+    if not m:
+        return False
+    try:
+        d = os.path.dirname(m)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(m, "w", encoding="utf-8") as fh:
+            fh.write(str(stamp))
+        return True
+    except Exception:
+        return False
+
+
+def _import_sweep():
+    """Import CLI credentials the vault's own scan cannot reach.
+
+    aiaccounts.import_from_cli() enumerates WSL homes by listing the
+    \\wsl.localhost share, and it reads its extra candidates from the process
+    environment. Neither works here: the share root is not enumerable through
+    os.listdir even while individual paths under it open fine, and this repo's
+    machine-specific paths live in .env rather than in os.environ. The result
+    is that the vault's own sweep sees the Windows profile and nothing else --
+    which on a machine whose Windows copy has been logged out and whose WSL
+    copy is the live one imports the dead credential and misses the good one.
+
+    So core supplements it using CLAUDE_CRED_PATHS / CODEX_CRED_PATHS, the
+    lists it already resolves from .env and already uses for every poll.
+    Deduplication reuses the vault's own fingerprint so the two sweeps agree on
+    what counts as the same login; a provider that cannot fingerprint a file is
+    skipped rather than imported as a mystery row. Returns the number added.
+    """
+    if _vault is None:
+        return 0
+    fp_of = getattr(_vault, "cred_fingerprint", None)
+    if fp_of is None:
+        # Without a shared notion of identity there is no safe way to tell a
+        # second account from a second copy of the first, and importing
+        # duplicates is worse than importing nothing.
+        return 0
+    try:
+        known = set()
+        for a in (_vault.list_accounts() or []):
+            try:
+                fp = fp_of(a.get("provider"), a.get("cred"))
+            except Exception:
+                fp = None
+            if fp:
+                known.add(fp)
+    except Exception:
+        return 0
+    added = 0
+    for pid in ("claude", "codex"):
+        for path in _cli_cred_paths(pid):
+            cred = _read_json(path)
+            if not cred:
+                continue
+            try:
+                fp = fp_of(pid, cred)
+            except Exception:
+                fp = None
+            if not fp or fp in known:
+                continue
+            known.add(fp)
+            try:
+                _vault.add_account(pid, _import_label(pid, added),
+                                   cred, "import", path)
+                added += 1
+            except Exception:
+                # One unimportable file must not abandon the rest of the sweep.
+                continue
+    return added
+
+
+def _import_label(pid, n):
+    """A human label for an imported account, without leaking anything.
+
+    Credential files carry no account name worth showing — Claude's holds a
+    subscription tier and an expiry, nothing else — and an email address would
+    be personal data on a public screenshot. A numbered provider name is
+    honest about what is known, and the user can rename it.
+    """
+    name = pid
+    try:
+        p = _prov.provider(pid) if _prov else None
+        if isinstance(p, dict) and p.get("name"):
+            name = p["name"]
+    except Exception:
+        pass
+    return name if n == 0 else "%s %d" % (name, n + 1)
+
+
+def ai_migrate_once():
+    """Adopt the CLIs' existing logins into the vault, on first run only.
+
+    Returns (imported_count, note). The point is that upgrading the widget
+    costs the user nothing: whatever `claude` and `codex` already hold shows up
+    as accounts without a single click. The stamp is written even when nothing
+    was found, so a user who starts with no logins at all — and later deletes
+    an account on purpose — is not handed it back at the next launch.
+    """
+    if not ai_vault_ready():
+        return 0, "vault unavailable"
+    if _migrated_already():
+        return 0, "already imported"
+    try:
+        existing = _vault.list_accounts() or []
+    except Exception as exc:
+        return 0, "vault unreadable (%s)" % type(exc).__name__
+    if existing:
+        # Somebody added accounts before the stamp existed. Nothing to import,
+        # but stamp anyway so this branch is never reached twice.
+        _mark_migrated()
+        return 0, "vault not empty"
+    n = 0
+    try:
+        got = _vault.import_from_cli()
+        if isinstance(got, (list, tuple)):
+            n = len(got)
+        elif isinstance(got, int):
+            n = got
+        elif got:
+            n = 1
+    except Exception as exc:
+        # A failed import is not stamped: the next launch should try again,
+        # because the likely cause is a credential file that was unreadable at
+        # that moment (a stopped WSL distro), not one that will never exist.
+        return 0, "import failed (%s)" % type(exc).__name__
+    try:
+        n += _import_sweep()
+    except Exception:
+        # The supplement is a best-effort widening of the vault's own scan;
+        # whatever it could not reach is still reachable by adding the account
+        # by hand, so a failure here must not undo a successful import.
+        pass
+    _mark_migrated()
+    return n, "imported"
+
+
+# ── per-account poll ──────────────────────────────────────────────────────────
+# Accounts whose rotated credential could not be written down. This is a
+# latch rather than a return value because the two callers that discover the
+# failure are not the code that renders a row: the keepalive thread has no row
+# to return, and the account it just broke has to be reported as broken the
+# next time the UI asks about it, not silently poll as healthy. Cleared as
+# soon as a write for that account finally succeeds.
+AI_UNSAVED = {}
+_unsaved_lock = threading.Lock()
+
+
+def _vault_store_cred(aid, cred):
+    """Persist a rotated credential immediately. Returns True on success.
+
+    Called the moment a refresh returns, before the new token is used for
+    anything. Both providers rotate the refresh token on use, so the old one
+    dies as soon as the new one is issued: fetching with a credential that was
+    never written down is the one reliable way to genuinely destroy a login.
+
+    The write is attempted twice. The failures this path actually sees on
+    Windows -- an antivirus scanner holding the file open for a moment, a
+    roaming profile that has not finished reconnecting -- are transient, and a
+    second attempt a moment later costs nothing compared with losing a paid
+    account's login for good. update_cred() now returns a bool that is only
+    True once the document has been read back off the disk, so a False here
+    genuinely means the live credential exists nowhere but in memory.
+    """
+    if _vault is None or not aid:
+        return False
+    ok = False
+    for attempt in (0, 1):
+        if attempt:
+            # Short, fixed pause rather than a backoff loop: this runs inside
+            # a poll the UI is waiting on, so one quick retry is the whole
+            # budget available.
+            time.sleep(0.25)
+        try:
+            ok = bool(_vault.update_cred(aid, cred))
+        except Exception:
+            ok = False
+        if ok:
+            break
+    with _unsaved_lock:
+        if ok:
+            AI_UNSAVED.pop(aid, None)
+        else:
+            AI_UNSAVED[aid] = True
+    return ok
+
+
+def _acct_row(acct, cred, status, usage=None, error=None, needs_login=False):
+    """One entry of the `accounts` array the renderer reads.
+
+    Deliberately free of anything secret: an id, a label, a status, the usage
+    numbers, a short reason and an expiry timestamp. The credential itself
+    never leaves this process.
+    """
+    pid = acct.get("provider") or ""
+    exp = None
+    if _prov is not None:
+        try:
+            exp = _prov.cred_expiry(pid, cred)
+        except Exception:
+            exp = None
+    return {
+        "id": acct.get("id"),
+        "provider": pid,
+        "label": acct.get("label") or pid,
+        "status": status,
+        "usage": usage if usage else None,
+        "error": error or None,
+        "expires_at": int(exp) if exp else None,
+        "needs_login": bool(needs_login),
+    }
+
+
+def _needs_login(pid, cred, error):
+    """Whether the only way forward is a human with a browser."""
+    if _prov is not None:
+        try:
+            if _prov.is_unrecoverable(pid, cred):
+                return True
+        except Exception:
+            pass
+    e = error or ""
+    return e.startswith("LOGIN_EXPIRED") or e in NOT_CONFIGURED
+
+
+def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
+    """Refresh one account if it needs it, then read its usage. Never raises.
+
+    Ordering matters more than it looks: the refresh is persisted before the
+    fetch, and a refresh failure only becomes a verdict when the existing token
+    is also past its expiry. A dropped tunnel mid-refresh says nothing about
+    the credential, and reporting that as an expired login sends the user off
+    to redo a login that was never broken.
+    """
+    pid = acct.get("provider") or ""
+    cred = acct.get("cred")
+    if not ai_vault_ready():
+        return _acct_row(acct, cred, "error", None, "vault unavailable")
+    with _unsaved_lock:
+        unsaved = acct.get("id") in AI_UNSAVED
+    if unsaved:
+        # The background keepalive rotated this account's token and could not
+        # write the replacement down. Whatever is in the vault is dead, so
+        # there is no point polling with it; say so instead.
+        return _acct_row(acct, cred, "error", None, "credential not saved")
+    if not _provider_is_live(pid):
+        # The registry's own wording, so the UI has one string to recognise.
+        return _acct_row(acct, cred, "planned", None, "not supported yet")
+    try:
+        if _prov.is_unrecoverable(pid, cred):
+            return _acct_row(acct, cred, "error", None,
+                             "LOGIN_EXPIRED:%s" % pid, True)
+    except Exception:
+        pass
+
+    err = None
+    try:
+        exp = _prov.cred_expiry(pid, cred)
+    except Exception:
+        exp = None
+    now = time.time()
+    if exp is None or exp - lead <= now:
+        try:
+            new, why = _prov.refresh_cred(pid, cred)
+        except Exception as exc:
+            new, why = None, "refresh error (%s)" % type(exc).__name__
+        if new:
+            if not _vault_store_cred(acct.get("id"), new):
+                # Deliberately fatal for this one account. Using the rotated
+                # credential now would work for this poll and then be lost
+                # with the process, while the vault still holds the token the
+                # provider killed when it issued this one -- the login would
+                # be gone at the next start with no warning anywhere. Better
+                # to fail loudly now, while the user can still see it.
+                return _acct_row(acct, cred, "error", None,
+                                 "credential not saved")
+            cred = new
+            exp = None
+            try:
+                exp = _prov.cred_expiry(pid, cred)
+            except Exception:
+                exp = None
+        elif why:
+            err = why
+            still_valid = exp is not None and exp > now
+            if not still_valid:
+                return _acct_row(acct, cred, "error", None, err,
+                                 _needs_login(pid, cred, err))
+
+    try:
+        usage = _prov.fetch_usage(pid, cred) or {}
+    except Exception as exc:
+        usage = {"error": "fetch error (%s)" % type(exc).__name__}
+    ferr = usage.get("error")
+    if ferr:
+        return _acct_row(acct, cred, "error", None, ferr,
+                         _needs_login(pid, cred, ferr))
+    # A refresh that failed while the old token still worked is not worth
+    # reporting as an error: the reading is good, and the next poll will try
+    # the refresh again with more urgency.
+    return _acct_row(acct, cred, "ok", usage, None)
+
+
+def ai_poll_accounts(lead=AI_REFRESH_LEAD, spacing=AI_ACCT_SPACING):
+    """Poll every registered account. Returns the `accounts` array.
+
+    An empty list means "there is no vault, or it holds nothing" — the caller
+    treats that as a signal to fall back to the original two-credential poll,
+    rather than showing the user an empty panel.
+    """
+    if not ai_vault_ready():
+        return []
+    try:
+        accts = _vault.list_accounts() or []
+    except Exception:
+        return []
+    rows = []
+    live_done = 0
+    for a in accts:
+        if not isinstance(a, dict):
+            continue
+        pid = a.get("provider") or ""
+        if _provider_is_live(pid):
+            # Space out only the requests that actually leave the machine.
+            if live_done and spacing:
+                time.sleep(spacing)
+            live_done += 1
+        try:
+            rows.append(ai_account_poll(a, lead=lead))
+        except Exception as exc:
+            rows.append(_acct_row(a, a.get("cred"), "error", None,
+                                  "poll error (%s)" % type(exc).__name__))
+    return rows
+
+
+def ai_accounts_snapshot():
+    """The `accounts` array with no network traffic at all.
+
+    Answers "what is registered, and does it look alive?" from the stored
+    credentials only, for the moments when the UI needs an immediate answer —
+    right after an add, a remove or a rename — and a poll would either cost a
+    request or be refused by the rate-limit floor. `usage` is null here by
+    definition; the next real poll fills it in.
+    """
+    if not ai_vault_ready():
+        return []
+    try:
+        accts = _vault.list_accounts() or []
+    except Exception:
+        return []
+    rows = []
+    now = time.time()
+    for a in accts:
+        if not isinstance(a, dict):
+            continue
+        pid = a.get("provider") or ""
+        cred = a.get("cred")
+        if not _provider_is_live(pid):
+            rows.append(_acct_row(a, cred, "planned", None, "not supported yet"))
+            continue
+        dead = False
+        try:
+            dead = bool(_prov.is_unrecoverable(pid, cred))
+        except Exception:
+            pass
+        if dead:
+            rows.append(_acct_row(a, cred, "error", None,
+                                  "LOGIN_EXPIRED:%s" % pid, True))
+            continue
+        try:
+            exp = _prov.cred_expiry(pid, cred)
+        except Exception:
+            exp = None
+        if exp is not None and exp < now - _prov_max_stale():
+            rows.append(_acct_row(a, cred, "error", None,
+                                  "LOGIN_EXPIRED:%s" % pid, True))
+            continue
+        rows.append(_acct_row(a, cred, "ok", None, None))
+    return rows
+
+
+def _prov_max_stale():
+    """The refresh-token lifetime, from the provider module when it is there."""
+    try:
+        return float(getattr(_prov, "CRED_MAX_STALE", AI_CRED_MAX_STALE))
+    except Exception:
+        return float(AI_CRED_MAX_STALE)
+
+
+# The provider modules name codex's two windows session_* and week_*, which is
+# the sane naming, but the card that ships today was written against sess_pct
+# and sess_reset_ts and lives in a file this change does not own. The rename is
+# absorbed here rather than in the UI, because the accounts array is the shape
+# with a future and the legacy pair is the one being kept alive on purpose.
+_LEGACY_KEYS = {
+    "codex": (("session_pct", "sess_pct"),
+              ("session_reset", "sess_reset_ts"),
+              ("week_pct", "week_pct"),
+              ("week_reset", "week_reset_ts"),
+              ("plan", "plan"),
+              ("credits", "credits"),
+              ("limit_reached", "limit_reached")),
+    "claude": (("session_pct", "session_pct"),
+               ("session_reset", "session_reset"),
+               ("week_pct", "week_pct"),
+               ("week_reset", "week_reset"),
+               ("model_pct", "model_pct"),
+               ("model_reset", "model_reset"),
+               ("model_name", "model_name")),
+}
+
+
+def _legacy_usage(pid, usage):
+    """Translate one provider-shaped usage dict into the old card's key names.
+
+    Only the keys the old fetch_* functions actually returned are carried over.
+    Anything new the provider module reports stays in the accounts array, where
+    the replacement UI can use it without the old card having to grow.
+    """
+    out = {"err": None}
+    for src_key, dst_key in _LEGACY_KEYS.get(pid, ()):
+        if src_key in usage:
+            out[dst_key] = usage[src_key]
+    if pid == "claude":
+        # fetch_claude_usage stamped this unconditionally on success: the usage
+        # endpoint being answerable at all is what identifies the plan, and the
+        # card prints the string as-is.
+        out.setdefault("plan", "MAX")
+    return out
+
+
+def ai_legacy_pair(rows):
+    """Recreate today's two single-account readings from the accounts array.
+
+    The existing cards read s.ai.claude and s.ai.codex, and those live in a
+    file this change does not own, so they keep being sent. Each is filled from
+    the first healthy account of its provider, falling back to the first
+    account of any health so a real error is still visible, and to the
+    never-configured note when the provider has no account at all.
+    """
+    out = {}
+    for pid, empty in (("claude", NOT_CONFIGURED_CLAUDE),
+                       ("codex", NOT_CONFIGURED_CODEX)):
+        mine = [r for r in rows if r.get("provider") == pid]
+        pick = None
+        for r in mine:
+            if r.get("status") == "ok":
+                pick = r
+                break
+        if pick is None and mine:
+            pick = mine[0]
+        if pick is None:
+            out[pid] = {"err": empty}
+        elif pick.get("status") == "ok" and pick.get("usage"):
+            out[pid] = _legacy_usage(pid, pick["usage"])
+        else:
+            out[pid] = {"err": pick.get("error") or "unknown error"}
+    return out["claude"], out["codex"]
+
+
+# ── interactive login, captured into the vault ────────────────────────────────
+def ai_login_capture(provider, label=None, account_id=None, wait=AI_LOGIN_WAIT):
+    """Run a provider's interactive login and copy the result into the vault.
+
+    Returns (ok, note). The login itself is unavoidably interactive — a browser
+    round-trip with a pasted code — so all this does is open the console and
+    then watch for the credential file to change. Nothing here sees or wants a
+    password.
+
+    Copying the result into the vault is the whole point of the exercise. The
+    CLI stores exactly one login, so signing into a second account overwrites
+    the first; once the vault owns a copy, the first account keeps working
+    regardless of what the CLI file says afterwards.
+    """
+    # The geo gate comes first, before anything is spawned. Every other
+    # outbound path in this file and in sidecar.py is already fail-closed on
+    # geo_verdict, and an interactive login is the request a vendor sees most
+    # clearly of all: a full OAuth authorization from the user's current exit
+    # IP, far more visible than a metered quota read. Running one from a
+    # blocked region risks the account itself rather than an error message.
+    # force=True because a cached verdict up to AI_GEO_TTL old is a reasonable
+    # basis for a usage poll and not for authenticating a paid account.
+    ok, _cc, _why = geo_verdict(force=True)
+    if not ok or AI_LATCH["blocked"]:
+        return False, "VPN required"
+    if not ai_vault_ready():
+        return False, "vault unavailable"
+    pid = (provider or "").strip()
+    if not _provider_is_live(pid):
+        return False, "not supported yet"
+    paths = _cli_cred_paths(pid)
+    if not paths:
+        return False, "no credential path known for %s" % pid
+
+    # What the file looked like before, so a login can be told from a no-op.
+    before = {}
+    for p in paths:
+        before[p] = _cred_fingerprint(_read_json(p))
+
+    if not ai_login_launch(pid):
+        return False, "no login command configured for %s" % pid
+
+    deadline = time.time() + max(10, wait)
+    while time.time() < deadline:
+        time.sleep(AI_LOGIN_POLL)
+        path, cred = _newest_cli_cred(pid)
+        if not cred:
+            continue
+        if _cred_fingerprint(cred) == before.get(path, ""):
+            continue          # same file as before: login not finished yet
+        try:
+            if _prov.is_unrecoverable(pid, cred):
+                continue      # a half-written or gutted file, keep waiting
+        except Exception:
+            pass
+        if account_id:
+            # update_cred now reports whether the credential is really on
+            # disk, so a quiet False here has to be treated exactly like the
+            # exception below: the user just completed a login whose result
+            # was not kept, and telling them it worked would send them away
+            # believing the account is fixed.
+            try:
+                stored = _vault.update_cred(account_id, cred)
+            except Exception as exc:
+                return False, "vault write failed (%s)" % type(exc).__name__
+            if not stored:
+                return False, "credential not saved"
+            with _unsaved_lock:
+                AI_UNSAVED.pop(account_id, None)
+            return True, "account re-authenticated"
+        try:
+            _vault.add_account(pid, label or _default_label(pid), cred,
+                               source="login", cred_path=path)
+        except Exception as exc:
+            return False, "vault write failed (%s)" % type(exc).__name__
+        return True, "account added"
+    return False, "login not completed"
+
+
+def _default_label(pid):
+    """A neutral label when the user did not supply one.
+
+    Numbered rather than guessed from the credential: a token's email claim is
+    personal data the widget has no reason to store, and the user renames the
+    account in one click anyway.
+    """
+    n = 1
+    try:
+        n = 1 + sum(1 for a in (_vault.list_accounts() or [])
+                    if a.get("provider") == pid)
+    except Exception:
+        pass
+    try:
+        name = (_prov.provider(pid) or {}).get("name") or pid
+    except Exception:
+        name = pid
+    return "%s %d" % (name, n)
 
 
 # ── helpers for display ───────────────────────────────────────────────────────

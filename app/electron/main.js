@@ -126,7 +126,7 @@ function createWindow() {
   win.on('move', onWindowMove)
   // The first report, for a page that has not moved yet: without it the
   // renderer has nothing but `window.screen` until the widget is first dragged.
-  win.webContents.on('did-finish-load', checkDisplay)
+  win.webContents.on('did-finish-load', () => { checkDisplay(); replayToRenderer() })
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) =>
     console.error('[load failed]', code, desc, url))
@@ -396,6 +396,21 @@ function makePane() {
  */
 let lastRects = []
 
+/**
+ * Is this rectangle something a window can actually be put at?
+ *
+ * Shrink the widget far enough and a card's measured rect rounds to zero, and
+ * while a layout is collapsing it can arrive negative for a frame. Neither is a
+ * size a window can have: the OS either refuses the call or substitutes a size
+ * of its own choosing, and what is left on the desktop is a frosted slab at a
+ * place no card occupies. A rectangle the frost cannot honour exactly is better
+ * not drawn at all, so those rows are dropped rather than clamped into
+ * something that looks deliberate.
+ */
+function usableRect(r) {
+  return !!r && Math.round(r.w) >= 1 && Math.round(r.h) >= 1
+}
+
 /** Absolute bounds for one card rectangle, given the window's current origin. */
 function paneBounds(origin, sf, r) {
   // Electron's setBounds takes DIPs, and the renderer measured in CSS px -- the
@@ -406,6 +421,10 @@ function paneBounds(origin, sf, r) {
   return {
     x: Math.round(origin.x + snap(r.x)),
     y: Math.round(origin.y + snap(r.y)),
+    // Every caller filters through `usableRect` first, so this floor is a
+    // backstop against a future one that forgets -- not a minimum size for the
+    // widget. A zero-width window is not a thing the OS will make; a small
+    // widget is.
     width: Math.max(1, Math.round(r.w)),
     height: Math.max(1, Math.round(r.h)),
   }
@@ -455,11 +474,20 @@ function flushStyleQueue() {
 
 function syncPanes(rects) {
   if (!win || win.isDestroyed()) return
+  // While the frost is suspended the cards paint their own background and the
+  // acrylic windows stay off. A batch can still arrive after the switch -- a
+  // rAF measured before it, or a resize settling afterwards -- and it must not
+  // quietly bring them back.
+  if (panesSuspended) { lastRects = []; return }
   const origin = win.getBounds()
   const sf = screen.getDisplayMatching(origin).scaleFactor || 1
-  lastRects = rects
+  // Filtered once, here, so that pane N is always rectangle N: `repositionPanes`
+  // pairs the two by index, and dropping a row later in the loop would silently
+  // shift every pane after it onto the wrong card.
+  const usable = rects.filter(usableRect)
+  lastRects = usable
 
-  rects.forEach((r, i) => {
+  usable.forEach((r, i) => {
     let pane = pool[i]
     if (!pane || pane.isDestroyed()) {
       pane = makePane()
@@ -471,7 +499,7 @@ function syncPanes(rects) {
 
   // Surplus panes are hidden, not destroyed: the next switch back will want
   // them, and rebuilding a window is the slow part.
-  for (let i = rects.length; i < pool.length; i++) {
+  for (let i = usable.length; i < pool.length; i++) {
     const pane = pool[i]
     if (pane && !pane.isDestroyed() && pane.isVisible()) pane.hide()
   }
@@ -590,9 +618,57 @@ function hidePanes() {
   }
 }
 
+/**
+ * Whether the acrylic windows are switched off entirely.
+ *
+ * Below a certain size they cannot be right. Windows will not make a window
+ * shorter than about 39 device pixels -- `minHeight: 1` does not move it, nor
+ * does making the window resizable -- and the thinnest cards are already close
+ * to that at scale 1. Shrink past it and the frost stops shrinking with its
+ * card and stands proud of it: a slab of acrylic sticking out past the edge of
+ * the thing it is supposed to be behind. There is no size at which that is
+ * preferable to no frost, so below the floor the renderer asks for the panes to
+ * be suspended and paints the cards' backgrounds in CSS instead.
+ *
+ * Suspending hides the windows rather than destroying them, for the same reason
+ * the pool exists at all: building a BrowserWindow is the slow part, and a
+ * destroy/recreate cycle would put the ~0.1s of frostless lag back on every trip
+ * across the threshold -- exactly the boundary the user is dragging back and
+ * forth across while choosing a size. Ten hidden windows cost nothing that
+ * matters; a visible stutter does.
+ */
+let panesSuspended = false
+
+function setPanesSuspended(on) {
+  const next = Boolean(on)
+  if (next === panesSuspended) return
+  panesSuspended = next
+  trace('panes', next ? 'suspended' : 'resumed')
+  if (next) {
+    // The same primitive a drag uses, for the same reason: get the frost off
+    // the screen in one call, before the layout it belongs to has changed.
+    hidePanes()
+    // And forget the geometry with it. `repositionPanes` runs on every window
+    // move, including while suspended, and would otherwise keep walking the
+    // panes around against rectangles measured at a scale that no longer
+    // exists.
+    lastRects = []
+    return
+  }
+  // Nothing is shown here, deliberately. Resuming is not the end of a drag: a
+  // drag ends with the cards exactly where the last batch said they were, so
+  // `syncPanes(lastRects)` is correct there. A resume follows a size change,
+  // so the last batch describes a layout that is gone. The renderer sends a
+  // fresh measurement as soon as it has laid out; the frost comes back with
+  // that. The cost is a few frames of no frost, which reads as the frost
+  // catching up -- against a frame of frost in the wrong place, which reads as
+  // the widget being broken.
+}
+
 function destroyPanes() {
   for (const pane of pool) if (pane && !pane.isDestroyed()) pane.destroy()
   pool.length = 0
+  panesSuspended = false
 }
 
 // ── position memory ───────────────────────────────────────────────────────────
@@ -942,7 +1018,16 @@ function startSidecar() {
         if (fakeIpAfter && msg.t === 'net' && ++netSeen > fakeIpAfter) {
           msg.ip = '203.0.113.9'          // TEST-NET-3, safe to print anywhere
         }
-        if (win && !win.isDestroyed()) win.webContents.send('data', msg)
+        // The AI messages pass through untouched -- `ai` now carries an
+        // `accounts` array beside the existing claude/codex keys, and
+        // `ai_providers` carries the whole vendor registry. Neither is
+        // inspected here: which vendors exist and what a quota looks like is
+        // decided in Python, and a shell that understood the payload would have
+        // to be edited every time a vendor is added. It is also why none of it
+        // is traced: the payload is quota data today and adjacent to
+        // credentials by construction, and this log persists to disk.
+        if (REPLAY_KINDS.has(msg?.t)) lastMsg.set(msg.t, msg)
+        toRenderer(msg)
       } catch { /* a half-written line is not worth crashing over */ }
     }
   })
@@ -951,6 +1036,31 @@ function startSidecar() {
   sidecar.stderr.on('data', (d) => console.error('[sidecar]', d.trim()))
   sidecar.on('exit', (code) => console.error('[sidecar] exited', code))
   sidecar.on('error', (err) => console.error('[sidecar] spawn failed', err.message))
+}
+
+/**
+ * The last message of each kind the pane cannot ask for again cheaply.
+ *
+ * `ai` arrives on a poll and would repair itself within a cycle, but the vendor
+ * registry is announced once at sidecar start and is static after that. A
+ * renderer that reloads -- dev server, or a crashed and restored view -- would
+ * otherwise sit with an empty provider list until something else prompted the
+ * sidecar to repeat itself, and the pane's "add account" picker is built
+ * entirely from it. Replayed on load; it is public metadata, no credentials.
+ */
+const REPLAY_KINDS = new Set(['ai', 'ai_providers'])
+const lastMsg = new Map()
+
+function toRenderer(msg) {
+  if (!win || win.isDestroyed()) return
+  // webContents can be gone between the isDestroyed check and the send during
+  // teardown, and an sidecar message must never be what closes the app.
+  try { win.webContents.send('data', msg) } catch { /* window went away */ }
+}
+
+/** Re-send the sticky messages to a freshly loaded page. */
+function replayToRenderer() {
+  for (const msg of lastMsg.values()) toRenderer(msg)
 }
 
 function toSidecar(cmd) {
@@ -988,7 +1098,15 @@ function finiteCoord(v) {
   return n === null || Math.abs(n) > MAX_COORD ? null : Math.round(n)
 }
 
-/** A finite, positive extent, rounded, or null. A window is never 0 wide. */
+/**
+ * A finite, positive extent, rounded, or null.
+ *
+ * The `Math.max(1, ...)` is the only lower bound the main process still imposes
+ * on a size the renderer reports, and it is kept on purpose: a zero-extent
+ * window is not something the platform will make, so a measurement of 0 has to
+ * become *something*. It is not a minimum widget size -- one device pixel is
+ * smaller than anything the renderer can lay out -- it is the floor of the type.
+ */
 function finiteSize(v) {
   const n = finiteNum(v)
   return n === null || n < 0 || n > MAX_COORD ? null : Math.max(1, Math.round(n))
@@ -996,6 +1114,114 @@ function finiteSize(v) {
 
 /** Schemes `open` may hand to the OS. See the handler for why this is closed. */
 const OPEN_SCHEMES = new Set(['http:', 'https:'])
+
+// ── AI account commands ───────────────────────────────────────────────────────
+//
+// The multi-account pane sends strings -- a provider key, an account id, a
+// label somebody typed -- and every one of them ends up on the sidecar's stdin,
+// which is a newline-delimited JSON stream. JSON.stringify escapes a newline
+// inside a string, so an embedded one cannot split a command in two by itself;
+// the checks below exist because that guarantee holds only while every writer
+// on this pipe stays strictly JSON, and because a control character in an
+// account label is meaningless to the vault and corrupts any log it reaches.
+//
+// A bad argument is dropped and answered with an error message, never repaired.
+// A silently truncated id is not a safer command, it is the same command aimed
+// at a different account -- and removing the wrong account is the one mistake
+// here that cannot be undone from the UI.
+//
+// Nothing below is vendor-aware on purpose. The provider key is checked for
+// *shape* and forwarded; which vendors exist, and which of them can report a
+// quota yet, is the Python side's business and changes without touching this.
+
+const MAX_LABEL = 64   // a display name, not a document
+const MAX_KEY = 128    // wide enough for a uuid or a hash, not for a payload
+
+/** A renderer string safe to serialise onto the sidecar's stdin, or null. */
+function safeText(v, max) {
+  if (typeof v !== 'string') return null
+  const s = v.trim()
+  if (!s || s.length > max) return null
+  // \n and \r are the framing characters of the protocol; the rest of C0, DEL
+  // and the two Unicode line separators are here because they cannot be typed
+  // into a label on purpose and they break a terminal that later prints one.
+  if (/[\u0000-\u001f\u007f\u2028\u2029]/.test(s)) return null
+  return s
+}
+
+/**
+ * An identifier -- a provider key or an account id.
+ *
+ * Deliberately narrower than a label: these are looked up as dictionary keys
+ * today, but a vault that keeps a credential copy per account is one refactor
+ * away from deriving a filename from one, so no separator, no traversal and no
+ * leading punctuation ever leaves here.
+ */
+function safeKey(v, max) {
+  const s = safeText(v, max)
+  if (!s || s.includes('..')) return null
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s) ? s : null
+}
+
+/**
+ * Every AI command the renderer may send, and the only fields each may carry.
+ *
+ * A table rather than a pass-through: the message that reaches the sidecar is
+ * rebuilt from validated pieces, so an extra field the renderer invented -- or
+ * had injected into it -- is dropped rather than forwarded. Each builder
+ * returns the payload's fields, or null if an argument did not pass.
+ */
+const AI_COMMANDS = {
+  ai_refresh: () => ({}),
+  ai_accounts_list: () => ({}),
+  ai_providers: () => ({}),
+  // Pre-dates the vault: names the single-credential CLI to re-authenticate.
+  ai_login: (c) => {
+    const which = safeKey(c.which, MAX_KEY)
+    return which ? { which } : null
+  },
+  ai_account_add: (c) => {
+    const provider = safeKey(c.provider, MAX_KEY)
+    if (!provider) return null
+    // A blank label is not an error: the vault names the account after its
+    // provider when the field is absent, and forwarding '' would override that
+    // with an empty row in the list.
+    if (c.label === undefined || c.label === null || c.label === '') return { provider }
+    const label = safeText(c.label, MAX_LABEL)
+    return label ? { provider, label } : null
+  },
+  ai_account_remove: (c) => {
+    const id = safeKey(c.id, MAX_KEY)
+    return id ? { id } : null
+  },
+  ai_account_rename: (c) => {
+    const id = safeKey(c.id, MAX_KEY)
+    const label = safeText(c.label, MAX_LABEL)
+    return id && label ? { id, label } : null
+  },
+  ai_account_login: (c) => {
+    const id = safeKey(c.id, MAX_KEY)
+    return id ? { id } : null
+  },
+  ai_account_refresh: (c) => {
+    const id = safeKey(c.id, MAX_KEY)
+    return id ? { id } : null
+  },
+}
+
+/**
+ * Tell the pane that a command of its was refused.
+ *
+ * Silence would be worse than the refusal: the UI disables a row while a
+ * sign-in is in flight, and a command that never reaches the sidecar never
+ * produces the reply that re-enables it. The reason is a fixed string -- the
+ * offending value is not echoed back and not logged, because an id typed into
+ * the wrong box is exactly the shape a pasted credential arrives in.
+ */
+function aiRefuse(name) {
+  trace('cmd', 'refused', name)
+  toRenderer({ t: 'ai_error', cmd: name, error: 'invalid arguments' })
+}
 
 // ── renderer IPC ──────────────────────────────────────────────────────────────
 
@@ -1015,6 +1241,17 @@ ipcMain.on('panes', (_e, rects) => {
   syncPanes(clean)
 })
 ipcMain.on('panes-hide', () => hidePanes())
+/**
+ * Switch the acrylic windows off, or back on.
+ *
+ * The renderer owns the decision because only it knows the current scale and
+ * the measured height of the thinnest card. The payload is a single boolean:
+ * true to suspend, false to resume. Anything else is coerced, because a
+ * malformed message here would leave the frost in whichever state it happened
+ * to be in, and a stuck-on frost at a tiny size is the failure this exists to
+ * prevent.
+ */
+ipcMain.on('frost-suspend', (_e, on) => setPanesSuspended(on))
 
 // ── pets ──────────────────────────────────────────────────────────────────────
 //
@@ -1043,6 +1280,21 @@ ipcMain.on('cmd', (_e, cmd) => {
     try { scheme = new URL(String(cmd.url)).protocol } catch { /* unparseable */ }
     if (!OPEN_SCHEMES.has(scheme)) { trace('cmd', 'refused open', cmd.url); return }
     shell.openExternal(String(cmd.url))
+    return
+  }
+  // The AI commands carry renderer-typed strings onto the sidecar's stdin, so
+  // they are rebuilt from checked fields instead of being forwarded as they
+  // arrived. Everything else on this channel is a fixed verb with no payload
+  // the renderer chose, and keeps the old straight-through path.
+  const name = typeof cmd?.cmd === 'string' ? cmd.cmd : null
+  if (name && Object.hasOwn(AI_COMMANDS, name)) {
+    let fields = null
+    // A builder reads fields off an object the renderer handed over; a getter
+    // that throws there would come out of the IPC dispatcher and take the main
+    // process down with it, which blanks the widget.
+    try { fields = AI_COMMANDS[name](cmd) } catch { fields = null }
+    if (!fields) { aiRefuse(name); return }
+    toSidecar({ cmd: name, ...fields })
     return
   }
   toSidecar(cmd)

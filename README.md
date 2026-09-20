@@ -20,6 +20,7 @@ Starts automatically with Windows and stays out of the way.
 - [Pets](#pets)
 - [Configuration](#configuration)
 - [AI usage tracking](#ai-usage-tracking)
+- [Multiple AI accounts](#multiple-ai-accounts)
 - [Restarting after an edit](#restarting-after-an-edit)
 - [Uninstall](#uninstall)
 - [Troubleshooting](#troubleshooting)
@@ -310,12 +311,15 @@ all** — copy `.env.example` to `.env` only if you want to change something.
 |---|---|---|
 | `CLAUDE_CRED_PATHS` | `%USERPROFILE%\.claude\.credentials.json` | Where to find the Claude CLI's stored login |
 | `CODEX_CRED_PATHS` | `%USERPROFILE%\.codex\auth.json` | Where to find the Codex CLI's stored login |
+| `AI_ACCOUNTS_FILE` | `%APPDATA%\net-watch-ui\accounts.json` | The account vault — see [Multiple AI accounts](#multiple-ai-accounts) |
 | `PING_HOST_1` | `1.1.1.1` | First latency target |
 | `PING_HOST_2` | `8.8.8.8` | Second latency target |
 | `LOG_FILE` | `%USERPROFILE%\ip_bar_log.txt` | Where the log is written |
 
-Both credential keys accept several paths separated by `;` — the first
-readable one wins. `~` and `%VARIABLES%` are expanded.
+Both credential keys accept several paths separated by `;`. Order does not
+decide the winner: every readable path is read and the copy whose token
+expires latest is used, so listing a stale leftover beside a live one is
+harmless. `~` and `%VARIABLES%` are expanded.
 
 Restart the widget after editing `.env`; it is read once at startup.
 
@@ -379,6 +383,154 @@ that as an expired login and send you off to redo a sign-in that was never
 broken, copies older than the 16-day refresh-token lifetime are ignored and the
 panel says **`credentials stale`** — meaning *the good file is out of reach*,
 not *your login died*.
+
+---
+
+## Multiple AI accounts
+
+Coding-assistant CLIs generally hold **one login at a time**. Sign in to a
+second Claude account and the first one is gone from `.claude` — not expired,
+just overwritten. If you keep a personal plan and a work plan, or two plans on
+different rate limits, you cannot see both at once.
+
+The widget keeps its own copy. Every account you register gets its own entry
+in a file the widget owns, credential included, so several accounts of the same
+vendor sit side by side and every one of them is polled. Signing in to the CLI
+again changes what the CLI holds; it does not disturb what the widget already
+stored.
+
+The AI card becomes two panes: the account list on the left, with a search box
+above it, and the selected account's quota on the right. Accounts are renameable
+— `work`, `personal` — because the credential files carry no display name to
+borrow, so a fresh import is called `Claude Code`, `Claude Code 2` and so on
+until you say otherwise.
+
+### Adding an account
+
+**On first run, nothing.** Whatever the `claude` and `codex` CLIs already have
+on disk is imported automatically, once, at the first launch after upgrading —
+including copies in a WSL home if `CLAUDE_CRED_PATHS` / `CODEX_CRED_PATHS`
+point at them. Duplicates of the same login are folded together rather than
+listed twice.
+
+That import happens **once**. The widget records that it ran, so an account you
+delete on purpose stays deleted instead of reappearing at the next launch, and
+a later CLI login does not quietly overwrite the copy the widget has since
+refreshed.
+
+**Afterwards, the `+` button** beside the search box. It opens a searchable list
+of every registered provider, with the ones that cannot report usage yet greyed
+out and labelled as such. Pick a working provider and the widget opens that
+CLI's own sign-in in a console. The sign-in is a browser round-trip belonging to
+the vendor — the widget cannot automate it and never handles your password. When
+it finishes, the new credential is stored as its own account.
+
+The same **sign in** action is offered on an individual account whose login has
+genuinely expired, so you re-authenticate just that one and leave the others
+alone.
+
+### Which providers work today
+
+Twelve vendors are registered. **Two of them actually report usage.** The other
+ten are in the picker so the account plumbing, naming and UI are ready for them
+— they are *not* working quota sources, and picking one gets you an account row
+that says **not wired up yet** instead of a number.
+
+| Provider | Usage today |
+|---|---|
+| Claude Code | **Working** — quota and reset countdown |
+| OpenAI Codex / ChatGPT | **Working** — quota and reset countdown |
+| Cursor | Registered, no usage endpoint yet |
+| GitHub Copilot | Registered, no usage endpoint yet |
+| Windsurf | Registered, no usage endpoint yet |
+| Devin | Registered, no usage endpoint yet |
+| Replit | Registered, no usage endpoint yet |
+| Kimi Code | Registered, no usage endpoint yet |
+| GLM Coding Plan | Registered, no usage endpoint yet |
+| Cline | Registered, no usage endpoint yet |
+| Google Antigravity | Registered, no usage endpoint yet |
+| Railway | Registered, no usage endpoint yet |
+
+If you only want numbers on the screen, register Claude Code and Codex accounts
+and ignore the rest of the list. A planned provider saying *not supported yet*
+is the intended behaviour, not a fault to report: the alternative was inventing
+a percentage, and a made-up quota is worse than an honest blank.
+
+### When an account shows a problem
+
+Three failures look similar in a small panel and mean completely different
+things, so the widget keeps them apart rather than showing one generic warning.
+
+| What it says | What it means | What to do |
+|---|---|---|
+| `login expired` | The provider rejected the stored credential outright — it is genuinely dead | Sign in again on that account |
+| `offline` | The request never reached the provider — no network, DNS failure, a timeout | **Nothing.** Wait, or fix the connection |
+| `refresh failed · <code>` | The provider answered, with an error of its own | Usually transient — retry later; the status code is shown so you can look it up |
+
+**`offline` says nothing at all about your login.** It is the state the widget
+reports when it could not ask the question, and the credential is untouched
+underneath it. Treating that as an expired session — and being sent off to redo
+an OAuth sign-in that was never broken — is the exact bug this design exists to
+prevent, so an offline account never arms the sign-in click.
+
+A re-login is genuinely needed in one case: the credential is **past the refresh
+window**. Both live providers rotate their refresh token every time it is used,
+and a stored copy older than roughly **16 days** can no longer be exchanged for
+a fresh token no matter what. That one can only be fixed by signing in again.
+Everything else is worth waiting out first.
+
+Because those tokens rotate, the widget rewrites the stored credential as they
+roll. That is normal — the file changing under you is the refresh working.
+
+### Where the accounts are stored
+
+| | |
+|---|---|
+| Default | `%APPDATA%\net-watch-ui\accounts.json` |
+| Override | `AI_ACCOUNTS_FILE` in `.env` |
+
+**This file holds live credentials.** It is created with owner-only permissions,
+written atomically, and the permissions are set as the file is created rather
+than tightened afterwards, so it is never briefly readable by anyone else. Treat
+it like any other secret: do not sync it to a shared folder, do not paste it
+into an issue, and delete it if you are handing the machine on.
+
+`%APPDATA%` is the roaming profile, which is deliberate — the file is small, it
+is per-user configuration, and a roaming profile ought to bring your account
+list with it. Set `AI_ACCOUNTS_FILE` to move it somewhere else, an encrypted
+volume for instance. `~` and `%VARIABLES%` are expanded.
+
+It is plain JSON. Deleting it loses nothing but the account list and the names
+you gave them; the CLIs' own logins are untouched and can be imported again.
+
+### Troubleshooting accounts
+
+**The same account appears twice, and one copy is wrong.**
+This is the classic one: a login exists both in your Windows profile and in a
+WSL home, and the older of the two is a leftover. Imports fold identical logins
+together, but two genuinely different stored copies are two accounts. Delete the
+stale one from the list — nothing else in the vault is affected.
+
+**I signed in, and the widget still shows the old account.**
+Check *which* account the CLI actually ended up logged in as. The CLI holds one
+login, so signing in to a second account replaces the first in its own file; if
+you then sign in again as the original, the CLI has overwritten your new one.
+The widget's stored copies do not have this problem, which is the point of the
+vault — but a sign-in you launch goes through the CLI, so it inherits the CLI's
+single-slot behaviour while it runs. Sign in once per account, and let the
+widget keep the copies.
+
+**Every account reads `offline` (or `VPN required`) and the network is fine.**
+The providers block some regions outright, and the widget will not send a quota
+request at all when it cannot confirm the exit IP is outside a blocked one. That
+gate is deliberate: no request goes out, so there is nothing to retry and
+nothing is wrong with your stored logins. Connect your VPN and hit Refresh. See
+also [Troubleshooting](#troubleshooting).
+
+**An account will not import.**
+The credential file has to be readable at the moment the widget looks. A stopped
+WSL distro or an unmounted share is the usual reason — start it and restart the
+widget, and the import is retried.
 
 ---
 

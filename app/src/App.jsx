@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { PaneProvider, usePaneSync, usePaneHold } from './panes.jsx'
+import { PaneProvider, usePaneSync, usePaneHold, usePaneSuspend } from './panes.jsx'
 import { useSidecar, send } from './useSidecar.js'
 import { Card, CardHead, Cell, Figure, Pair, Pill, PrimaryButton, Row } from './components/Glass.jsx'
 import { Bar, pctTone } from './components/Bar.jsx'
@@ -8,6 +8,7 @@ import { IconButton, NetDot } from './components/Footer.jsx'
 import { SectionIcon } from './components/Icons.jsx'
 import { CountryChip } from './components/Country.jsx'
 import { PetsCard } from './components/Pets.jsx'
+import { AiAccounts } from './components/AiAccounts.jsx'
 import { PetsProvider, useOverlaySync } from './pets/store.jsx'
 import { PetLayer } from './pets/PetLayer.jsx'
 
@@ -37,12 +38,28 @@ const INTRO_MS = 900
 /**
  * A usable widget size, whatever it is handed.
  *
- * The floor is a platform limit, not taste. A card's frost is a window, and
- * **Windows will not make a window shorter than 39px** -- measured directly, and
- * unmoved by `minHeight: 1` or by making it resizable. The two thinnest cards,
- * the title and the footer, are 43px, so below about 0.90 their frost stands
- * proud of them by a pixel or two. 0.92 is the first hundredth that measures
- * clean on every card.
+ * The floor used to be 0.79, and it was a frost limit wearing a floor's
+ * clothes. A card's frost is its own window, and **Windows will not make a
+ * window shorter than 39px** -- measured directly, and unmoved by
+ * `minHeight: 1` or by making the window resizable. The two thinnest cards,
+ * the title and the footer, are 43px unscaled, so once the scale drops far
+ * enough their frost can no longer shrink with them and stands proud of the
+ * card it is supposed to be sitting behind.
+ *
+ * That is a true constraint on the frost. It was never a true constraint on
+ * how small someone is allowed to make their own widget, and letting it act as
+ * one meant the honest answer to "this is still too big for me" was no. The
+ * two are separated now. Above FROST_MIN_SCALE nothing has changed: one
+ * acrylic window per card, exactly as before. Below it the per-card frost is
+ * stood down entirely and the cards paint their own background instead, which
+ * costs the acrylic and buys the whole range underneath. Losing real frost at
+ * a size that small is a trade; a slab of frost hanging out past the card edge
+ * is just a defect.
+ *
+ * So the number below is no longer a platform fact. It is the point at which
+ * the layout stops being worth drawing at all -- small enough that nobody is
+ * arguing with it, and still a rail rather than a cliff, because a scale of
+ * zero is a window with no pixels and no way back.
  *
  * The ceiling is not a taste limit either, and it is no longer 2x. What the
  * widget is actually allowed to grow to is whatever the monitor can hold --
@@ -57,8 +74,32 @@ const INTRO_MS = 900
  * screen the full view fits at ~1.7 and is limited by the screen either way;
  * the shorter views are the ones that were being held back.
  */
-const SCALE_MIN = 0.79
+const SCALE_MIN = 0.35
 const SCALE_MAX = 12
+
+/**
+ * Where the per-card frost has to be switched off, and why that number.
+ *
+ * Derived rather than felt. DWM_MIN_WINDOW_PX is the shortest window Windows
+ * will actually make -- 39, measured on this machine and not movable by any
+ * option Electron exposes. THIN_CARD_PX is the unscaled height of the two
+ * thinnest cards, the title and the footer. A card drawn at scale s is
+ * s * 43 CSS pixels tall, and its frost window can only keep matching it while
+ *
+ *     s * 43 >= 39   ->   s >= 39 / 43 = 0.9069...
+ *
+ * Rounded up to the hundredth the resize drag actually works in, that is 0.91,
+ * and one further hundredth is added on top. The extra step is not padding for
+ * comfort: the card's own box is a fractional height that the browser rounds,
+ * and a zoomed layout is rounded a second time on its way to device pixels, so
+ * the arithmetic is clean a hundredth before the pixels are. 0.92 is the first
+ * step that measured clean on every card rather than only on paper.
+ *
+ * Below this the frost is suspended -- see the root flag in Widget.
+ */
+const DWM_MIN_WINDOW_PX = 39
+const THIN_CARD_PX = 43
+const FROST_MIN_SCALE = (Math.ceil((DWM_MIN_WINDOW_PX / THIN_CARD_PX) * 100) + 1) / 100
 
 /**
  * The ceiling used when there is no usable fitted measurement.
@@ -68,6 +109,12 @@ const SCALE_MAX = 12
  * measured and does not fit even at the floor. Neither should hand the person
  * the full rail -- an unmeasured widget is not licence to zoom to 12x -- so
  * both fall back to what the ceiling used to be, which is known to be sane.
+ *
+ * It bounds growth only. Shrinking is never gated on having a measurement: the
+ * floor is a constant and the fitted number only ever arrives as a maximum, so
+ * the widget can be dragged all the way down before the first measurement
+ * lands, on a second monitor whose work area has not been reported yet, and on
+ * a monitor whose reported area is nonsense.
  */
 const SCALE_MAX_UNFITTED = 2
 
@@ -92,15 +139,24 @@ const FIT_MARGIN = 48
 /**
  * The ceiling a fitted measurement is actually allowed to impose.
  *
- * A fitted maximum below the floor is not a ceiling, it is a screen that cannot
- * hold this layout at any size it still renders correctly at -- the full view on
- * a high-DPI monitor is exactly that. Honouring such a number would pin the
- * ceiling onto the floor and leave the range a single point, which is what froze
- * the resize drag in the full view while the shorter compact view kept working.
+ * A fitted maximum below the floor is not a ceiling at all. It says the screen
+ * cannot hold this layout at any size the widget is willing to draw, and
+ * honouring it would pin the ceiling under the floor and leave the range empty
+ * -- which is what once froze the resize drag in the full view while the
+ * shorter compact view kept working.
  *
- * So a ceiling that has collapsed past the floor is discarded rather than
- * clamped up: the widget is going to overhang whatever is chosen, so the choice
- * is handed back to the person making it and the whole range stays reachable.
+ * With the floor at 0.35 that case is now rare and means something different
+ * than it used to. It no longer catches "the full view on a high-DPI monitor",
+ * which genuinely fits somewhere in the sixties and is reported as such; it
+ * catches a measurement that has gone wrong. Either way the answer is the
+ * same: discard the collapsed ceiling rather than clamp it up, so the widget
+ * overhangs whatever is chosen and the whole range stays reachable.
+ *
+ * Note what this function deliberately does not do -- it never raises anything.
+ * Every path returns either a fitted value or SCALE_MAX_UNFITTED, both of which
+ * are ceilings, and clampScale only ever takes a minimum against them. Nothing
+ * here can push a small scale back up, which is the property the floor change
+ * depends on.
  */
 function scaleCeiling(max) {
   const fitted = Math.min(SCALE_MAX, Number(max) || SCALE_MAX_UNFITTED)
@@ -112,9 +168,14 @@ function clampScale(v, max = SCALE_MAX) {
   if (!Number.isFinite(n)) return SCALE_DEFAULT
   // The floor wins over the fitted ceiling: a screen too small for even the
   // minimum is still better served by a widget that renders correctly and
-  // overhangs than by one squeezed below where its frost stops matching. When
-  // that happens the fitted ceiling is dropped entirely rather than folded onto
-  // the floor, so the drag still has somewhere to go -- see scaleCeiling.
+  // overhangs than by one squeezed past the point of being readable. When that
+  // happens the fitted ceiling is dropped entirely rather than folded onto the
+  // floor, so the drag still has somewhere to go -- see scaleCeiling.
+  //
+  // The order matters for shrinking: the maximum against the floor is taken
+  // first and the minimum against the ceiling second, so a ceiling can only
+  // ever pull a value down. There is no path through here, fitted or unfitted,
+  // that hands back something larger than it was given.
   const ceiling = scaleCeiling(max)
   return Math.min(ceiling, Math.max(SCALE_MIN, Math.round(n * 100) / 100))
 }
@@ -368,7 +429,54 @@ function Widget() {
 
   const [animating, setAnimating] = useState(false)
   const { suspend, resume } = usePaneHold()
+  // A different latch from the two above, on purpose. `suspend`/`resume` are
+  // the animation hold; this one is the mode. They have to be separate or an
+  // animation that ends while the widget is still too small hands the frost
+  // back by lifting a hold it does not own.
+  const setFrostSuspended = usePaneSuspend()
   const moving = useMoving()
+
+  // Whether the frost can still be drawn honestly at this size. Below
+  // FROST_MIN_SCALE a card is shorter than the shortest window Windows will
+  // make, so its frost would stand proud of it -- the frost is stood down
+  // instead and the cards paint themselves.
+  const frostSuspended = scale < FROST_MIN_SCALE
+  const frostRef = useRef(frostSuspended)
+  frostRef.current = frostSuspended
+
+  // Resume only if the frost is allowed to exist at the current size. Several
+  // things finish and want the panes back -- the end of a mode animation, the
+  // end of a resize drag -- and none of them should be the route by which a
+  // suspended frost quietly comes back at a size it cannot fit.
+  const resumeFrost = useCallback(() => {
+    if (!frostRef.current) resume()
+  }, [resume])
+
+  // The suspension itself, and the flag the stylesheet reads.
+  //
+  // Two things have to happen and they belong to different layers. The pane
+  // layer has to stop reporting geometry, because that is what actually hides
+  // the acrylic windows; the document element carries `data-frost-suspended`
+  // so the card styling can swap to a solid background for exactly as long as
+  // there is no frost behind it. The flag lives on the root rather than on the
+  // shell because the shell is inside the CSS `zoom`, and a fallback that has
+  // to cover every card is easier to reason about from outside it.
+  useEffect(() => {
+    const root = document.documentElement
+    if (frostSuspended) {
+      root.setAttribute('data-frost-suspended', 'true')
+      root.classList.add('nw-solo')
+      setFrostSuspended(true)
+    } else {
+      root.removeAttribute('data-frost-suspended')
+      root.classList.remove('nw-solo')
+      // Unconditional, including mid-animation. Lifting this latch does not
+      // restart the pass while the animation hold is still down -- the pane
+      // layer restarts only when no latch is set -- so the animation's own
+      // moment to lift stays the one that decides.
+      setFrostSuspended(false)
+    }
+  }, [frostSuspended, setFrostSuspended])
   usePaneSync(animating)
   usePaneSync(scale)
 
@@ -427,8 +535,8 @@ function Widget() {
 
   const onSettled = useCallback(() => {
     setAnimating(false)
-    resume()
-  }, [resume])
+    resumeFrost()
+  }, [resumeFrost])
 
   // The tab sizes and docks itself, the way ModeBox does for the two expanded
   // layouts. Exactly one of the two is mounted at a time, so exactly one of
@@ -510,7 +618,7 @@ function Widget() {
             maxScale={maxScale}
             onScale={setScale}
             onScaleStart={() => { suspend(); setResizing(true) }}
-            onScaleEnd={() => { setResizing(false); resume() }}
+            onScaleEnd={() => { setResizing(false); resumeFrost() }}
           />
         ) : (
           <div className="flex flex-col gap-2">
@@ -535,7 +643,7 @@ function Widget() {
               resizeMode={resizeMode}
               onToggleResize={() => setResizeMode((r) => !r)}
               onScaleStart={() => { suspend(); setResizing(true) }}
-              onScaleEnd={() => { setResizing(false); resume() }}
+              onScaleEnd={() => { setResizing(false); resumeFrost() }}
             />
           </div>
         )}
@@ -841,7 +949,7 @@ function Full({ s, copy, ipChanged, rfChanged }) {
         </Card>
       </Pair>
 
-      <AiCard ai={s.ai} rise={rise} />
+      <AiCard ai={s.ai} providers={s.aiProviders} rise={rise} />
       <ChecksCard checks={s.checks} ip={s.net?.ip} rise={rise} />
       {/* Last of the cards, just above the footer: it is the one row here that
           is a control rather than a readout, so it sits with the controls
@@ -896,10 +1004,15 @@ const AI_ROWS = [
   ['GPT · week', 'codex', 'week_pct', 'week_reset_ts'],
 ]
 
-function AiCard({ ai, rise }) {
+function AiCard({ ai, providers, rise }) {
   const cl = ai?.claude
   const gt = ai?.codex
   const spinning = ai?.status === 'polling'
+  // The vault's account list is what the two-pane view is for. Until a sidecar
+  // that knows about it is running, `accounts` is simply absent and the card
+  // keeps the single-account layout it has always had -- an older sidecar must
+  // not be answered with an empty pane that looks like the feature broke.
+  const multi = Array.isArray(ai?.accounts)
 
   return (
     <Card id="ai" {...rise('130ms', 'pb-2')}>
@@ -929,7 +1042,9 @@ function AiCard({ ai, rise }) {
         <Row label="Status" value={ai.reason} tone="text-warn" />
       ) : (
         <>
-          {AI_ROWS.map(([name, who, pctKey, resetKey]) => {
+          {multi ? (
+            <AiAccounts ai={ai} providers={providers} />
+          ) : AI_ROWS.map(([name, who, pctKey, resetKey]) => {
             const d = who === 'claude' ? cl : gt
             const label = pctKey === 'model_pct' && cl?.model_name
               ? `Claude · ${cl.model_name}`
@@ -948,13 +1063,19 @@ function AiCard({ ai, rise }) {
               />
             )
           })}
-          <AiNote
-            cl={cl}
-            gt={gt}
-            retry={ai?.retry}
-            age={ai?.age}
-            wait={ai?.status === 'wait' ? ai : null}
-          />
+          {/* The legacy note line summarises two fixed accounts. With the vault
+              in play each account carries its own reason text in the detail
+              pane, so a second global summary would only repeat -- or worse,
+              contradict -- what the selected account already says. */}
+          {!multi && (
+            <AiNote
+              cl={cl}
+              gt={gt}
+              retry={ai?.retry}
+              age={ai?.age}
+              wait={ai?.status === 'wait' ? ai : null}
+            />
+          )}
         </>
       )}
     </Card>
@@ -1678,6 +1799,22 @@ function ResizeBand({ scale, onScale, onStart, onEnd, max }) {
   const handlers = useScaleDrag({ scale, onScale, onStart, onEnd, max })
   const atMax = scale >= max - 0.001
   const atMin = scale <= SCALE_MIN + 0.001
+  const frostOff = scale < FROST_MIN_SCALE
+
+  // What the second line says has to be true wherever the drag happens to be.
+  // It used to read "smallest usable" at the floor, which was a claim about
+  // usability that the floor was never making -- and would now be a plain lie,
+  // since the floor is far below the point where the frost has to be given up.
+  // So: the ceiling is named where the ceiling binds, the floor is named where
+  // the floor binds, and in between the one thing that actually changes on the
+  // way down gets said out loud rather than being discovered.
+  const note = atMax
+    ? 'largest this screen fits'
+    : atMin
+      ? `smallest · ${Math.round(SCALE_MIN * 100)}%`
+      : frostOff
+        ? `no frost below ${Math.round(FROST_MIN_SCALE * 100)}%`
+        : `max ${Math.round(max * 100)}%`
 
   return (
     <div
@@ -1692,9 +1829,7 @@ function ResizeBand({ scale, onScale, onStart, onEnd, max }) {
         {`Drag to resize · ${Math.round(scale * 100)}%`}
       </span>
       <span className="glass-text text-[9.5px] tabular-nums text-faint">
-        {atMax ? 'largest this screen fits'
-          : atMin ? 'smallest usable'
-            : `max ${Math.round(max * 100)}%`}
+        {note}
       </span>
     </div>
   )

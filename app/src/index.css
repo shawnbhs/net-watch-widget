@@ -43,6 +43,13 @@
   --nw-alert-glass: rgba(74, 56, 26, 0.78);
   --nw-alert-wash: rgba(255, 196, 107, 0.16);
 
+  /* The two card fills used while the frost is suspended. Same colours as the
+     glass above, at an alpha that no longer needs anything behind it: there is
+     no acrylic window under the card in that mode, so what these sit on is the
+     wallpaper. */
+  --nw-solo-card: rgba(23, 29, 39, 0.97);
+  --nw-solo-alert: rgba(74, 56, 26, 0.97);
+
   /* 8px, not the design's 20px, and the reason is a platform limit rather than
      a preference. The frost behind a card is a DWM acrylic window, and the only
      rounding DWM will apply to one is its own corner preference -- a fixed
@@ -194,6 +201,30 @@ body {
   .nw-card[data-alert="true"] { animation: none; }
 }
 
+/* Frost suspended: the card is its own background.
+
+   Below FROST_MIN_SCALE a card is shorter than the shortest window Windows will
+   make, so App.jsx stands the acrylic panes down and marks the root element.
+   Nothing is behind the card from that moment on, and the two fills above are
+   both translucent by design -- at rest the acrylic is what guarantees the
+   contrast floor, and the flat wash is deliberately thin because the desktop
+   showing through is the point while the widget is moving. With no frost there,
+   either one would leave the text sitting on raw wallpaper.
+
+   Both rules are placed after the flat and alert rules and match them on
+   specificity, so source order alone decides: `.nw-solo .nw-card` is (0,2,0)
+   like `[data-flat] .nw-card`, and the alert pair is (0,3,0) like its flat
+   counterpart. That is why four states need two rules. The transition is
+   inherited from `.nw-card`, so the swap at the threshold fades rather than
+   pops, in both directions. */
+.nw-solo .nw-card {
+  background-color: var(--nw-solo-card);
+}
+
+.nw-solo .nw-card[data-alert="true"] {
+  background-color: var(--nw-solo-alert);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .nw-card { transition: none; }
 }
@@ -267,4 +298,184 @@ body {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 6.2 4.8 8.5 9.5 3.6' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-size: 12px 12px;
   background-repeat: no-repeat;
+}
+
+/* ── scrollbars ────────────────────────────────────────────────────────────── */
+
+/* Windows draws a scrollbar as a ~17px light-grey trough with a square thumb and
+   an arrow button at each end. On a dark frosted card that is not a subdued
+   control, it is a piece of another program: it is the brightest object in the
+   card and it is opaque, so it also punches a solid rectangle through the one
+   surface that is supposed to be glass all the way across.
+
+   So the whole document gets the glass version instead. Styling `*` rather than
+   a single list class is deliberate — a scroll area added later inherits the
+   right look by default, and nobody has to remember a class name to avoid
+   reintroducing the native one.
+
+   The thumb is the card language reused rather than a new palette: it rests at
+   the same alpha as a card hairline (--color-edge), brightens to the faint text
+   weight on hover, and reaches the muted text weight while dragged. That last
+   step matters more than it sounds — a 7px bar is small enough that "am I
+   actually holding it" has to be answered by value, since there is no room for
+   it to be answered by shape. All three are existing tokens, so a change to the
+   edge weight carries into the scrollbars without a second edit. */
+::-webkit-scrollbar {
+  /* Both axes, because a horizontal bar in a narrow card is the same eyesore
+     lying down. 7px is the middle of the 6-8 device-pixel target at 1x; the
+     shell is scaled with `zoom`, so this multiplies up with the rest of the
+     widget and stays proportionally the same bar at 12x as at 0.8x. */
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  /* Transparent rather than tinted. The card behind this is frost over a live
+     desktop, and any track colour would be a stripe of flat paint down an
+     otherwise continuous piece of glass. */
+  background: transparent;
+}
+
+::-webkit-scrollbar-button {
+  /* The stepper arrows. `display: none` rather than a zero size, because at a
+     zero size Chromium still reserves the hit area and a click near the end of
+     the bar scrolls by a line instead of doing nothing. */
+  display: none;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-edge);
+  border-radius: 999px;
+  transition: background-color 120ms ease-out;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-faint);
+}
+
+::-webkit-scrollbar-thumb:active {
+  background-color: var(--color-muted);
+}
+
+/* The standard two-property form, which Chromium honours as well but with far
+   less control — it is here so the widget degrades to a thin translucent bar
+   rather than back to Windows grey if this is ever rendered by an engine that
+   dropped the WebKit pseudo-elements. Where both are understood the
+   pseudo-elements win, which is the order we want. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-edge) transparent;
+}
+
+/* Scroll containers.
+
+   `:where()` keeps this at zero specificity, so a component that wants
+   different behaviour can override it with a plain class and does not have to
+   fight an `!important`. Matching the utility class names means the two lists
+   in the AI usage card get this without anyone editing their JSX.
+
+   scrollbar-gutter reserves the bar's width whether or not a bar is showing.
+   Without it, a list that gains one more row crosses into overflow, the bar
+   appears, and every line of text beside it shifts left by 7px — so refreshing
+   an account list makes the labels twitch sideways. Reserving the space costs
+   7px of width permanently and buys a layout that never moves.
+
+   overscroll-behavior stops a wheel event that runs off the end of an inner
+   list from continuing into whatever is behind it. In a floating always-on-top
+   widget that is a real defect rather than a nicety: the scroll chains out to
+   the shell, the card rectangles move, and the separate frost windows behind
+   them are repositioned a few frames later — so a stray flick of the wheel over
+   a full list visibly shakes the glass. */
+:where(
+  [class~="overflow-y-auto"],
+  [class~="overflow-auto"],
+  [class~="overflow-y-scroll"],
+  .nw-scroll
+) {
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+}
+
+/* The overflow fade.
+
+   A list clipped at its bottom edge by a hard line reads as a list that ends
+   there. Fading the last few pixels out instead is the only signal available
+   that there is more below, since the scrollbar is deliberately too quiet to be
+   one on a short list.
+
+   CSS cannot see scroll position, so the two edges are driven by data
+   attributes and the owner of the JSX wires them up. THE CONTRACT:
+
+     - Put `nw-fade-edges` on the element that scrolls (the one carrying
+       `overflow-y-auto`), or on a wrapper around it.
+     - Set `data-scroll-top="true"` while there is hidden content ABOVE the
+       viewport, i.e. `el.scrollTop > 0`. Remove the attribute, or set it to
+       anything else, when scrolled to the very top.
+     - Set `data-scroll-bottom="true"` while there is hidden content BELOW, i.e.
+       `el.scrollTop + el.clientHeight < el.scrollHeight - 1`. The 1px slack is
+       load-bearing: scrollTop is fractional under `zoom` and an exact
+       comparison leaves a fade stuck on at the bottom of the list.
+     - Recompute on `scroll`, and also whenever the list contents or the element
+       size change, since neither fires a scroll event. Both attributes absent
+       is the correct state for a list that does not overflow at all, and is
+       also the safe default: with neither set the element renders exactly as it
+       would without the class.
+
+   Only the string "true" turns a fade on, so `data-scroll-top={hasAbove}` in
+   JSX works as written — React omits the attribute entirely for `false`.
+
+   Implemented as a mask rather than an overlaid gradient because the card is
+   translucent: a gradient fading to the card colour would be a visible dark bar
+   painted over live frost, whereas a mask removes the pixels and lets the frost
+   itself come through. The mask does also feather the top and bottom tips of
+   the scrollbar thumb, which is a fair trade for not needing a wrapper element;
+   put the class on a wrapper if that ever looks wrong. */
+@property --nw-fade-top {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --nw-fade-bottom {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+.nw-fade-edges {
+  /* Registered above so the two lengths interpolate; an unregistered custom
+     property snaps between values and the fade would pop in the moment the list
+     leaves the top rather than arriving with the scroll. */
+  --nw-fade-top: 0px;
+  --nw-fade-bottom: 0px;
+  transition: --nw-fade-top 120ms ease-out, --nw-fade-bottom 120ms ease-out;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--nw-fade-top),
+    #000 calc(100% - var(--nw-fade-bottom)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--nw-fade-top),
+    #000 calc(100% - var(--nw-fade-bottom)),
+    transparent 100%
+  );
+}
+
+/* 14px of feather. Enough to read as a fade on a 104px-tall list without eating
+   a whole row, and it scales with `zoom` like everything else. */
+.nw-fade-edges[data-scroll-top="true"] {
+  --nw-fade-top: 14px;
+}
+
+.nw-fade-edges[data-scroll-bottom="true"] {
+  --nw-fade-bottom: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nw-fade-edges { transition: none; }
 }

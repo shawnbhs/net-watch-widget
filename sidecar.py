@@ -15,6 +15,8 @@ Protocol, one JSON object per line, UTF-8:
          {"t": "hw",     ...}   cpu / ram / gpu
          {"t": "ai",     ...}   Claude and Codex usage, forwarded raw
          {"t": "checks", ...}   ASN, proxy/datacenter, DNS leak, score
+         {"t": "ai_cred_sources", ...}  discovered logins, never their tokens
+         {"t": "ai_windsurf_cached", ...}  cached quota plus its age
                                 (on an IP change, or on demand)
          {"t": "tz",     ...}   system timezone vs the exit IP's
          {"t": "netstate",...}  adapters up or cut, and whether a toggle is live
@@ -28,14 +30,32 @@ Protocol, one JSON object per line, UTF-8:
          {"cmd": "copy", "text": …}  to the clipboard
          {"cmd": "open", "url": …}   in the default browser
          {"cmd": "ai_login", "which": "claude"|"codex"}
+         {"cmd": "ai_login_cancel"}
+         {"cmd": "ai_accounts_list"}                 the vault, no network
+         {"cmd": "ai_providers"}                     the provider registry
+         {"cmd": "ai_account_add", "provider": …, "label": …}
+         {"cmd": "ai_account_login", "id": …}        re-auth a dead account
+         {"cmd": "ai_account_remove", "id": …}
+         {"cmd": "ai_account_rename", "id": …, "label": …}
+         {"cmd": "ai_account_refresh", "id": …}      poll one account now
+         {"cmd": "ai_cred_scan"}                     logins already on this PC
+         {"cmd": "ai_cred_import", "provider": …, "path": …, "label": …}
+         {"cmd": "ai_windsurf_cached"}               cached quota, no network
          {"cmd": "open_log"}
          {"cmd": "quit"}
+
+The `ai` message gained an `accounts` array — one entry per registered
+account, each with id, provider, label, status, usage, error, expires_at and
+needs_login. The older `claude` and `codex` keys are still sent, filled from
+the first healthy account of each provider, because the cards that read them
+live in the React app and are replaced on their own schedule.
 
 Percentages and colour thresholds are sent as raw numbers. Deciding that 92% is
 red is a presentation choice and belongs in CSS, not here.
 """
 
 import io
+import inspect
 import json
 import os
 import random
@@ -428,9 +448,22 @@ def ai_tick(fails, last, manual):
 
     last = now
     emit("ai", status="polling")
-    claude = core.fetch_claude_usage()
-    time.sleep(random.uniform(1.5, 5.0))  # don't fire both at one instant
-    codex = core.fetch_gpt_usage()
+    # The vault is the source of truth when it exists, because it is the only
+    # one that can hold two accounts for the same provider. With no vault, or
+    # an empty one, this falls straight back to the two credential files the
+    # widget has always read, so nothing about a fresh install changes.
+    rows = []
+    try:
+        rows = core.ai_poll_accounts()
+    except Exception as exc:
+        emit("error", where="ai_accounts", err=str(exc))
+        rows = []
+    if rows:
+        claude, codex = core.ai_legacy_pair(rows)
+    else:
+        claude = core.fetch_claude_usage()
+        time.sleep(random.uniform(1.5, 5.0))  # don't fire both at one instant
+        codex = core.fetch_gpt_usage()
 
     # If the tunnel dropped between the two calls the readings are from the
     # wrong exit, so they are discarded rather than displayed.
@@ -449,6 +482,7 @@ def ai_tick(fails, last, manual):
         codex=_ai_payload(codex, ("sess_pct", "week_pct"),
                           ("sess_reset_ts", "week_reset_ts"),
                           limit_reached=bool(codex.get("limit_reached"))),
+        accounts=rows,
         polled_at=clock12(),
         retry=max(claude.get("retry", 0), codex.get("retry", 0)))
     emit("ai", stale=False, age=0, **payload)
@@ -554,10 +588,1030 @@ def style_pane(hwnd):
         emit("error", where="style_pane", err="rounded refused")
 
 
+# ── account management ────────────────────────────────────────────────────────
+# Each of these answers on the same channel with a {"t": "ai_accounts"} or
+# {"t": "ai_providers"} message. They are deliberately total: every failure
+# path ends in an `err` string rather than an exception, because an exception
+# escaping into the stdin loop would take the stream down and the whole widget
+# goes blank when that happens, not just the card that asked.
+
+def ai_accounts_emit(err=None, note=None, **extra):
+    """Send the current vault contents, with no network traffic."""
+    try:
+        rows = core.ai_accounts_snapshot()
+    except Exception as exc:
+        rows, err = [], err or str(exc)
+    emit("ai_accounts", accounts=rows, err=err or "", note=note or "", **extra)
+
+
+def ai_providers_emit():
+    """Send the provider registry so the picker names no vendor itself."""
+    try:
+        provs = core.ai_providers_list()
+    except Exception as exc:
+        emit("ai_providers", providers=[], err=str(exc))
+        return
+    emit("ai_providers", providers=provs, err="" if provs else "unavailable")
+
+
+def _vault_or_err(where):
+    """True when the vault is usable; otherwise says so and returns False."""
+    if core.ai_vault_ready():
+        return True
+    emit("ai_accounts", accounts=[], err="account vault unavailable",
+         note=where)
+    return False
+
+
+def ai_account_add(provider, label):
+    """Add an account by signing in inside an isolated sandbox.
+
+    The old path drove a login that wrote into the user's real shared
+    credential file, which is precisely why a second account could never get
+    in: the CLI found the first login already sitting there and reused it. The
+    work now happens in `isolated_login`, and this is kept only as the name the
+    command table already spells.
+    """
+    isolated_login(provider, label=label)
+
+
+def ai_account_login(aid):
+    """Re-authenticate an account whose refresh token finally died.
+
+    Also isolated: re-signing in through the shared credential file would
+    overwrite whichever account the CLI happens to hold, so fixing one account
+    could quietly break another.
+    """
+    isolated_login("", account_id=aid)
+
+
+def ai_account_remove(aid):
+    if not _vault_or_err("remove"):
+        return
+    try:
+        known = bool(core._vault.get_account(aid))
+    except Exception:
+        known = False
+    if not known:
+        ai_accounts_emit(err="no such account")
+        return
+    try:
+        core._vault.remove_account(aid)
+    except Exception as exc:
+        ai_accounts_emit(err=str(exc) or "remove failed")
+        return
+    ai_accounts_emit(note="removed")
+    _ai_now.set()
+
+
+def ai_account_rename(aid, label):
+    if not _vault_or_err("rename"):
+        return
+    if not label:
+        ai_accounts_emit(err="a label is required")
+        return
+    try:
+        known = bool(core._vault.get_account(aid))
+    except Exception:
+        known = False
+    if not known:
+        ai_accounts_emit(err="no such account")
+        return
+    try:
+        core._vault.rename_account(aid, label)
+    except Exception as exc:
+        ai_accounts_emit(err=str(exc) or "rename failed")
+        return
+    ai_accounts_emit(note="renamed")
+
+
+def ai_account_refresh(aid):
+    """Poll exactly one account now, behind the same fail-closed geo gate.
+
+    A single-account poll is still an outbound request to a provider that
+    blocks this country, so it gets the identical verdict every other request
+    gets. Refusing here is cheap; being seen from a blocked address is not.
+    """
+    if not _vault_or_err("refresh"):
+        return
+    try:
+        acct = core._vault.get_account(aid)
+    except Exception:
+        acct = None
+    if not acct:
+        ai_accounts_emit(err="no such account")
+        return
+    if core.AI_LATCH["blocked"]:
+        ai_accounts_emit(err=core.AI_LATCH["reason"] or "blocked")
+        return
+    ok, cc, why = core.geo_verdict(_state.get("ip"), _state.get("code"),
+                                   force=True)
+    if not ok:
+        ai_accounts_emit(err="VPN required" if cc == "IR"
+                         else "VPN required (%s)" % why)
+        return
+    try:
+        row = core.ai_account_poll(acct)
+    except Exception as exc:
+        ai_accounts_emit(err=str(exc) or "poll failed")
+        return
+    emit("ai_accounts", accounts=[row], err=row.get("error") or "",
+         note="single")
+
+
+def ai_migrate():
+    """First-run adoption of whatever the CLIs already hold.
+
+    Runs once per process on a thread of its own: reading the credential files
+    can mean waking a stopped WSL distro, which takes seconds the startup path
+    cannot afford to spend.
+    """
+    try:
+        n, note = core.ai_migrate_once()
+    except Exception as exc:
+        emit("error", where="ai_migrate", err=str(exc))
+        return
+    if n:
+        emit("ai_accounts", accounts=core.ai_accounts_snapshot(),
+             err="", note="%s %d" % (note, n))
+
+
+
+# ── credential discovery ───────────────────────────────────────────────
+# `aicredsources` locates vendor logins that are already sitting on this
+# machine, so the add-account flow can offer the user a list to pick from
+# instead of demanding they find and paste a token by hand. Everything it does
+# is a read of a local file, which is why none of the commands below touch the
+# geographic gate: the gate exists to stop outbound requests from a blocked
+# country, and discovery makes none. The one function in that module that does
+# spawn a process (`copilot_token_via_gh`) is opt-in and is never reached from
+# here, because a background scan must not start subprocesses.
+
+try:
+    import aicredsources  # noqa: E402  (new module; may legitimately be absent)
+except Exception:
+    # Identical reasoning to `ailogin` above: a module that is missing or
+    # half-written must cost the user one command, not the entire widget. A
+    # sidecar that fails to import leaves Electron with a blank pane and no
+    # explanation, so no new import is ever allowed to be load-bearing.
+    aicredsources = None
+
+
+def _discovery_or_err(where):
+    """True when the discovery layer is importable; otherwise says so."""
+    if aicredsources is not None:
+        return True
+    emit("ai_cred_sources", providers=[], found=[], missing=[],
+         err="credential discovery unavailable (aicredsources not importable)",
+         note=where)
+    return False
+
+
+def _safe_locations(locs):
+    """Candidate locations with nothing but path-shaped metadata in them.
+
+    `aicredsources` documents its `key` field as a key NAME and never a value,
+    and the rest of the record is a path, a size and an existence flag, so
+    this is a whitelist rather than a filter: a field the discovery layer adds
+    later cannot smuggle a secret across the bridge unless it is added here
+    too.
+    """
+    out = []
+    for loc in (locs or []):
+        if not isinstance(loc, dict):
+            continue
+        rec = {}
+        for k in ("path", "kind", "exists", "confidence", "key", "note",
+                  "size", "mtime"):
+            if k in loc:
+                rec[k] = loc[k]
+        out.append(rec)
+    return out
+
+
+def _vault_fingerprints():
+    """{fingerprint: account id} and {(provider, cred_path): id} for the vault.
+
+    Both indexes come from the vault's own `cred_fingerprint`, deliberately
+    rather than from a second implementation written here: `core._import_sweep`
+    already reuses that helper, and a third opinion about what counts as the
+    same login would eventually disagree with the other two and either
+    duplicate a row or hide one.
+    """
+    by_fp, by_path = {}, {}
+    try:
+        accts = core._vault.list_accounts() or []
+    except Exception:
+        return by_fp, by_path
+    for a in accts:
+        if not isinstance(a, dict):
+            continue
+        aid = a.get("id")
+        try:
+            fp = core._vault.cred_fingerprint(a.get("provider"), a.get("cred"))
+        except Exception:
+            fp = None
+        if fp:
+            by_fp[fp] = aid
+        path = a.get("cred_path")
+        if path:
+            by_path[(a.get("provider"), path)] = aid
+    return by_fp, by_path
+
+
+def _in_vault(provider, source_path, by_fp, by_path):
+    """(already_registered, account id, how it was matched).
+
+    The fingerprint is the real answer, because it survives a token refresh
+    and survives the same login being found under two different homes. It only
+    exists for the two providers whose credential shapes the vault knows, so
+    the path match is the fallback for the rest: it is weaker -- two logins
+    could in principle share a file -- but it is still better than offering
+    the user an "add" button for a row they already added.
+    """
+    cred = None
+    if core.ai_vault_ready():
+        try:
+            cred, _why = aicredsources.read_cred(provider)
+        except Exception:
+            cred = None
+    fp = None
+    if cred is not None:
+        try:
+            fp = core._vault.cred_fingerprint(provider, cred)
+        except Exception:
+            fp = None
+    # The credential object dies with this frame. It is read only to compute a
+    # fingerprint and is never returned, never stored and never logged, so it
+    # cannot reach a renderer log line or a crash report.
+    del cred
+    if fp and fp in by_fp:
+        return True, by_fp[fp], "fingerprint"
+    if source_path and (provider, source_path) in by_path:
+        return True, by_path[(provider, source_path)], "path"
+    return False, None, None
+
+
+def ai_cred_scan():
+    """Report every vendor login discoverable on this machine.
+
+    Runs on a thread of its own because the scan opens files that may live on
+    a WSL share, and reaching one can mean waking a stopped distro: seconds
+    that the polling loop and the stdin reader cannot afford to spend blocked.
+    """
+    if not _discovery_or_err("scan"):
+        return
+    try:
+        # include_creds=False is the whole safety argument for this command:
+        # the payload is free of token material by construction rather than
+        # because this function remembered to strip it afterwards.
+        report = aicredsources.scan_all(include_creds=False)
+    except Exception as exc:
+        emit("ai_cred_sources", providers=[], found=[], missing=[],
+             err=str(exc) or "scan failed", note="scan")
+        return
+    by_fp, by_path = _vault_fingerprints()
+    rows = []
+    for slug, rec in sorted((report.get("providers") or {}).items()):
+        rec = rec if isinstance(rec, dict) else {}
+        source = rec.get("source")
+        found = bool(rec.get("found"))
+        known, aid, how = (False, None, None)
+        if found:
+            known, aid, how = _in_vault(slug, source, by_fp, by_path)
+        rows.append({
+            "provider": slug,
+            "found": found,
+            "reason": rec.get("reason"),
+            "source": source,
+            "source_kind": rec.get("source_kind"),
+            "locations": _safe_locations(rec.get("locations")),
+            "in_vault": known,
+            "account_id": aid,
+            "matched_by": how,
+        })
+    emit("ai_cred_sources",
+         providers=rows,
+         found=sorted(r["provider"] for r in rows if r["found"]),
+         missing=sorted(r["provider"] for r in rows if not r["found"]),
+         generated_at=report.get("generated_at"),
+         err="", note="scan")
+
+
+def _import_label(provider, existing):
+    """A unique default name for an imported row.
+
+    The vault's own helper is used when it is exposed, so an imported account
+    is named the same way whether it arrived through the first-run sweep or
+    through this command; the local fallback exists only because that helper
+    is private and could be renamed.
+    """
+    fn = getattr(core._vault, "_import_label", None)
+    if callable(fn):
+        try:
+            return fn(provider, None, existing)
+        except Exception:
+            pass
+    used = {a.get("label") for a in existing if isinstance(a, dict)}
+    if provider not in used:
+        return provider
+    n = 2
+    while "%s %d" % (provider, n) in used:
+        n += 1
+    return "%s %d" % (provider, n)
+
+
+def ai_cred_import(provider, path=None, label=None):
+    """Import ONE discovered login into the vault.
+
+    The first-run sweep is all-or-nothing and runs once; this is the path for
+    a user who wants a single account off this machine and not every login on
+    it. It deliberately does not consult and does not stamp the first-run
+    marker: that marker exists so a login the user deleted is never silently
+    resurrected by an automatic pass, and an explicit click on one named row
+    is not an automatic pass. Leaving the marker untouched also means this
+    command can never suppress or trigger the bulk import as a side effect.
+    """
+    if not _discovery_or_err("import"):
+        return
+    provider = provider if isinstance(provider, str) else ""
+    provider = provider.strip()
+    if not provider:
+        ai_accounts_emit(err="a provider is required", note="import")
+        return
+    try:
+        slugs = list(aicredsources.provider_slugs() or [])
+    except Exception:
+        slugs = []
+    if slugs and provider not in slugs:
+        ai_accounts_emit(err="unknown provider: %s" % provider, note="import")
+        return
+    if not _vault_or_err("import"):
+        return
+    try:
+        locs = aicredsources.cred_locations(provider) or []
+    except Exception:
+        locs = []
+    known_paths = [l.get("path") for l in locs if isinstance(l, dict)]
+    if path and path not in known_paths:
+        # Refusing an unrecognised path is not pedantry: the caller is meant
+        # to be echoing back a location this sidecar itself reported, and a
+        # path from anywhere else is a bug in the caller or an attempt to make
+        # the sidecar read an arbitrary file.
+        ai_accounts_emit(err="unknown location for %s" % provider,
+                         note="import")
+        return
+    try:
+        cred, why = aicredsources.read_cred(provider)
+    except Exception as exc:
+        cred, why = None, "%s reader raised %s" % (provider, type(exc).__name__)
+    if cred is None:
+        ai_accounts_emit(err=why or "no credential found for %s" % provider,
+                         note="import")
+        return
+    try:
+        fp = core._vault.cred_fingerprint(provider, cred)
+    except Exception:
+        fp = None
+    by_fp, by_path = _vault_fingerprints()
+    source = path or next((l.get("path") for l in locs
+                           if isinstance(l, dict) and l.get("exists")), None)
+    if fp and fp in by_fp:
+        ai_accounts_emit(err="that account is already in the vault",
+                         note="import", account_id=by_fp[fp])
+        return
+    if not fp and source and (provider, source) in by_path:
+        # Without a fingerprint the identity claim is weaker, so the path is
+        # the only duplicate signal available; refusing on it is the safer of
+        # the two mistakes, because a duplicate row polls twice and shows the
+        # same quota under two names.
+        ai_accounts_emit(err="that login is already in the vault",
+                         note="import", account_id=by_path[(provider, source)])
+        return
+    try:
+        existing = core._vault.list_accounts() or []
+    except Exception:
+        existing = []
+    name = (label or "").strip() or _import_label(provider, existing)
+    try:
+        acct = core._vault.add_account(provider, name, cred, source="import",
+                                       cred_path=source)
+    except Exception as exc:
+        ai_accounts_emit(err=str(exc) or "import failed", note="import")
+        return
+    finally:
+        # Same rule as the scan: the credential was needed to write the vault
+        # and for nothing else, so it is dropped before anything is emitted.
+        del cred
+    acct = acct if isinstance(acct, dict) else {}
+    # Only the non-secret half of the new row is echoed back. `add_account`
+    # returns the stored record, credential included, and forwarding it whole
+    # would put a token in the renderer for the sake of a UI that only needs
+    # the id to select the row it just created.
+    safe = {k: acct.get(k) for k in ("id", "provider", "label", "added_at",
+                                     "source", "cred_path")}
+    ai_accounts_emit(note="imported", account=safe)
+    _ai_now.set()
+
+
+def ai_windsurf_cached():
+    """The Windsurf quota the editor already cached, plus how old it is.
+
+    Worth a command of its own because it is the only quota in the widget that
+    costs no network request at all, which matters a great deal in a region
+    where the live request may simply be impossible. The age travels with it
+    because the number is only as fresh as the last time the Windsurf editor
+    ran, and a three-week-old reading presented as current is a silent
+    wrong-data bug -- worse than showing nothing.
+
+    No freshness threshold is applied here. What counts as too old is a
+    presentation decision in the same sense as a colour threshold, so the age
+    and whatever staleness flag the discovery layer supplies are forwarded and
+    the UI decides.
+    """
+    if aicredsources is None:
+        emit("ai_windsurf_cached", ok=False,
+             err="credential discovery unavailable "
+                 "(aicredsources not importable)")
+        return
+    try:
+        doc = aicredsources.windsurf_cached_plan()
+    except Exception as exc:
+        emit("ai_windsurf_cached", ok=False, err=str(exc) or "read failed")
+        return
+    if not isinstance(doc, dict):
+        emit("ai_windsurf_cached", ok=False, err="malformed discovery result")
+        return
+    # Both spellings of the staleness fields are accepted because the module
+    # documents them with a leading underscore in one place and without in
+    # another; taking whichever is present avoids a silent None when the other
+    # side settles on a name.
+    def pick(*names):
+        for n in names:
+            if doc.get(n) is not None:
+                return doc.get(n)
+        return None
+    emit("ai_windsurf_cached",
+         ok=bool(doc.get("ok")),
+         plan=doc.get("plan"),
+         path=doc.get("path"),
+         key=doc.get("key"),
+         written_at=pick("written_at", "_source_mtime"),
+         written_at_iso=doc.get("written_at_iso"),
+         age_seconds=pick("age_seconds", "_age_seconds"),
+         stale=pick("stale", "_stale"),
+         cached=True,
+         err=doc.get("reason") or "")
+
+
+# ── isolated per-account login ────────────────────────────────────────────────
+# A vendor CLI keeps exactly one login under the user's home directory and
+# reuses it without asking, which is why signing in with a second email keeps
+# handing back the first account. `ailogin` runs each sign-in inside a
+# disposable sandbox directory that acts as a fake home, so the CLI has no
+# previous login to find and is forced to prompt for real credentials.
+#
+# This file only orchestrates that: it claims the single login slot, applies
+# the same fail-closed geographic gate every other outbound path uses, reports
+# progress while a human is in a browser, and guarantees the sandbox is
+# destroyed afterwards. That last point is not housekeeping -- until teardown
+# runs, the sandbox holds a live credential in a plain file on disk.
+
+try:
+    import ailogin  # noqa: E402  (new module; may legitimately be absent)
+except Exception:
+    # A missing or half-written module must never be fatal. A sidecar that
+    # fails to import blanks the whole widget, which is a far worse outcome
+    # than one command reporting that it cannot run yet.
+    ailogin = None
+
+
+# The module is authored separately and its exact function names are not
+# guaranteed, so each role is resolved by trying the plausible spellings in
+# turn. Binding by role rather than by one hardcoded name means a reasonable
+# naming choice on the other side does not silently disable the feature; an
+# unreasonable one still degrades to a clear "isolated login not available"
+# message rather than an exception.
+_LOGIN_ROLES = (
+    ("supported", ("isolated_login_supported", "supports", "supported",
+                   "is_supported", "can_isolate", "provider_supported",
+                   "is_available", "available")),
+    ("sandbox", ("create_sandbox", "make_sandbox", "new_sandbox",
+                 "prepare_sandbox", "open_sandbox", "sandbox")),
+    ("launch", ("launch_login", "launch", "start_login", "spawn_login",
+                "start", "spawn")),
+    ("wait", ("wait_for_cred", "wait_for_credential", "wait",
+              "await_credential", "collect", "harvest", "capture")),
+    ("teardown", ("destroy_sandbox", "teardown", "destroy", "cleanup",
+                  "remove_sandbox", "discard", "close")),
+    ("duplicate", ("classify_account", "is_duplicate", "duplicate",
+                   "detect_duplicate", "find_duplicate", "same_account",
+                   "match_account", "classify", "is_new_account", "is_new")),
+)
+
+# How long a whole sign-in may take before it is abandoned, and how large a
+# slice of that is spent inside one `wait` call. The wait is sliced rather than
+# made in one blocking call so a cancel command is noticed within seconds
+# instead of at the end of a five-minute timeout.
+_LOGIN_WAIT = getattr(core, "AI_LOGIN_WAIT", 300)
+_LOGIN_SLICE = 5.0
+
+# The single login slot. Two concurrent sign-ins would race two sandboxes and
+# put two console windows in front of a user who can only be in one of them,
+# so the second is refused rather than queued.
+_login_lock = threading.Lock()
+_login = {"busy": False, "proc": None, "cancel": None, "what": ""}
+
+
+def _login_api():
+    """(callables by role, error string). Exactly one of the two is useful."""
+    if ailogin is None:
+        return None, "isolated login not available (ailogin module missing)"
+    api, missing = {}, []
+    for role, names in _LOGIN_ROLES:
+        fn = None
+        for name in names:
+            cand = getattr(ailogin, name, None)
+            if callable(cand):
+                fn = cand
+                api[role] = (name, cand)
+                break
+        if fn is None:
+            missing.append(role)
+    if missing:
+        return None, ("isolated login not available (ailogin is missing: %s)"
+                      % ", ".join(missing))
+    return api, ""
+
+
+def _call(api, role, *args, **kw):
+    return api[role][1](*args, **kw)
+
+
+def _takes(api, role, name):
+    """Whether this role's function has a parameter of that name.
+
+    The roles are bound by name across a module this file does not own, so the
+    optional arguments -- a timeout, the process handle, the provider slug --
+    are passed by keyword only when the bound function actually declares them.
+    Passing them positionally instead would quietly land a timeout in a
+    parameter that means something else entirely, and the failure would look
+    like a login that never captured anything.
+    """
+    try:
+        return name in inspect.signature(api[role][1]).parameters
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def _login_progress(stage, note, provider="", **extra):
+    """One progress beat, on the envelope the accounts card already reads.
+
+    A sign-in is minutes of a human in a browser. Without these the card sits
+    on its last state and the widget looks frozen exactly when the user most
+    needs to be told to go and look at the console window that just opened.
+    Nothing secret is ever put on this channel -- it is the IPC stream and it
+    reaches the log file on disk.
+    """
+    ai_accounts_emit(note=note, status="login", stage=stage,
+                     provider=provider or "", **extra)
+
+
+def _sandbox_dir(handle):
+    """The sandbox's directory, whatever the handle calls it. For messages."""
+    for attr in ("dir", "path", "home", "root", "sandbox_dir"):
+        val = getattr(handle, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    if isinstance(handle, dict):
+        for key in ("dir", "path", "home", "root", "sandbox_dir"):
+            val = handle.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return ""
+
+
+def _wait_result(raw):
+    """Normalise the wait function's answer into (credential, reason).
+
+    The contract says it returns either the captured credential or a reason
+    string that distinguishes cancellation from timeout from CLI error, and
+    there is more than one reasonable way to express that in Python. Accepting
+    all of them here is cheaper than being wrong about one: the mapping is a
+    dict, the reason is a string, a pair is taken in that order.
+    """
+    if raw is None:
+        return None, "login not completed"
+    if isinstance(raw, tuple) and len(raw) == 2:
+        first, second = raw
+        if isinstance(first, dict):
+            return first, ("" if not second else str(second))
+        if isinstance(second, dict):
+            return second, ("" if not first else str(first))
+        return None, str(second or first or "login not completed")
+    if isinstance(raw, dict):
+        # A wrapper carrying both is still unambiguous: a credential under a
+        # named key, with a reason beside it.
+        for key in ("cred", "credential", "creds"):
+            if isinstance(raw.get(key), dict):
+                return raw[key], str(raw.get("reason") or raw.get("err") or "")
+        if raw.get("reason") or raw.get("err"):
+            return None, str(raw.get("reason") or raw.get("err"))
+        return raw, ""
+    if isinstance(raw, str):
+        return None, raw
+    return None, "login not completed"
+
+
+def _is_timeout(reason):
+    """Whether a reason string means 'nothing happened yet', not 'it failed'.
+
+    Only a timeout is worth waiting through: the wait is called in short
+    slices, so its own timeout fires long before ours does and must not be
+    mistaken for the user cancelling or the CLI erroring out, both of which
+    are final.
+    """
+    low = (reason or "").lower()
+    return ("timeout" in low or "timed out" in low or "pending" in low
+            or "waiting" in low or low in ("", "none"))
+
+
+def _dup_verdict(api, pid, cred, accounts):
+    """(is duplicate, matching account id). Conservative when unsure.
+
+    Reported as a duplicate only on a positive signal, because the cost of the
+    two mistakes is not symmetric: a missed duplicate adds a redundant row the
+    user can delete in one click, while a false duplicate refuses a genuinely
+    new account and leaves him exactly where he started.
+    """
+    name = api["duplicate"][0]
+    try:
+        if _takes(api, "duplicate", "provider"):
+            raw = _call(api, "duplicate", pid, cred, accounts)
+        else:
+            raw = _call(api, "duplicate", cred, accounts)
+    except Exception:
+        return False, ""
+    inverted = name.startswith("is_new")
+    if isinstance(raw, bool):
+        return (not raw if inverted else raw), ""
+    if raw is None:
+        return False, ""
+    if isinstance(raw, dict):
+        # A three-way verdict is the informative shape: "unknown" means the
+        # credential could not be compared at all, and refusing a login on
+        # "unknown" would block the very account the user is trying to add.
+        status = str(raw.get("status") or "").strip().lower()
+        if status in ("duplicate", "same", "existing"):
+            return True, str(raw.get("account_id") or raw.get("id") or "")
+        if status in ("new", "fresh", "different", "unknown"):
+            return False, ""
+        dup = raw.get("duplicate")
+        if dup is None:
+            dup = raw.get("same")
+        if dup is None and raw.get("new") is not None:
+            dup = not raw.get("new")
+        aid = raw.get("account_id") or raw.get("id") or ""
+        if dup is None:
+            dup = bool(aid)
+        return bool(dup), str(aid or "")
+    if isinstance(raw, tuple) and len(raw) == 2:
+        dup, aid = raw
+        if isinstance(dup, bool):
+            return (not dup if inverted else dup), str(aid or "")
+        return bool(aid), str(dup or aid or "")
+    if isinstance(raw, str):
+        # A bare string is read as a verdict word when it is one, and as the
+        # id of the account that already holds this credential otherwise.
+        low = raw.strip().lower()
+        if low in ("new", "fresh", "different", ""):
+            return False, ""
+        if low in ("duplicate", "same", "existing"):
+            return True, ""
+        return True, raw.strip()
+    return False, ""
+
+
+def _account_label(accounts, aid):
+    for acct in accounts or []:
+        try:
+            if acct.get("id") == aid:
+                return acct.get("label") or acct.get("provider") or ""
+        except Exception:
+            continue
+    return ""
+
+
+# The one message that matters most in this project. The user has two accounts
+# on two email addresses and every attempt at the second hands back the first,
+# so being told plainly what just happened -- and what to do differently -- is
+# the difference between understanding the problem and being stuck in it.
+_DUPLICATE_MSG = (
+    "This is the same account you are already signed in as%s. "
+    "Sign out in your browser, or open a private/incognito window, "
+    "before signing in with the other email address.")
+
+
+def _kill_proc_tree(proc):
+    """Stop the login console and anything it started. Never raises."""
+    if proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    if pid is None and isinstance(proc, int):
+        pid = proc
+    for meth in ("kill", "terminate"):
+        fn = getattr(proc, meth, None)
+        if callable(fn):
+            try:
+                fn()
+                break
+            except Exception:
+                pass
+    if not pid:
+        return
+    try:
+        import psutil
+        parent = psutil.Process(int(pid))
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except Exception:
+                pass
+        try:
+            parent.kill()
+        except Exception:
+            pass
+    except Exception:
+        # psutil absent, the process already gone, or a permission refusal:
+        # the sandbox teardown below is what actually protects the credential,
+        # and it runs regardless.
+        pass
+
+
+def _login_gate(where):
+    """Why this sign-in must not be attempted, or '' when it may be.
+
+    An authentication request is the single most visible thing a vendor sees
+    from an address, so the login path gets the same fail-closed geographic
+    verdict every other outbound path gets, checked here at the command
+    boundary. `core` may well check again inside its own capture function; a
+    redundant check costs one cached lookup and closes the window where a
+    request escapes because the two files disagreed about whose job it was.
+    """
+    if not core.ai_vault_ready():
+        return "account vault unavailable (%s)" % where
+    try:
+        if core.AI_LATCH["blocked"]:
+            return core.AI_LATCH["reason"] or "blocked"
+    except Exception:
+        pass
+    try:
+        ok, cc, why = core.geo_verdict(_state.get("ip"), _state.get("code"),
+                                       force=True)
+    except Exception as exc:
+        return "geo check failed (%s)" % type(exc).__name__
+    if not ok:
+        return "VPN required" if cc == "IR" else "VPN required (%s)" % why
+    return ""
+
+
+def _login_claim(what):
+    """Take the single login slot, or say who already has it."""
+    with _login_lock:
+        if _login["busy"]:
+            return None
+        _login["busy"] = True
+        _login["proc"] = None
+        _login["what"] = what
+        _login["cancel"] = threading.Event()
+        return _login["cancel"]
+
+
+def _login_release():
+    with _login_lock:
+        _login["busy"] = False
+        _login["proc"] = None
+        _login["cancel"] = None
+        _login["what"] = ""
+
+
+def isolated_login(provider, label="", account_id=None):
+    """Sign into one account inside a disposable sandbox, then vault it.
+
+    Runs on its own thread: the wait is a human doing a browser round-trip and
+    pasting a code, which is minutes, and doing that on the stdin loop would
+    stop every other command and the entire quota poll for the duration.
+
+    Every exit from here goes through one `finally` that tears the sandbox
+    down and frees the login slot, because the only alternative is a directory
+    full of live credentials left on disk after a failure nobody saw.
+    """
+    what = "login" if account_id else "add"
+    cancel = _login_claim(what)
+    if cancel is None:
+        ai_accounts_emit(err="a sign-in is already running; "
+                             "finish or cancel it first")
+        return
+
+    handle = None
+    api = None
+    try:
+        why = _login_gate(what)
+        if why:
+            ai_accounts_emit(err=why)
+            return
+
+        acct = None
+        if account_id:
+            try:
+                acct = core._vault.get_account(account_id)
+            except Exception as exc:
+                emit("error", where="ai_account_login", err=str(exc))
+                acct = None
+            if not acct:
+                ai_accounts_emit(err="no such account")
+                return
+            provider = acct.get("provider") or provider
+
+        pid = (str(provider or "")).strip()
+        # Checked before anything is spawned: everything past this point opens
+        # a visible console and waits minutes for a human, and doing that for
+        # a provider nothing can service is indistinguishable, from the user's
+        # side, from a login that silently never finished.
+        try:
+            bad = core.ai_provider_login_error(pid)
+        except Exception as exc:
+            bad = str(exc) or "provider check failed"
+        if bad:
+            ai_accounts_emit(err=bad)
+            return
+
+        api, err = _login_api()
+        if err:
+            ai_accounts_emit(err=err)
+            return
+        try:
+            can = bool(_call(api, "supported", pid))
+        except Exception as exc:
+            ai_accounts_emit(err="isolated login not available (%s)"
+                                 % type(exc).__name__)
+            return
+        if not can:
+            ai_accounts_emit(err="isolated login not available for %s" % pid)
+            return
+
+        try:
+            handle = _call(api, "sandbox", pid)
+        except Exception as exc:
+            ai_accounts_emit(err="sandbox could not be created (%s)"
+                                 % (str(exc) or type(exc).__name__))
+            return
+        if handle is None:
+            ai_accounts_emit(err="sandbox could not be created")
+            return
+        _login_progress("sandbox", "isolated sign-in prepared", pid,
+                        isolated=True)
+
+        try:
+            proc = _call(api, "launch", pid, handle)
+        except Exception as exc:
+            ai_accounts_emit(err="login could not be launched (%s)"
+                                 % (str(exc) or type(exc).__name__))
+            return
+        with _login_lock:
+            _login["proc"] = proc
+        _login_progress("console", "a sign-in window is open: complete the "
+                                   "sign-in there, then come back", pid,
+                        isolated=True)
+
+        cred, reason = None, "login not completed"
+        deadline = time.time() + max(10, _LOGIN_WAIT)
+        while time.time() < deadline and not cancel.is_set():
+            slice_s = min(_LOGIN_SLICE, max(1.0, deadline - time.time()))
+            kw = {}
+            if _takes(api, "wait", "timeout"):
+                kw["timeout"] = slice_s
+            if _takes(api, "wait", "proc"):
+                # Given the process, the wait can tell "the CLI exited without
+                # writing anything" from "still waiting", which turns a silent
+                # five-minute timeout into an immediate, accurate answer.
+                kw["proc"] = proc
+            try:
+                raw = _call(api, "wait", handle, **kw) if kw \
+                    else _call(api, "wait", handle, slice_s)
+            except Exception as exc:
+                cred, reason = None, ("login failed (%s)"
+                                      % (str(exc) or type(exc).__name__))
+                break
+            cred, reason = _wait_result(raw)
+            if cred or not _is_timeout(reason):
+                break
+            cred, reason = None, "login timed out"
+
+        if cancel.is_set():
+            ai_accounts_emit(err="sign-in cancelled")
+            return
+        if not cred:
+            ai_accounts_emit(err=reason or "login not completed")
+            return
+
+        try:
+            known = core._vault.list_accounts() or []
+        except Exception:
+            known = []
+
+        dup, dup_id = _dup_verdict(api, pid, cred, known)
+        if dup and not account_id:
+            # Adding a second identical row would hide the problem instead of
+            # naming it, and the user would be left with two cards showing one
+            # account's numbers twice.
+            name = _account_label(known, dup_id)
+            ai_accounts_emit(err=_DUPLICATE_MSG
+                             % (" (%s)" % name if name else ""),
+                             note="duplicate")
+            return
+
+        try:
+            if account_id:
+                core._vault.update_cred(account_id, cred)
+                note = "account re-authenticated"
+            else:
+                shown = label or _default_login_label(pid)
+                core._vault.add_account(pid, shown, cred, source="login")
+                note = "account added"
+        except Exception as exc:
+            # The type name only: a vault write failure can carry the path or
+            # the payload in its message, and this string goes to stdout.
+            ai_accounts_emit(err="vault write failed (%s)" % type(exc).__name__)
+            return
+        ai_accounts_emit(note=note)
+        _ai_now.set()
+    except Exception as exc:  # pragma: no cover - defensive
+        ai_accounts_emit(err=str(exc) or "login failed")
+    finally:
+        # The sandbox holds a real credential until it is gone, so teardown is
+        # unconditional: success, failure, cancellation, timeout and the
+        # exception nobody predicted all arrive here.
+        if handle is not None and api is not None:
+            try:
+                _call(api, "teardown", handle)
+            except Exception as exc:
+                emit("error", where="ai_login_teardown",
+                     err=type(exc).__name__)
+        _login_release()
+
+
+def _default_login_label(pid):
+    """A neutral label when the user supplied none. Never from the token.
+
+    An email address out of a credential is personal data this widget has no
+    reason to store, and the user renames an account in one click anyway.
+    """
+    try:
+        return core._default_label(pid)
+    except Exception:
+        pass
+    try:
+        n = 1 + sum(1 for a in (core._vault.list_accounts() or [])
+                    if a.get("provider") == pid)
+    except Exception:
+        n = 1
+    return "%s %d" % (pid or "account", n)
+
+
+def ai_login_cancel():
+    """Abandon the sign-in in flight: kill its console, drop its sandbox.
+
+    An interactive login waits on a human who may simply have walked away.
+    Without this the only way out is killing the widget, which leaves the
+    sandbox -- and the credential inside it -- behind on disk.
+    """
+    with _login_lock:
+        if not _login["busy"]:
+            ai_accounts_emit(err="no sign-in is running")
+            return
+        ev = _login["cancel"]
+        proc = _login["proc"]
+    if ev is not None:
+        ev.set()
+    _kill_proc_tree(proc)
+    _login_progress("cancelling", "cancelling the sign-in")
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 def handle(cmd):
+    # A JSON line that parses but is not an object -- a bare list, a number, a
+    # string -- must not reach .get(). It would raise, and the stdin loop would
+    # answer a structural mistake with a stack-trace-shaped error instead of
+    # naming what was wrong with the message.
+    if not isinstance(cmd, dict):
+        emit("error", where="stdin", err="command must be a JSON object")
+        return
     name = cmd.get("cmd", "")
+    if not isinstance(name, str):
+        emit("error", where="stdin", err="cmd must be a string")
+        return
     if name == "refresh":
         _refresh_now.set()
         _ai_now.set()
@@ -578,11 +1632,62 @@ def handle(cmd):
     elif name == "open":
         core.ourl(cmd.get("url", ""))
     elif name == "ai_login":
-        core.ai_login_launch(cmd.get("which", "claude"))
+        # The card's "login expired" click used to call the CLI launcher
+        # directly, which was both ungated and aimed at the shared credential
+        # file. It now takes the same isolated, geo-gated path as every other
+        # sign-in, on its own thread so the click cannot stall the stream.
+        threading.Thread(target=isolated_login, daemon=True,
+                         args=(str(cmd.get("which") or "claude"),)).start()
+    elif name == "ai_accounts_list":
+        ai_accounts_emit()
+    elif name == "ai_providers":
+        ai_providers_emit()
+    elif name == "ai_account_add":
+        threading.Thread(target=ai_account_add, daemon=True,
+                         args=(str(cmd.get("provider") or ""),
+                               str(cmd.get("label") or "").strip())).start()
+    elif name == "ai_account_login":
+        threading.Thread(target=ai_account_login, daemon=True,
+                         args=(cmd.get("id"),)).start()
+    elif name == "ai_login_cancel":
+        # Deliberately inline: cancelling only sets an event and kills a
+        # process, so it must not be queued behind anything, least of all the
+        # sign-in it is trying to stop.
+        ai_login_cancel()
+    elif name == "ai_account_remove":
+        ai_account_remove(cmd.get("id"))
+    elif name == "ai_account_rename":
+        ai_account_rename(cmd.get("id"), str(cmd.get("label") or "").strip())
+    elif name == "ai_account_refresh":
+        threading.Thread(target=ai_account_refresh, daemon=True,
+                         args=(cmd.get("id"),)).start()
+    elif name == "ai_cred_scan":
+        # Threaded because the scan reads files that can live on a WSL share,
+        # and reaching one may wake a stopped distro; the stdin reader must
+        # stay responsive while that happens.
+        threading.Thread(target=ai_cred_scan, daemon=True).start()
+    elif name == "ai_cred_import":
+        prov = cmd.get("provider")
+        loc = cmd.get("path")
+        lab = cmd.get("label")
+        threading.Thread(
+            target=ai_cred_import, daemon=True,
+            args=(prov if isinstance(prov, str) else "",
+                  loc if isinstance(loc, str) else None,
+                  lab if isinstance(lab, str) else None)).start()
+    elif name == "ai_windsurf_cached":
+        threading.Thread(target=ai_windsurf_cached, daemon=True).start()
     elif name == "open_log":
         core.ourl(core.LOG_FILE)
     elif name == "quit":
         _STOP.set()
+    else:
+        # Silence here used to mean a UI that had sent a command this build
+        # does not implement sat waiting forever for a reply that was never
+        # going to come. Saying so costs one line and makes the mismatch
+        # visible the first time it happens.
+        emit("error", where="stdin",
+             err="unknown command: %s" % (name or "(missing)"))
 
 
 def stdin_loop():
@@ -602,7 +1707,7 @@ def stdin_loop():
 def main():
     emit("hello", pid=os.getpid(), refresh=core.REFRESH)
     ai_cache_emit()
-    for target in (net_loop, hw_loop, ai_loop, tz_once, net_adopt):
+    for target in (net_loop, hw_loop, ai_loop, tz_once, net_adopt, ai_migrate):
         threading.Thread(target=target, daemon=True).start()
     threading.Thread(target=stdin_loop, daemon=True).start()
     emit("ready")

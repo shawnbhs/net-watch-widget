@@ -130,8 +130,13 @@ function createWindow() {
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) =>
     console.error('[load failed]', code, desc, url))
-  win.webContents.on('console-message', (_e, _lvl, msg) =>
-    console.error('[renderer]', msg))
+  // Electron 37 replaced this event's `(event, level, message, line, source)`
+  // arguments with a single ConsoleMessageEvent carrying `.message`. Read
+  // positionally and every renderer log -- including an uncaught error, which
+  // is the one that matters -- arrives here as the literal word `undefined`.
+  // Both shapes are accepted so the log survives an Electron downgrade too.
+  win.webContents.on('console-message', (e, _lvl, msg) =>
+    console.error('[renderer]', msg ?? e?.message ?? e))
 
   // Diagnostic: dump the rendered page so a layout problem can be told apart
   // from a compositing one. The page is transparent and its text is white, so

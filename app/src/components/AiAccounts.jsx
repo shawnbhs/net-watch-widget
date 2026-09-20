@@ -386,15 +386,36 @@ function classify(account, planned) {
 
 /* ── small formatters ──────────────────────────────────────────────────────── */
 
-/** A reset marker, however the backend phrased it: a string, or epoch seconds. */
+/**
+ * A reset marker, however the backend phrased it, as time remaining.
+ *
+ * The sidecar already converts these (see `_usage_relative`), so in practice
+ * this passes a ready-made `2h 27m` straight through. It converts anyway
+ * because a provider adapter can be added without touching the sidecar, and
+ * the failure is silent and ugly: an unconverted marker renders as
+ * `resets 2026-09-20T13:00:00Z`, and a wall-clock time is barely better --
+ * the question a quota row answers is how long is left, not when.
+ *
+ * Anything that is neither epoch seconds nor an ISO instant is left alone;
+ * some adapters answer with a phrase, and mangling one would lose it.
+ */
 function resetLabel(v) {
   if (v == null || v === '') return ''
-  if (typeof v === 'number' || /^\d{9,}$/.test(String(v))) {
-    const d = new Date(Number(v) * 1000)
-    if (Number.isNaN(d.getTime())) return String(v)
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  }
-  return String(v)
+  const s = String(v)
+  let ms = null
+  if (typeof v === 'number' || /^\d{9,}$/.test(s)) ms = Number(v) * 1000
+  else if (!Number.isNaN(Date.parse(s))) ms = Date.parse(s)
+  if (ms == null || Number.isNaN(ms)) return s
+
+  const left = ms - Date.now()
+  if (left <= 0) return 'now'
+  const mins = Math.floor(left / 60000)
+  const d = Math.floor(mins / 1440)
+  const h = Math.floor((mins % 1440) / 60)
+  const m = mins % 60
+  if (d) return `${d}d ${h}h`
+  if (h) return `${h}h ${m}m`
+  return `${m}m`
 }
 
 /** How long this account's stored credential has left, when that is known. */

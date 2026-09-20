@@ -3523,6 +3523,34 @@ def _vault_store_cred(aid, cred):
     return ok
 
 
+def _usage_relative(usage):
+    """Turn every reset marker in a usage block into a compact duration.
+
+    The single-account path has always done this in `_ai_payload`, so the card
+    read `resets 2h 27m`. The accounts array forwarded whatever the provider
+    returned instead, and providers answer with an ISO instant as often as with
+    epoch seconds, so the same row started reading `resets 2026-09-20T...`. A
+    date is the one thing a quota line does not want: the question is how long
+    is left, not when the clock strikes.
+
+    A value `_until` cannot parse is kept as it was. Some adapters already
+    answer with a phrase, and blanking those would lose information rather
+    than reformat it.
+    """
+    if not isinstance(usage, dict):
+        return usage
+    out = dict(usage)
+    for k, v in usage.items():
+        if not (k.endswith("_reset") or k.endswith("_reset_ts")):
+            continue
+        if v in (None, ""):
+            continue
+        rel = _until(v)
+        if rel:
+            out[k] = rel
+    return out
+
+
 def _acct_row(acct, cred, status, usage=None, error=None, needs_login=False):
     """One entry of the `accounts` array the renderer reads.
 
@@ -3542,7 +3570,7 @@ def _acct_row(acct, cred, status, usage=None, error=None, needs_login=False):
         "provider": pid,
         "label": acct.get("label") or pid,
         "status": status,
-        "usage": usage if usage else None,
+        "usage": _usage_relative(usage) if usage else None,
         "error": error or None,
         "expires_at": int(exp) if exp else None,
         "needs_login": bool(needs_login),

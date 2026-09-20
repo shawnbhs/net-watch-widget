@@ -310,8 +310,11 @@ function createOverlay() {
   overlay.webContents.on('did-finish-load', () => {
     if (pending) overlay.webContents.send('pets', pending)
   })
-  overlay.webContents.on('console-message', (_e, _lvl, msg) =>
-    console.error('[overlay]', msg))
+  // See the note on the widget's own console-message handler: Electron 37
+  // changed this to a single event object, so the positional read printed
+  // `undefined` for every line the overlay logged.
+  overlay.webContents.on('console-message', (e, _lvl, msg) =>
+    console.error('[overlay]', msg ?? e?.message ?? e))
   overlay.on('closed', () => { overlay = null; ignoring = null })
   watchDisplays()
 }

@@ -464,7 +464,12 @@ function statusChip(account, planned, fault) {
   if (planned) return { text: 'planned', tone: 'text-faint' }
   if (fault?.kind === 'expired') return { text: 'sign in', tone: 'text-warn' }
   if (fault?.kind === 'offline') return { text: 'offline', tone: 'text-muted' }
-  if (fault) return { text: fault.short, tone: 'text-bad' }
+  // A short word, like every other branch here. `fault.short` is only short
+  // by comparison with `fault.full` -- `refresh failed · 429` is twenty
+  // characters, and in a 118px roster column that is most of the row. The
+  // reason belongs in the title and in the detail pane, both of which carry
+  // `fault.full`; the roster only has to say that something is wrong.
+  if (fault) return { text: 'failed', tone: 'text-bad' }
   if (account?.held) return { text: 'stale', tone: 'text-muted' }
   return { text: 'ok', tone: 'text-good' }
 }
@@ -672,11 +677,17 @@ function AccountRow({ account, providers, selected, onSelect, busy }) {
           is not. It is muted for a provider with no endpoint, so the row still
           admits what it is. */}
       <ProviderIcon id={account.provider} size={12} muted={planned} className="mt-[1px]" />
+      {/* Both lines truncate rather than wrap. `break-words` here was breaking
+          inside words, which is only ever reached when a line has almost no
+          width left -- and then it does not wrap, it shatters: `OpenAI Codex /
+          ChatGPT` came out as eight lines of one or two characters, eight rows
+          tall, which dragged the whole widget from 877px to 1183px. The full
+          text is on the row's `title`, so an ellipsis costs nothing. */}
       <span className="min-w-0 flex-1">
-        <span className="glass-text block break-words text-[10px] leading-snug text-ink-2">
+        <span className="glass-text block truncate text-[10px] leading-snug text-ink-2">
           {account.label || name}
         </span>
-        <span className="glass-text block break-words text-[9px] leading-snug text-faint">
+        <span className="glass-text block truncate text-[9px] leading-snug text-faint">
           {name}
         </span>
       </span>
@@ -686,7 +697,15 @@ function AccountRow({ account, providers, selected, onSelect, busy }) {
            command is in flight the old status is stale anyway. */
         <Busy className="mt-[1px]" />
       ) : (
-        <span className={'glass-text shrink-0 text-right text-[9px] leading-snug ' + chip.tone}>
+        /* Shrinkable, not `shrink-0`. `fault.short` is not always short --
+           `refresh failed · 429` is twenty characters -- and an unshrinkable
+           chip of that width in a 118px column leaves the name nothing to
+           live in. The name is what identifies the row, so it wins the space
+           and the chip gives way; the full reason is in the row's title. */
+        <span
+          className={'glass-text min-w-0 max-w-[52px] shrink truncate text-right '
+            + 'text-[9px] leading-snug ' + chip.tone}
+        >
           {chip.text}
         </span>
       )}

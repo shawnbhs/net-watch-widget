@@ -38,6 +38,8 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'assets', '
 #        'visor'  wraparound band, lit edge to edge
 #        'hood'   raised hood, the face sunk in shadow inside it
 #        'domino' small mask, face shows
+#        'lenses' full mask, two big pale lenses tapering outwards
+#        'eared'  cowl with two pointed ears, jaw left bare below it
 #        'none'   bare face
 #
 # The roster is picked for spread rather than for taste: each entry differs
@@ -109,6 +111,45 @@ HEROES = [
         'id': 'vermeil', 'suit': (198, 46, 120), 'trim': (255, 214, 140),
         'skin': None, 'cape': (168, 36, 102), 'emblem': (255, 236, 200),
         'mask': 'visor', 'build': 'normal', 'eye': (255, 230, 250),
+    },
+    {
+        # Cowled and caped, in pink. Slim rather than normal on purpose: the
+        # roster rule above wants two differences from every other entry, and
+        # midnight already holds cowl+normal while onyx holds cowl+bulky, so
+        # pink alone would not have been enough to tell this one apart.
+        'id': 'rose', 'suit': (196, 74, 140), 'trim': (247, 168, 214),
+        'skin': None, 'cape': (148, 44, 102), 'emblem': (255, 226, 244),
+        'mask': 'cowl', 'build': 'slim', 'eye': (255, 255, 255),
+    },
+    {
+        # Powered armour: red plate, gold faceplate, a lit core in the chest.
+        # Bulky and visored -- solar and vermeil already hold visor+normal,
+        # and crimson holds the red/gold palette with a helmet, so this needs
+        # both the heaviest build and the full-width faceplate to be its own
+        # figure rather than a recolour of one.
+        'id': 'crucible', 'suit': (198, 46, 42), 'trim': (248, 190, 60),
+        'skin': None, 'cape': None, 'emblem': (206, 250, 255),
+        'mask': 'visor', 'build': 'bulky', 'eye': (226, 252, 255),
+    },
+    {
+        # The acrobat: red over blue, full mask, big pale lenses. Slim because
+        # the whole read is agility -- in a bulky build the lenses turn the
+        # head into a headlamp and the figure stops looking quick.
+        'id': 'cinnabar', 'suit': (206, 54, 50), 'trim': (56, 92, 178),
+        'skin': None, 'cape': None, 'emblem': (232, 238, 250),
+        'mask': 'lenses', 'build': 'slim', 'eye': (250, 252, 255),
+    },
+    {
+        # The night vigilante: grey plate, black cowl and cape, a bright belt
+        # and no emblem at all. Slate rather than black for the body, for the
+        # reason onyx records -- at a true near-black the cape and the suit
+        # are one shape and the figure has no silhouette inside its own
+        # shadow. The belt is the only bright thing on it, which is what the
+        # separate `belt` slot exists for: the boots stay dark.
+        'id': 'nocturne', 'suit': (92, 96, 108), 'trim': (44, 46, 58),
+        'skin': (226, 186, 150), 'cape': (28, 30, 40), 'emblem': None,
+        'belt': (232, 200, 74),
+        'mask': 'eared', 'build': 'bulky', 'eye': (238, 242, 250),
     },
 ]
 
@@ -199,12 +240,15 @@ def draw_hero(hero, pose):
     rect(d, cx - half_t, torso_t, cx + half_t, torso_b, suit)
     rect(d, cx - half_t, torso_t, cx - half_t + 1, torso_b, shade(suit, 1.2))
     rect(d, cx + half_t - 1, torso_t, cx + half_t, torso_b, shade(suit, 0.82))
-    # belt
-    rect(d, cx - half_t, torso_b - 2, cx + half_t, torso_b, trim)
-    # emblem
-    ey = torso_t + 3
-    rect(d, cx - 1, ey, cx + 1, ey + 2, hero['emblem'])
-    d.point((cx, ey - 1), fill=hero['emblem'])
+    # Belt. Its own colour when one is given, because the belt and the boots
+    # are the same slot otherwise, and a figure wanting a bright belt over
+    # dark boots could not say so.
+    rect(d, cx - half_t, torso_b - 2, cx + half_t, torso_b, hero.get('belt') or trim)
+    # Emblem, unless the character is defined by not having one.
+    if hero['emblem']:
+        ey = torso_t + 3
+        rect(d, cx - 1, ey, cx + 1, ey + 2, hero['emblem'])
+        d.point((cx, ey - 1), fill=hero['emblem'])
 
     # ---- arms ----
     punch = pose.get('punch', 0)
@@ -263,6 +307,64 @@ def draw_hero(hero, pose):
         rect(d, cx - hw + 1, head_t + 3, cx + hw - 1, head_b - 1, shade(skin, 0.42))
         rect(d, cx - hw + 2, head_t + 4, cx - 1, head_t + 5, hero['eye'])
         rect(d, cx + 1, head_t + 4, cx + hw - 2, head_t + 5, hero['eye'])
+    elif mask == 'eared':
+        # A cowl that stops at the cheekbones with two ears standing off it.
+        # The bare jaw is doing as much work as the ears: a full-face cowl in
+        # this palette is a dark oval, and the strip of skin under it is what
+        # makes the top half read as a mask worn over a face rather than as
+        # the whole head.
+        # The ears are carved out of the head's own height, not added on top
+        # of it. There is nothing on top: at this build the skull already
+        # starts two pixels below the top of a 36px canvas, so ears drawn
+        # above it were simply clipped off and came out as two faint nubs.
+        # The skull is dropped instead and the freed space becomes the ears,
+        # which is the only way to get a real pair inside the frame.
+        jaw_top = head_b - 3
+        skull_top = jaw_top - 5
+        ear_apex = max(0, skull_top - 6)
+
+        # The rig lays down a full head in `skin` before this switch runs, and
+        # this mask does not cover all of it -- the dropped skull leaves the
+        # top of that fill showing as a band of bare forehead above the eyes.
+        # Clear it back to nothing so only the ears break the outline. Safe to
+        # erase: the cape starts at the shoulders, below the whole head.
+        d.rectangle([cx - hw, head_t, cx + hw, skull_top - 1], fill=(0, 0, 0, 0))
+
+        # Tall and thin, hard against the outer edges, with a wide flat gap
+        # between them: the gap is as much of the shape as the ears are.
+        for sx in (-1, 1):
+            inner = cx + sx * (hw - 3)
+            outer = cx + sx * hw
+            apex = cx + sx * (hw - 1)
+            d.polygon([(inner, skull_top + 1), (apex, ear_apex), (outer, skull_top + 1)],
+                      fill=trim)
+
+        rect(d, cx - hw, skull_top, cx + hw, jaw_top, trim)
+        rect(d, cx - hw, skull_top, cx + hw, skull_top, shade(trim, 1.2))
+        # The jaw, inset either side so it is a chin and not a stripe across
+        # the whole head.
+        rect(d, cx - hw + 2, jaw_top, cx + hw - 2, head_b, skin)
+        rect(d, cx - hw + 1, skull_top + 2, cx - 1, skull_top + 3, hero['eye'])
+        rect(d, cx + 1, skull_top + 2, cx + hw - 1, skull_top + 3, hero['eye'])
+        rect(d, cx - 2, head_b - 1, cx + 2, head_b - 1, shade(skin, 0.74))
+
+    elif mask == 'lenses':
+        # Two big pale lenses over a full mask. They taper outwards -- tall at
+        # the nose, shallow at the temple -- which is what keeps them reading
+        # as a pair of lenses instead of as one visor band with a notch in it,
+        # and the notch is the only thing separating them at this size.
+        rect(d, cx - hw, head_t, cx + hw, head_b, suit)
+        rect(d, cx - hw, head_t, cx + hw, head_t + 1, shade(suit, 1.18))
+        for sx in (-1, 1):
+            inner = cx + sx
+            outer = cx + sx * (hw - 1)
+            rect(d, inner, head_t + 3, outer, head_t + 5, hero['eye'])
+            # shave the outer top corner so the lens leans back
+            rect(d, outer, head_t + 3, outer, head_t + 3, suit)
+            # a dark rim under each lens, or they float
+            rect(d, inner, head_t + 6, outer, head_t + 6, shade(suit, 0.6))
+        rect(d, cx, head_t + 3, cx, head_t + 6, shade(suit, 0.6))
+
     elif mask == 'domino':
         d.rectangle([cx - hw, head_t, cx + hw, head_t + 3], fill=shade(skin, 0.72))   # hair
         d.rectangle([cx - hw, head_t + 3, cx + hw, head_t + 6], fill=trim)            # band

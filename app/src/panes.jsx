@@ -370,18 +370,32 @@ export function PaneProvider({ children }) {
    * Watch the measured card rectangles. Returns an unsubscribe.
    *
    * A subscriber that attaches while there is a batch worth having gets it at
-   * once, so a pet layer mounting between passes has ground to stand on. It
-   * gets nothing if the pass is stopped and the layout has moved since, because
-   * the alternative is building that ground out of rectangles known to be out
-   * of date; a subscriber that is handed nothing keeps whatever it already had,
-   * which for the pets means the cards they were last told about -- still on
-   * screen, still painted, just no longer frosted.
+   * once, so a pet layer mounting between passes has ground to stand on. If the
+   * batch on hand is stale or there is none, it gets a fresh measurement rather
+   * than nothing -- see below for why nothing was the wrong answer.
    */
   const watch = useCallback((fn) => {
     subs.current.add(fn)
-    if (current.current && rects.current.length) fn(rects.current)
+    // Nothing worth replaying, so measure once for this subscriber.
+    //
+    // The old reading -- hand it nothing, it keeps what it had -- holds for a
+    // subscriber that has been running. It is empty for one that has just
+    // mounted, and for the pets "no ground" is not "keep what you had", it is
+    // falling through the widget forever. That is not a corner: the frost pass
+    // is stood down for as long as the widget is drawn too small to frost, and
+    // `schedule` marks the batch stale on the way past, so every pet layer that
+    // mounts at that size mounts into it.
+    //
+    // A measurement is a forced layout flush and this is one of them, on
+    // subscribe, not one per frame. The cards are on screen and measurable
+    // whether or not anything is frosting them.
+    if (!current.current || !rects.current.length) {
+      rects.current = measure()
+      current.current = rects.current.length > 0
+    }
+    if (rects.current.length) fn(rects.current)
     return () => subs.current.delete(fn)
-  }, [])
+  }, [measure])
 
   return (
     <PaneCtx.Provider value={{

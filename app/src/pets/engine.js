@@ -136,6 +136,8 @@ export class Pet {
 
     this.target = null      // roam destination
     this.hopCooldown = 0    // stops two pets ping-ponging leaps
+    this.cameFrom = null    // the card it hopped off, so it does not bounce back
+    this.hopRest = 0        // seconds it owes the card it just landed on
     this.danceT = 0         // beat clock, only ticks while dancing
     this.vxNow = 0          // signed speed this frame, for meetings
 
@@ -267,6 +269,7 @@ export class Pet {
   moveTo(platform, keepX) {
     if (!platform) return
     this.platformId = platform.id
+    this.cameFrom = null
     if (!keepX) this.x = rand(platform.x1 + this.w, platform.x2 - this.w)
     this.snap()
     this.state = 'land'
@@ -275,7 +278,7 @@ export class Pet {
   }
 
   /**
-   * The card one level up (-1) or down (+1), or null.
+   * The cards on the nearest level up (-1) or down (+1), nearest in x first.
    *
    * Levels, not list positions. Cards sit two to a row -- ip beside rf, lan
    * beside ping, hw beside tz -- so in a list sorted by y the entry next to
@@ -285,25 +288,58 @@ export class Pet {
    * row are each other's neighbour, so a pet could hop ip->rf->ip->rf without
    * ever leaving the row. That is the loop this used to fall into.
    *
-   * Among the cards that do sit at the nearest other level, the one nearest
-   * in x wins, so the hop stays as vertical as the layout allows.
+   * The list is ordered by how far each card is from the pet in x, so taking
+   * the head of it keeps a hop as vertical as the layout allows, and the tail
+   * is there for `pickHopTarget` when straight up or straight down is the card
+   * the pet has just come from.
    */
-  levelStep(delta) {
+  levelCards(delta) {
     const here = this.platform
-    if (!here) return null
+    if (!here) return []
     const roomy = (p) => p.x2 - p.x1 > this.w * 1.5
     const side = this.world.platforms.filter((p) => (
       roomy(p) && (delta < 0 ? p.y < here.y - LEVEL_EPS : p.y > here.y + LEVEL_EPS)
     ))
-    if (!side.length) return null
-    // The nearest level in that direction, then the closest card on it.
+    if (!side.length) return []
+    // The nearest level in that direction, then every card sitting on it.
     const level = side.reduce((best, p) => (
       Math.abs(p.y - here.y) < Math.abs(best.y - here.y) ? p : best
     )).y
-    const row = side.filter((p) => Math.abs(p.y - level) <= LEVEL_EPS)
-    return row.reduce((best, p) => (
-      Math.abs(p.x1 + p.x2 - 2 * this.x) < Math.abs(best.x1 + best.x2 - 2 * this.x) ? p : best
-    ))
+    const off = (p) => Math.abs(p.x1 + p.x2 - 2 * this.x)
+    return side
+      .filter((p) => Math.abs(p.y - level) <= LEVEL_EPS)
+      .sort((a, b) => off(a) - off(b))
+  }
+
+  /** The card one level up (-1) or down (+1), or null. */
+  levelStep(delta) {
+    return this.levelCards(delta)[0] || null
+  }
+
+  /**
+   * The other cards on the pet's own level, nearest in x first.
+   *
+   * Hopping sideways is not a level change, and a pet that does it by accident
+   * bounces along a row -- that is the bug `levelCards` exists to prevent, and
+   * nothing here reopens it: the card just left is excluded, and with cards two
+   * to a row that leaves no sideways move at all on the hop after this one.
+   *
+   * What it buys is a way out of a dead end. On a two-level layout -- three
+   * rows of cards, since the topmost is not ground -- "never go back where you
+   * came from" leaves exactly one legal card at every step, and four cards in
+   * a fixed order is a loop however honestly each hop was chosen.
+   */
+  rowCards() {
+    const here = this.platform
+    if (!here) return []
+    const off = (p) => Math.abs(p.x1 + p.x2 - 2 * this.x)
+    return this.world.platforms
+      .filter((p) => (
+        p.id !== here.id
+        && p.x2 - p.x1 > this.w * 1.5
+        && Math.abs(p.y - here.y) <= LEVEL_EPS
+      ))
+      .sort((a, b) => off(a) - off(b))
   }
 
   /** Move one platform up (-1) or down (+1) in visual order. */
@@ -427,6 +463,11 @@ export class Pet {
   hopToPlatform(p) {
     const landing = clamp(this.x, p.x1 + this.w * 0.5, p.x2 - this.w * 0.5)
     const dy = Math.abs(p.y - this.y)
+    this.cameFrom = this.platformId
+    // Owed to the card it is aiming at: a pet that may hop the instant it lands
+    // bounces between two cards several times a second, which is the same loop
+    // read at speed. Long enough to walk a little of the new card first.
+    this.hopRest = rand(2.4, 4.2)
     this.hopToId = p.id
     this.hopTo(landing, p.y, Math.min(90, dy * 0.5 + this.h * 0.7))
   }
@@ -561,16 +602,64 @@ export class Pet {
     return this.world.opts.dance && !this.world.opts.calm
   }
 
-  /** A card to hop to: one step up or down, and only if it is wide enough. */
+  /**
+   * A card to hop to: one level up or down, and only if it is wide enough.
+   *
+   * Straight up and straight down are the first choices, because a vertical
+   * leap is the one that reads as a level change. What stops that being a
+   * two-card bounce is that the card the pet just left is taken out of the
+   * running: with three levels it simply carries on in the direction it was
+   * going, and with two it falls through to the card *diagonally* across. That
+   * is still a level change, and it walks the pet around the layout instead of
+   * back and forth over its own footprints.
+   *
+   * Excluding one card is not enough on its own, though. A four-card layout
+   * then has exactly one legal target at every step, which is a fixed circuit
+   * -- so a fifth of the time the pet takes the card beside it instead (see
+   * `rowCards`), and the circuit stops being predictable.
+   *
+   * Only when the card it came from is genuinely the sole place to stand does
+   * it go back there.
+   */
   pickHopTarget() {
-    const candidates = [this.levelStep(-1), this.levelStep(1)].filter(Boolean)
-    return candidates.length ? pick(candidates) : null
+    const up = this.levelCards(-1)
+    const down = this.levelCards(1)
+    // Sideways is a garnish on a repertoire of level changes, never a
+    // repertoire of its own: with no level to change to, a pet has only the
+    // card beside it and the one it came from, and alternating between two
+    // cards forever is the loop itself. On a layout like that it stays put.
+    if (!up.length && !down.length) return null
+
+    const notBack = (p) => p.id !== this.cameFrom
+    const straight = [up[0], down[0]].filter(Boolean)
+    const fresh = straight.filter(notBack)
+    const diagonal = [...up.slice(1), ...down.slice(1)].filter(notBack)
+    const beside = this.rowCards().filter(notBack)
+
+    // A level change is the point of hopping, so it wins most of the time.
+    if (beside.length && Math.random() < 0.22) return pick(beside)
+    if (fresh.length) {
+      if (diagonal.length && Math.random() < 0.3) return pick(diagonal)
+      return pick(fresh)
+    }
+    if (diagonal.length) return pick(diagonal)
+    if (beside.length) return pick(beside)
+    // Nothing anywhere but the card it came from: going back beats being stuck.
+    return straight.length ? pick(straight) : null
   }
 
   decide() {
     if (this.mode === 'free') {
       this.state = 'roam'
       this.target = null
+      return
+    }
+    // No cards at all: nothing to walk along and nowhere to hop to, so it
+    // waits rather than stepping off into a fall it cannot land from.
+    if (!this.world.platforms.length) {
+      this.state = 'idle'
+      this.timer = rand(0.5, 1.5)
+      this.setClip('idle')
       return
     }
     const live = this.world.opts.liveliness / 100        // 0 lazy .. 1 hyper
@@ -581,7 +670,9 @@ export class Pet {
     // Hopping between cards is what makes a widget pet read as living in the
     // widget rather than on one card of it, so it is weighted like a first-class
     // activity rather than as a rare flourish.
-    const hopWeight = this.world.platforms.length > 1 ? 0.10 + live * 0.16 : 0
+    const hopWeight = this.world.platforms.length > 1 && this.hopRest <= 0
+      ? 0.10 + live * 0.16
+      : 0
 
     let cut = restWeight
     if (roll < cut) {
@@ -635,6 +726,7 @@ export class Pet {
   update(dt) {
     this.vxNow = 0
     if (this.hopCooldown > 0) this.hopCooldown -= dt
+    if (this.hopRest > 0) this.hopRest -= dt
 
     switch (this.state) {
       case 'held':
@@ -658,6 +750,7 @@ export class Pet {
         const p = this.world.landingBelow(this.x, prevY)
         if (p && this.y >= p.y) {
           this.platformId = p.id
+          this.cameFrom = null
           this.y = p.y
           this.vy = 0
           this.vx = 0
@@ -668,13 +761,28 @@ export class Pet {
           break
         }
 
-        // Fell past everything: put it back on the lowest card. With no cards
-        // at all -- a layout mid-swap -- it is dropped in again from the top
-        // rather than left to accelerate off the bottom of the world forever.
+        // Fell past everything. With a card to land on it goes back to the
+        // lowest one; with no cards at all it waits at the foot of the widget.
+        //
+        // It used to be dropped in again from the top instead, which is fine
+        // for the case that was in mind -- a layout mid-swap, cards back within
+        // a frame -- and a visible infinite loop for the case that was not.
+        // The widget drawn small enough to stand the frost pass down reports no
+        // card geometry at all, for as long as it stays that size, so there was
+        // never a card to land on and the pet fell through the widget from the
+        // top over and over. Waiting costs nothing: `setPlatforms` puts it back
+        // in the air the moment there is ground to aim at.
         if (this.y > this.world.h + 120) {
           const ground = this.world.lowest()
-          if (ground) this.moveTo(ground, false)
-          else { this.y = -20; this.vy = 0 }
+          if (ground) { this.moveTo(ground, false); break }
+          this.x = clamp(this.x, this.w, Math.max(this.w, this.world.w - this.w))
+          this.y = this.world.h - 8
+          this.vy = 0
+          this.vx = 0
+          this.platformId = null
+          this.state = 'idle'
+          this.timer = rand(0.6, 1.4)
+          this.setClip('idle')
         }
         break
       }
@@ -829,7 +937,21 @@ export class Pet {
       case 'run': {
         if (this.mode === 'free') { this.state = 'roam'; this.target = null; break }
         const p = this.platform
-        if (!p) { this.state = 'air'; this.vy = 0; this.setClip('air'); break }
+        // Walked off a card that has gone. Falling is right when there is
+        // something below to land on, and is the fall loop again when there is
+        // not.
+        if (!p) {
+          if (this.world.platforms.length) {
+            this.state = 'air'
+            this.vy = 0
+            this.setClip('air')
+          } else {
+            this.state = 'idle'
+            this.timer = rand(0.6, 1.4)
+            this.setClip('idle')
+          }
+          break
+        }
         const pace = this.speedPx() * (this.state === 'run' ? 2.6 : 1)
 
         this.vxNow = this.dir * pace
@@ -1091,7 +1213,7 @@ export class World {
       if (pet.mode !== 'platform') continue
       if (pet.platformId && ids.has(pet.platformId)) {
         if (pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') pet.snap()
-      } else if (pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') {
+      } else if (list.length && pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') {
         pet.platformId = null
         pet.state = 'air'
         pet.vy = 0

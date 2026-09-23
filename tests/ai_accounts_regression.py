@@ -692,6 +692,382 @@ def t19_vault_path_still_sandboxed():
 
 
 # ===========================================================================
+# durable deletion -- the tombstone lifecycle
+# ===========================================================================
+# Why this needs its own block rather than folding into t05/t16: remove_account()
+# returning True and dropping the row is not the property the user cares about.
+# What he reported is that an account he deleted comes back on its own, so the
+# property under test is "deleted stays deleted across the next CLI import, and
+# across the vault document itself being wiped". That is a lifecycle, and it
+# needs the CLI-import fixture rather than a bare vault.
+#
+# Every test here runs against the sandbox vault (AI_ACCOUNTS_FILE, set at the
+# top of this file before aiaccounts was imported) and tears down BOTH the vault
+# and its sibling tombstone file. A leaked .forgotten is the one failure mode
+# that would make a later test pass for the wrong reason: it would still be
+# blocking an import the next test believes it un-blocked.
+
+TOMBSTONE_API = ("forget_account", "is_tombstoned", "list_forgotten",
+                 "allow_reimport")
+
+
+def tombstone_file():
+    """The sibling tombstone path, recomputed from the sandbox vault path.
+
+    Deliberately derived here instead of asked of the module: if the store ever
+    moves (back into the vault document, or somewhere outside the sandbox) these
+    tests must notice rather than follow it there.
+    """
+    return VAULT + ".forgotten"
+
+
+def missing_tombstone_api():
+    if aiaccounts is None:
+        return list(TOMBSTONE_API)
+    return [a for a in TOMBSTONE_API if not hasattr(aiaccounts, a)]
+
+
+def require_tombstone_api():
+    """Absence of the durable-delete API is a FAIL, not a SKIP.
+
+    The rest of this harness skips what is not built yet. This one does not:
+    these functions exist because "delete" did not stick, so a build without
+    them is a build with the original bug, and reporting that as "skipped"
+    would hide exactly the regression this block is here to catch.
+    """
+    missing = missing_tombstone_api()
+    if missing:
+        return "durable-delete API missing from aiaccounts: %s" % (
+            ", ".join(missing),)
+    return None
+
+
+def reset_vault_and_tombstones():
+    """Teardown: the vault AND the sibling tombstone file, proven empty."""
+    reset_vault()
+    leftovers = sorted(os.listdir(os.path.dirname(VAULT)))
+    if leftovers:
+        raise AssertionError("sandbox vault dir not clean: %r" % (leftovers,))
+    if os.path.exists(tombstone_file()):
+        raise AssertionError("tombstone file survived teardown")
+
+
+_READ_GUARD_ARMED = []
+
+
+def cli_sandbox():
+    """Arm the CLI-import sandbox, or Skip if it cannot be trusted.
+
+    Same gate t16 uses: without the redirected home and the read guard, an
+    import walk would stat the user's real credential files.
+    """
+    if not inside_tmp(os.path.expanduser("~")):
+        raise Skip("expanduser('~') did not redirect into the sandbox; "
+                   "refusing to run an import that could read real "
+                   "credential files")
+    if not _READ_GUARD_ARMED:
+        if not install_read_guard():
+            raise Skip("could not install the credential read guard")
+        _READ_GUARD_ARMED.append(True)
+    disable_wsl_walk()
+
+
+def write_cli_creds(claude=None, codex=None):
+    """Lay fake CLI credential files inside the sandbox; return their paths.
+
+    Passing None for a provider removes that file, so a test can narrow the
+    import to one provider. The env vars are pointed at the sandbox paths on
+    every call, because a previous test may have left them elsewhere.
+    """
+    cdir = os.path.join(FAKE_HOME, ".claude")
+    xdir = os.path.join(FAKE_HOME, ".codex")
+    os.makedirs(cdir, exist_ok=True)
+    os.makedirs(xdir, exist_ok=True)
+    cpath = os.path.join(cdir, ".credentials.json")
+    xpath = os.path.join(xdir, "auth.json")
+    for path, cred in ((cpath, claude), (xpath, codex)):
+        if cred is None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cred, f)
+    os.environ["CLAUDE_CRED_PATHS"] = cpath
+    os.environ["CODEX_CRED_PATHS"] = xpath
+    return cpath, xpath
+
+
+def first_of(rows, provider):
+    for a in rows or []:
+        if a.get("provider") == provider:
+            return a
+    return None
+
+
+def t20_forget_blocks_reimport():
+    """Remove -> a tombstone exists -> import_from_cli() does not undo it."""
+    need(aiaccounts, "add_account", "import_from_cli", "list_accounts")
+    bad = require_tombstone_api()
+    if bad:
+        return False, bad
+    cli_sandbox()
+    reset_vault_and_tombstones()
+    try:
+        cpath, _ = write_cli_creds(
+            claude=claude_cred(expires_at_s=time.time() + 3600),
+            codex=codex_cred(account_id="acct-fake-0001"))
+        first = aiaccounts.import_from_cli()
+        row = first_of(first, "claude")
+        if row is None:
+            return False, "fixture failed: import produced no claude account"
+        forgot = aiaccounts.forget_account(row["id"])
+        stones = aiaccounts.list_forgotten()
+        on_disk = os.path.exists(tombstone_file())
+        again = aiaccounts.import_from_cli()
+        rows = aiaccounts.list_accounts()
+        # codex is the positive control: it must still be there, which proves
+        # the second import really ran and was capable of adding rows.
+        ok = (forgot is True
+              and len(stones) == 1
+              and stones[0].get("provider") == "claude"
+              and on_disk
+              and first_of(again, "claude") is None
+              and first_of(rows, "claude") is None
+              and first_of(rows, "codex") is not None)
+        return ok, ("forget=%r, tombstones=%d, sibling file on disk=%r, "
+                    "claude re-imported=%r, providers left=%r"
+                    % (forgot, len(stones), on_disk,
+                       first_of(again, "claude") is not None,
+                       sorted(a.get("provider") for a in rows)))
+    finally:
+        reset_vault_and_tombstones()
+
+
+def t21_tombstone_survives_vault_wipe():
+    """The scenario the sibling-file storage exists for.
+
+    An uninstall/reinstall, a corrupted-vault recovery, or a user deleting
+    accounts.json to "reset" the widget all destroy the vault document. A
+    tombstone kept inside that document would die with it and silently
+    un-delete every account the user ever removed -- the same bug, one level
+    up. Wiping the vault here is the whole point of the test, not incidental
+    setup.
+    """
+    need(aiaccounts, "import_from_cli", "list_accounts", "load")
+    bad = require_tombstone_api()
+    if bad:
+        return False, bad
+    cli_sandbox()
+    reset_vault_and_tombstones()
+    try:
+        cpath, _ = write_cli_creds(
+            claude=claude_cred(expires_at_s=time.time() + 3600),
+            codex=codex_cred(account_id="acct-fake-0001"))
+        row = first_of(aiaccounts.import_from_cli(), "claude")
+        if row is None:
+            return False, "fixture failed: import produced no claude account"
+        if not aiaccounts.forget_account(row["id"]):
+            return False, "forget_account() reported failure"
+
+        os.remove(VAULT)
+        wiped = (aiaccounts.load().get("accounts") == [])
+        survived = os.path.exists(tombstone_file())
+
+        again = aiaccounts.import_from_cli()
+        rows = aiaccounts.list_accounts()
+        # codex coming back from an empty vault is the positive control: the
+        # import genuinely re-populated the wiped vault, so claude's absence
+        # is a decision, not an import that did nothing.
+        ok = (wiped and survived
+              and first_of(again, "claude") is None
+              and first_of(rows, "claude") is None
+              and first_of(rows, "codex") is not None)
+        return ok, ("vault wiped=%r, tombstone survived=%r, "
+                    "claude back=%r, codex re-imported=%r"
+                    % (wiped, survived,
+                       first_of(rows, "claude") is not None,
+                       first_of(rows, "codex") is not None))
+    finally:
+        reset_vault_and_tombstones()
+
+
+def t22_allow_reimport_undoes_the_tombstone():
+    """A mistaken forget is recoverable: after undo, the account comes back."""
+    need(aiaccounts, "import_from_cli", "list_accounts")
+    bad = require_tombstone_api()
+    if bad:
+        return False, bad
+    cli_sandbox()
+    reset_vault_and_tombstones()
+    try:
+        cpath, _ = write_cli_creds(
+            claude=claude_cred(expires_at_s=time.time() + 3600), codex=None)
+        row = first_of(aiaccounts.import_from_cli(), "claude")
+        if row is None:
+            return False, "fixture failed: import produced no claude account"
+        if not aiaccounts.forget_account(row["id"]):
+            return False, "forget_account() reported failure"
+        blocked = first_of(aiaccounts.import_from_cli(), "claude") is None
+
+        cleared = aiaccounts.allow_reimport("claude", cred_path=cpath)
+        left = aiaccounts.list_forgotten()
+        back = aiaccounts.import_from_cli()
+        rows = aiaccounts.list_accounts()
+        ok = (blocked and cleared == 1 and left == []
+              and first_of(back, "claude") is not None
+              and first_of(rows, "claude") is not None)
+        return ok, ("blocked before undo=%r, cleared=%r, tombstones left=%d, "
+                    "re-imported after undo=%r"
+                    % (blocked, cleared, len(left),
+                       first_of(back, "claude") is not None))
+    finally:
+        reset_vault_and_tombstones()
+
+
+def t23_coerce_preserves_allowlisted_top_level_keys():
+    """imported_from_cli must survive save/load; unknown keys must not.
+
+    _coerce() used to return exactly {version, accounts} and drop everything
+    else, so core._mark_migrated()'s stamp was eaten on the very next save and
+    never actually persisted. The fix is an allowlist, so this asserts both
+    halves: the known key sticks, and an arbitrary key still cannot smuggle
+    itself into the vault. Two round trips, because the old bug ate the key on
+    EVERY save -- one cycle would not prove it stays.
+    """
+    need(aiaccounts, "load", "save", "add_account")
+    reset_vault_and_tombstones()
+    try:
+        aiaccounts.add_account("claude", "personal", claude_cred())
+        doc = aiaccounts.load()
+        doc["imported_from_cli"] = True
+        doc["definitely_not_allowlisted"] = {"smuggled": True}
+        wrote = aiaccounts.save(doc)
+
+        back = aiaccounts.load()
+        aiaccounts.save(back)
+        back2 = aiaccounts.load()
+
+        ok = (wrote is not False
+              and back.get("imported_from_cli") is True
+              and back2.get("imported_from_cli") is True
+              and "definitely_not_allowlisted" not in back
+              and "definitely_not_allowlisted" not in back2
+              and len(back2.get("accounts") or []) == 1)
+        return ok, ("imported_from_cli after 1/2 round trips = %r/%r, "
+                    "unknown key dropped=%r, accounts kept=%d"
+                    % (back.get("imported_from_cli"),
+                       back2.get("imported_from_cli"),
+                       "definitely_not_allowlisted" not in back2,
+                       len(back2.get("accounts") or [])))
+    finally:
+        reset_vault_and_tombstones()
+
+
+def t24_fingerprint_drift_still_tombstoned():
+    """A refreshed Claude credential is still recognised as forgotten.
+
+    cred_fingerprint("claude", ...) is subscriptionType + expiresAt, and
+    expiresAt is rewritten on every token issue. A tombstone keyed on that
+    alone goes stale the first time the CLI refreshes, quietly un-blocking a
+    deliberately removed account -- the exact complaint. This is why matching
+    is on cred_path too, and this test is what stops anyone dropping that
+    second key as redundant.
+    """
+    need(aiaccounts, "import_from_cli", "list_accounts", "cred_fingerprint")
+    bad = require_tombstone_api()
+    if bad:
+        return False, bad
+    cli_sandbox()
+    reset_vault_and_tombstones()
+    try:
+        before = claude_cred(expires_at_s=time.time() + 3600)
+        cpath, _ = write_cli_creds(claude=before, codex=None)
+        row = first_of(aiaccounts.import_from_cli(), "claude")
+        if row is None:
+            return False, "fixture failed: import produced no claude account"
+        if not aiaccounts.forget_account(row["id"]):
+            return False, "forget_account() reported failure"
+
+        # Simulate the token refresh: same login, same file, new expiresAt.
+        after = claude_cred(expires_at_s=time.time() + 99999)
+        fp_before = aiaccounts.cred_fingerprint("claude", before)
+        fp_after = aiaccounts.cred_fingerprint("claude", after)
+        drifted = bool(fp_before) and bool(fp_after) and fp_before != fp_after
+        if not drifted:
+            return False, ("fixture failed: fingerprint did not drift across a "
+                           "simulated refresh, so this test proves nothing")
+        write_cli_creds(claude=after, codex=None)
+
+        still = aiaccounts.is_tombstoned("claude", after, cpath)
+        again = aiaccounts.import_from_cli()
+        rows = aiaccounts.list_accounts()
+        ok = (still is True
+              and first_of(again, "claude") is None
+              and first_of(rows, "claude") is None)
+        return ok, ("fingerprint drifted=%r, is_tombstoned after drift=%r, "
+                    "resurrected=%r"
+                    % (drifted, still, first_of(rows, "claude") is not None))
+    finally:
+        reset_vault_and_tombstones()
+
+
+def t25_shared_cred_path_stays_blocked_until_undo():
+    """The false-positive direction, asserted honestly.
+
+    Because cred_path is a match key, a genuinely DIFFERENT login that later
+    occupies the same credential file (an ordinary CLI account switch, not a
+    reinstall) is also blocked. That is a deliberate trade-off, conservative in
+    the user's favour: a false "still forgotten" costs one allow_reimport()
+    call, while the alternative -- trusting the drifting fingerprint alone --
+    fails as a silent resurrection of an account the user deleted.
+
+    This asserts what the code actually does, not what would be nicer. If
+    someone later makes the match narrower, this test should be changed
+    deliberately, with the resurrection risk reconsidered -- not quietly
+    because it started failing.
+    """
+    need(aiaccounts, "import_from_cli", "list_accounts", "cred_fingerprint")
+    bad = require_tombstone_api()
+    if bad:
+        return False, bad
+    cli_sandbox()
+    reset_vault_and_tombstones()
+    try:
+        original = claude_cred(expires_at_s=time.time() + 3600, sub="max")
+        cpath, _ = write_cli_creds(claude=original, codex=None)
+        row = first_of(aiaccounts.import_from_cli(), "claude")
+        if row is None:
+            return False, "fixture failed: import produced no claude account"
+        if not aiaccounts.forget_account(row["id"]):
+            return False, "forget_account() reported failure"
+
+        # A different subscription tier AND a different expiry: by fingerprint
+        # this is unambiguously another account. Only the file path is shared.
+        other = claude_cred(expires_at_s=time.time() + 123456, sub="pro")
+        if (aiaccounts.cred_fingerprint("claude", other)
+                == aiaccounts.cred_fingerprint("claude", original)):
+            return False, ("fixture failed: the 'different' account shares a "
+                           "fingerprint, so path matching is untested")
+        write_cli_creds(claude=other, codex=None)
+
+        blocked = aiaccounts.is_tombstoned("claude", other, cpath)
+        denied = first_of(aiaccounts.import_from_cli(), "claude") is None
+
+        cleared = aiaccounts.allow_reimport("claude", cred_path=cpath)
+        back = first_of(aiaccounts.import_from_cli(), "claude")
+        ok = (blocked is True and denied and cleared >= 1 and back is not None
+              and aiaccounts.cred_fingerprint("claude", back.get("cred"))
+              == aiaccounts.cred_fingerprint("claude", other))
+        return ok, ("different account on the same path blocked=%r, "
+                    "import denied=%r, cleared by undo=%r, admitted after "
+                    "undo=%r" % (blocked, denied, cleared, back is not None))
+    finally:
+        reset_vault_and_tombstones()
+
+
+# ===========================================================================
 TESTS = [
     ("01 missing vault file yields an empty store", t01_missing_vault_is_empty),
     ("02 corrupt/truncated vault yields an empty store", t02_corrupt_vault_is_empty),
@@ -713,6 +1089,12 @@ TESTS = [
     ("14b rotated refresh token survives the vault", t14b_refresh_rotation_survives_vault_roundtrip),
     ("15 is_unrecoverable: dead vs freshly expired", t15_is_unrecoverable_window),
     ("16 import_from_cli is idempotent", t16_import_from_cli_idempotent),
+    ("20 forget_account blocks the next CLI re-import", t20_forget_blocks_reimport),
+    ("21 tombstone survives a full vault wipe", t21_tombstone_survives_vault_wipe),
+    ("22 allow_reimport lets the account back in", t22_allow_reimport_undoes_the_tombstone),
+    ("23 _coerce keeps allowlisted top-level keys", t23_coerce_preserves_allowlisted_top_level_keys),
+    ("24 drifted claude fingerprint is still tombstoned", t24_fingerprint_drift_still_tombstoned),
+    ("25 shared cred_path stays blocked until undo", t25_shared_cred_path_stays_blocked_until_undo),
     ("17 safety: no network request was attempted", t17_no_network_attempted),
     ("18 safety: no credential read outside the sandbox", t18_no_reads_outside_sandbox),
     ("19 safety: vault path still inside the sandbox", t19_vault_path_still_sandboxed),

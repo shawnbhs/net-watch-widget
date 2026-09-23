@@ -48,7 +48,6 @@ contextBridge.exposeInMainWorld('nw', {
     ipcRenderer.on('dock', handler)
     return () => ipcRenderer.off('dock', handler)
   },
-  /** True while the window is being moved and the frost is hidden. */
   /**
    * The widget is now on a different monitor.
    *
@@ -62,6 +61,7 @@ contextBridge.exposeInMainWorld('nw', {
     return () => ipcRenderer.off('display', handler)
   },
 
+  /** True while the window is being moved and the frost is hidden. */
   onMoving(fn) {
     const handler = (_e, value) => fn(value)
     ipcRenderer.on('moving', handler)
@@ -139,14 +139,25 @@ contextBridge.exposeInMainWorld('nw', {
   // Named verbs, one per command, rather than letting the pane build its own
   // message and hand it to `send`. `send` already exists and would have worked,
   // but these are the first commands that carry a string somebody typed, and a
-  // named method is what keeps the set of things the renderer can ask for
-  // closed: the argument is the only variable part, and its shape is fixed
-  // here and checked again in the main process before it reaches the sidecar.
+  // named method fixes the *shape* of the argument in one place: the verb and
+  // its field names are literals here, so the only variable part is the value,
+  // and that value is checked again in the main process (`AI_COMMANDS` in
+  // main.js) before it reaches the sidecar.
+  //
+  // What a named verb does NOT do is close the set. `send` is still exposed a
+  // few lines above and forwards whatever `{cmd}` the renderer builds, and
+  // main.js re-validates only the verbs its `AI_COMMANDS` table names --
+  // everything else falls through to `toSidecar(cmd)` verbatim. The sidecar
+  // accepts more verbs than that table covers, several of which touch the
+  // credential vault. Closing that is main.js's job, not this file's: adding
+  // an allowlist here would put the authoritative policy in the one place the
+  // renderer's own world can be compromised. Do not read these named methods
+  // as the boundary.
   //
   // Coercion happens here so a wrong type is a rejected command rather than an
-  // exception thrown into whichever React handler called it. The main process
-  // re-validates everything -- this side runs in the renderer's world and is
-  // not a trust boundary by itself.
+  // exception thrown into whichever React handler called it. It is ergonomics,
+  // not enforcement -- this side runs in the renderer's world and is not a
+  // trust boundary by itself.
   //
   // There is no reply channel: every one of these is answered by the sidecar's
   // usual broadcast -- the `ai` message with its `accounts` array, or the

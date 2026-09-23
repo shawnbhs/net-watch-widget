@@ -34,7 +34,9 @@ and it stays that way.
 """
 
 import base64
+import hashlib
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -400,6 +402,336 @@ def is_unrecoverable(provider_id, cred):
         return False
     return exp < time.time() - CRED_MAX_STALE
 
+
+# ── durable credential identity ──────────────────────────────────────────────
+# Why this section exists, stated plainly because it is the fix for a bug the
+# user actually hit: a Claude credential file contains NO account identifier.
+# The vault's fingerprint was therefore built from subscriptionType plus
+# expiresAt -- and expiresAt is rewritten on EVERY token issue, including the
+# silent refresh the CLI does on its own. That makes the "fingerprint" a
+# timestamp wearing an identity's clothes:
+#
+#   * the duplicate check never fires for claude, so signing into the SAME
+#     account a second time writes a SECOND row -- the reported symptom;
+#   * a tombstone keyed on it goes stale the first time the token renews, so
+#     removal has to fall back to matching the credential file's path;
+#   * sidecar's re-auth guard cannot refuse on a fingerprint that is expected
+#     to differ every time, so it is written to tighten automatically once a
+#     durable one exists.
+#
+# Where durable identity actually lives. Claude Code stores the signed-in
+# account in the CLI's own state file, `~/.claude.json`, under `oauthAccount`
+# -- NOT in `.claude/.credentials.json`. Read from the live file on this
+# machine, that object carries (key names only, no values ever read out of
+# this module): accountUuid, emailAddress, organizationUuid, organizationRole,
+# organizationName, displayName, billingType, accountCreatedAt,
+# subscriptionCreatedAt, seatTier, workspaceRole, hasExtraUsageEnabled,
+# ccOnboardingFlags, claudeCodeTrialDurationDays, claudeCodeTrialEndsAt (and,
+# on some builds, organizationRateLimitTier / organizationType /
+# userRateLimitTier). `accountUuid` is a stable per-account UUID and is
+# exactly the identifier the credential file lacks.
+#
+# This is a LOCAL FILE READ, never a network call. There is no offline way to
+# learn the account behind a Claude access token other than asking Anthropic,
+# and this module must not do that; upstream has been asked to put an id in
+# the credential file and declined (the issue is closed "not planned"). So the
+# CLI's own state file is the best material available, and when it is missing
+# -- a credential imported by hand, a pruned profile, a vault row from before
+# this change -- we say so via `durable=False` rather than inventing an id.
+#
+# Nothing here reads, returns, hashes or logs a token, a refresh token, or any
+# other secret. The email address IS treated as sensitive: it is never
+# returned in a fingerprint, only a truncated SHA-256 of its lowercased form,
+# which compares equal for the same account and reveals nothing.
+
+# The CLI state file that holds `oauthAccount`, relative to the home directory
+# that also holds `.claude/.credentials.json`.
+CLAUDE_STATE_FILE = ".claude.json"
+
+# The oauthAccount fields worth carrying, most durable first. accountUuid is a
+# real account identifier; emailAddress is the human-stable fallback for older
+# CLI builds that wrote no uuid. organizationUuid is deliberately NOT used on
+# its own: two accounts in one organisation share it, so it would merge them.
+_CLAUDE_ID_KEYS = ("accountUuid", "emailAddress")
+
+# Tiny memo so a sweep over several accounts does not re-read and re-parse the
+# same multi-hundred-kilobyte state file once per row. Keyed by path plus the
+# stat identity of the file, so an edit by the CLI invalidates it for free. It
+# holds only the two id fields above -- never the rest of the document, which
+# includes project history.
+_CLAUDE_STATE_CACHE = {}
+_CLAUDE_STATE_CACHE_MAX = 32
+
+
+def _claude_state_paths(cred_path):
+    """Candidate `.claude.json` locations for a given credential file path.
+
+    The ordinary layout is `<home>/.claude/.credentials.json` beside
+    `<home>/.claude.json`, so the first candidate is the parent of the
+    `.claude` directory. Two fallbacks follow for layouts that nest
+    differently (a sandboxed CLI home, a relocated CLAUDE_CONFIG_DIR): the
+    credential's own directory, and that directory's parent. Order is
+    best-first and every candidate is only ever opened read-only.
+    """
+    if not cred_path or not isinstance(cred_path, str):
+        return []
+    try:
+        d = os.path.dirname(os.path.abspath(cred_path))
+    except Exception:
+        return []
+    cands = []
+    parent = os.path.dirname(d)
+    if os.path.basename(d).lower() in (".claude", "claude") and parent:
+        cands.append(os.path.join(parent, CLAUDE_STATE_FILE))
+    cands.append(os.path.join(d, CLAUDE_STATE_FILE))
+    if parent:
+        cands.append(os.path.join(parent, CLAUDE_STATE_FILE))
+    seen, out = set(), []
+    for p in cands:
+        k = os.path.normcase(p)
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
+
+
+def _read_claude_state(path):
+    """The two id fields out of one `.claude.json`, or None. Never raises.
+
+    Returns a dict with at most accountUuid and emailAddress. Everything else
+    in that file -- project paths, prompt history, cached feature flags -- is
+    dropped here and never enters the process's long-lived state.
+    """
+    try:
+        st = os.stat(path)
+        key = (os.path.normcase(path), st.st_mtime_ns, st.st_size)
+    except Exception:
+        return None
+    hit = _CLAUDE_STATE_CACHE.get(key)
+    if hit is not None:
+        return hit or None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        doc = None
+    out = {}
+    if isinstance(doc, dict):
+        acct = doc.get("oauthAccount")
+        if isinstance(acct, dict):
+            for k in _CLAUDE_ID_KEYS:
+                v = acct.get(k)
+                if isinstance(v, str) and v.strip():
+                    out[k] = v.strip()
+    if len(_CLAUDE_STATE_CACHE) >= _CLAUDE_STATE_CACHE_MAX:
+        _CLAUDE_STATE_CACHE.clear()
+    _CLAUDE_STATE_CACHE[key] = out
+    return out or None
+
+
+def _claude_account_ids(cred, cred_path=None):
+    """{accountUuid?, emailAddress?} for a Claude credential, or {}.
+
+    Two sources, in order:
+      1. the credential object itself, if an importer has already stapled an
+         `oauthAccount` (or a flat `accountUuid`) onto it -- which is what a
+         vault row written by a future import path will look like, and costs
+         no file access at all;
+      2. the CLI state file next to `cred_path`.
+
+    A credential with neither is not an error and not a different account; it
+    is an account whose identity we cannot establish, and every caller below
+    degrades to the legacy scheme for it instead of guessing.
+    """
+    out = {}
+    c = _dict(cred)
+    acct = c.get("oauthAccount")
+    if not isinstance(acct, dict):
+        o = _claude_oauth(cred) or {}
+        sub = o.get("oauthAccount")
+        acct = sub if isinstance(sub, dict) else {}
+    for k in _CLAUDE_ID_KEYS:
+        v = acct.get(k) if isinstance(acct, dict) else None
+        if not (isinstance(v, str) and v.strip()):
+            v = c.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    if out:
+        return out
+    for p in _claude_state_paths(cred_path):
+        got = _read_claude_state(p)
+        if got:
+            return dict(got)
+    return {}
+
+
+def _email_digest(email):
+    """A stable, non-reversible tag for an email address.
+
+    The address itself never leaves this function. Fingerprints are compared,
+    stored in the vault, written into tombstone files and shown in diagnostic
+    listings; an address in any of those is a privacy leak for no gain, since
+    only equality is ever needed. Lowercased first because the same account
+    can be typed either way, truncated because 64 bits of SHA-256 is far more
+    than enough to separate a handful of accounts.
+    """
+    try:
+        norm = str(email).strip().lower().encode("utf-8")
+    except Exception:
+        return None
+    if not norm:
+        return None
+    return hashlib.sha256(norm).hexdigest()[:16]
+
+
+def _claude_legacy_fp(cred):
+    """The pre-existing claude fingerprint, byte for byte.
+
+    Reproduced here rather than imported so this module keeps its "no sibling
+    imports" property, and reproduced EXACTLY because vault rows and tombstone
+    files already on disk contain this string. Changing its shape by one
+    character would orphan every one of them -- which would present as the
+    user's original bug (a known account seen as new) plus a second one (a
+    deliberately removed account coming back).
+    """
+    o = _claude_oauth(cred)
+    if not o:
+        return None
+    return "claude:%s:%s" % (o.get("subscriptionType") or "?",
+                             o.get("expiresAt") or 0)
+
+
+def _codex_fp(cred):
+    """Codex's fingerprint: account_id, which is already durable."""
+    t = _codex_tokens(cred)
+    if not t:
+        return None
+    acct = t.get("account_id")
+    if not acct:
+        return None
+    return "codex:%s" % acct
+
+
+def cred_identity(provider_id, cred, cred_path=None):
+    """What we know about WHOSE account this credential is.
+
+    Always a dict, never an exception:
+
+      kind     "account_uuid" | "email" | "account_id" | "expiry" | None
+      durable  True when the value survives a token refresh
+      fp       the fingerprint string, or None when even the legacy scheme
+               cannot be applied (an unrecognised credential shape)
+      source   "cred" when the id came from the credential object, "cli-state"
+               when it came from the CLI's own `.claude.json`, "legacy" when
+               no durable id was available
+
+    `durable=False` is a real answer and callers must respect it: it means
+    "this fingerprint changes when the token renews", which is precisely when
+    a duplicate check has to fall back to something else (the credential path)
+    rather than conclude the account is new.
+
+    No value in the returned dict is a secret. The email case returns only a
+    truncated digest.
+    """
+    out = {"provider": provider_id, "kind": None, "durable": False,
+           "fp": None, "source": "legacy"}
+    if provider_id == "codex":
+        fp = _codex_fp(cred)
+        if fp:
+            out.update(kind="account_id", durable=True, fp=fp, source="cred")
+        return out
+    if provider_id != "claude":
+        return out
+    if _claude_oauth(cred) is None:
+        # Not a claude credential shape at all. None, so callers skip it
+        # rather than importing a mystery -- the long-standing contract.
+        return out
+    ids = _claude_account_ids(cred, cred_path)
+    src = "cred" if (isinstance(_dict(cred).get("oauthAccount"), dict)
+                     or _dict(cred).get("accountUuid")) else "cli-state"
+    uid = ids.get("accountUuid")
+    if uid:
+        out.update(kind="account_uuid", durable=True,
+                   fp="claude:acct:%s" % uid, source=src)
+        return out
+    dig = _email_digest(ids.get("emailAddress")) if ids.get("emailAddress") \
+        else None
+    if dig:
+        out.update(kind="email", durable=True,
+                   fp="claude:email:%s" % dig, source=src)
+        return out
+    fp = _claude_legacy_fp(cred)
+    if fp:
+        out.update(kind="expiry", durable=False, fp=fp, source="legacy")
+    return out
+
+
+def cred_fingerprint(provider_id, cred, cred_path=None):
+    """The best fingerprint available for this credential, or None.
+
+    Durable when the account is identifiable, the legacy expiry-based string
+    when it is not. Callers that need to know which they got ask
+    `is_durable_fingerprint()` or use `cred_identity()` directly.
+    """
+    return cred_identity(provider_id, cred, cred_path).get("fp")
+
+
+def is_durable_fingerprint(fp):
+    """True when this fingerprint string survives a token refresh.
+
+    Recognises the stored form, so it answers correctly for a value read back
+    out of the vault or a tombstone file with no credential in hand.
+    """
+    if not isinstance(fp, str) or not fp:
+        return False
+    if fp.startswith("codex:"):
+        return True
+    return fp.startswith("claude:acct:") or fp.startswith("claude:email:")
+
+
+def cred_fingerprint_candidates(provider_id, cred, cred_path=None):
+    """Every fingerprint form this credential answers to, best first.
+
+    This is the back-compatibility mechanism, and it is a matcher rather than
+    a migration on purpose. A migration would have to rewrite the vault AND
+    the tombstone sidecar AND do it before the CLI's next silent refresh moved
+    the legacy value out from under it; a row or tombstone written by an older
+    build, or by a build that never saw the CLI state file, would still be
+    left behind. Answering to both forms costs one extra string comparison and
+    cannot orphan anything.
+
+    So a claude credential with a known account yields:
+        ["claude:acct:<uuid>", "claude:<tier>:<expiresAt>"]
+    The legacy element is kept second and is still an exact match for a row
+    stored before this change, as long as that row's credential has not been
+    refreshed since -- and when it HAS been refreshed, the durable element
+    matches instead, which is the entire point.
+    """
+    out = []
+    ident = cred_identity(provider_id, cred, cred_path)
+    if ident.get("fp"):
+        out.append(ident["fp"])
+    if provider_id == "claude":
+        legacy = _claude_legacy_fp(cred)
+        if legacy and legacy not in out:
+            out.append(legacy)
+    return out
+
+
+def cred_fingerprint_matches(provider_id, cred, stored, cred_path=None):
+    """True when `stored` identifies the same account as this credential.
+
+    `stored` is whatever a vault row or a tombstone entry recorded, in either
+    format. Asymmetry is deliberate and is the safe direction: a legacy stored
+    value matches only while the token behind it has not been renewed, while a
+    durable stored value keeps matching forever. A False here never deletes
+    anything -- it only means "treat as a different account" -- so the failure
+    mode of an unmatched legacy tombstone is the one that already existed
+    before this change, not a new one.
+    """
+    if not stored or not isinstance(stored, str):
+        return False
+    return stored in cred_fingerprint_candidates(provider_id, cred, cred_path)
 
 # ── Claude adapter ────────────────────────────────────────────────────────────
 def _claude_usage(cred):

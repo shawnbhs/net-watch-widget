@@ -2,12 +2,14 @@
 
 This widget can track quota for more than one AI coding subscription at a
 time, including **two accounts with the same vendor** on two different email
-addresses. That second case is the one that goes wrong, and it goes wrong for
-a reason that has nothing to do with this widget. Read section 1 before you
-try anything.
+addresses. That second case is the one that goes wrong, and most of the
+reasons it went wrong have now been fixed. One reason has not been fixed and
+cannot be, because it is not in this software at all: your web browser
+decides which account you sign in as. Read section 1 before you try
+anything.
 
-Everything below describes behaviour that exists today. Where something is
-unverified or unsupported, it says so.
+Everything below describes behaviour that exists in the code today. Where
+something is unverified, unsupported or not wired up, it says so.
 
 ---
 
@@ -43,9 +45,14 @@ which held a real credential in a plain file while the login was running - is
 deleted. Teardown happens on success, failure, timeout, cancellation and the
 unexpected error nobody predicted, alike.
 
-### Half two - the one people skip: your browser is still signed in
+Section 2 describes exactly what that sandbox does and does not cover. It is
+worth reading once, because for a long time the sandbox looked right and was
+silently not working.
 
-**This is the most likely single reason you cannot get the second account in.**
+### Half two - the one that cannot be fixed: your browser is still signed in
+
+**This is the most likely single reason you cannot get the second account in,
+and no version of this software will ever fix it.**
 
 These logins are an OAuth round-trip through a real browser. The sandbox
 isolates the *CLI*. It does not, and cannot, isolate your *browser*.
@@ -61,10 +68,19 @@ Both halves have to be broken for a second account to get in:
 1. the CLI must not find an existing login - the sandbox handles that;
 2. the **browser** must not have a live vendor session - **you** have to handle
    that, by signing out on the vendor's website or using a private/incognito
-   window.
+   window, *before* you start the sign-in.
 
-The widget does detect this after the fact. When a sign-in returns an account
-that is already in the vault it refuses to add a second copy, and says:
+Because this is the step people skip, the widget now stops you on the way in.
+Choosing a provider no longer starts the login: it shows a warning panel
+first, every single time, with the text "Your web browser decides which
+account you sign in as here, not this app." You have to click "My browser is
+ready - continue" before a console opens. There is deliberately no "don't
+show this again": it costs one click when your browser is already correct,
+and the one time you forget is the time this whole problem comes back.
+
+The widget also detects the failure after the fact. When a sign-in returns an
+account that is already in the vault it refuses to add a second copy, and
+says:
 
 > This is the same account you are already signed in as. Sign out in your
 > browser, or open a private/incognito window, before signing in with the
@@ -75,27 +91,124 @@ and authenticated the wrong account.
 
 ---
 
-## 2. Adding a second account of the same vendor
+## 2. What the sandbox actually isolates, and what it does not
 
-Do these in order. Step 2 is not optional.
+This section exists because three separate things in this area were broken in
+ways that produced no error message at all. Knowing what is covered tells you
+where to look when something still goes wrong.
+
+### A fake home that really reaches the process
+
+The sandbox is a fresh temporary directory, created with owner-only
+permissions, and checked before anything is written to it: it must be inside
+the system temporary directory and must not be inside your real home, any
+vendor configuration directory, any known credential directory, or this
+repository. If that check fails the login is refused rather than continuing.
+Deleting the one working login you already have, while trying to add a
+second, would be worse than the bug being fixed.
+
+Every route a process can take to find "the home directory" is pointed at that
+directory: `HOME`, `USERPROFILE`, the `HOMEDRIVE`/`HOMEPATH` pair, and the
+four XDG directory variables. Each provider also gets its own configuration
+directory variable pointed inside the sandbox - `CLAUDE_CONFIG_DIR` for
+Claude, `CODEX_HOME` for Codex - because some CLIs honour those and ignore
+`HOME` entirely.
+
+**The part that used to be silently broken:** on this machine the vendor CLIs
+do not run on Windows, they run inside WSL, and WSL resets `HOME` from
+`/etc/passwd` on the far side of the boundary no matter what the Windows side
+sets. So the sandbox looked perfect from the Windows side and the actual
+`claude` process ran with `HOME=/home/<you>` and read your real
+`~/.claude.json`. That is fixed by setting `HOME` *inside* the distro, in the
+command line itself, using the sandbox path translated once by `wslpath`. The
+other variables do cross the boundary correctly and are carried by `WSLENV`.
+
+### Your shell's proxy variables are removed for the login child only
+
+The login command runs through `bash -lic`, which means your own shell
+start-up files are sourced before the CLI starts. If those files export
+`ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` - a proxy setup, which is
+exactly the case here - then Claude Code starts in API-key mode and never
+performs an OAuth sign-in at all. It does not fail; it just quietly does
+nothing that looks like a login.
+
+The widget now `unset`s those names inside the distro, after your start-up
+files have run and before the CLI starts. For Claude the list is
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and
+`CLAUDE_CODE_OAUTH_TOKEN`; for Codex it is `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` (the Codex list is an untested guess by analogy, not
+something confirmed against a live Codex CLI).
+
+Two things to be clear about:
+
+- **Your own shell configuration is not touched.** Nothing edits `.bashrc`,
+  `.profile` or anything else you own. The removal happens only in the one
+  child process that runs the login, and only for that one run. Your normal
+  shells keep the proxy exactly as you set it up.
+- The names are configurable. `AI_LOGIN_UNSET_VARS_CLAUDE` and
+  `AI_LOGIN_UNSET_VARS_CODEX` in `.env` replace the list (semicolon
+  separated), so a name that turns out to be wrong is a configuration change,
+  not a code change. This document names variables only; never put an actual
+  proxy URL or token into a document or a bug report.
+
+### The login command is a real login subcommand
+
+Running the bare `claude` binary opens its interactive prompt. It does not
+sign anything in - the `/login` command is something a human types inside
+that prompt, and nothing here types it. So a "login" that launched the bare
+binary sat there forever and then timed out.
+
+The widget now appends the real subcommand, `auth login`, to the configured
+command when the command does not already end in it. `AI_LOGIN_SUBCOMMAND_CLAUDE`
+in `.env` overrides the words appended. Codex's configured command already
+ends in `login`, so nothing is appended for it.
+
+### What is not isolated
+
+- **The browser.** See section 1. This is the whole remaining limit.
+- Anything outside a `wsl.exe ... bash -c` shaped command. The variable
+  scrubbing and the in-distro `HOME` only apply to that shape, because that
+  is the only point downstream of your shell start-up files. A login command
+  configured some other way gets the sandbox environment but not those two
+  fixes.
+
+---
+
+## 3. Adding a second account of the same vendor
+
+Do these in order. Step 2 is not optional, and it must happen **before**
+step 3.
 
 1. **Make sure quota lookups and logins can run at all.** If you are in a
    region the vendors block, the widget refuses to send anything until a VPN
-   is up - see section 8. A refusal here is intentional, and no amount of
+   is up - see section 9. A refusal here is intentional, and no amount of
    retrying will get past it.
 
-2. **Sign your browser out of the vendor, or prepare a private window.** Open
-   the vendor's website in your default browser and sign out of account #1 -
-   or plan to complete the sign-in in a private/incognito window with no
-   session in it. Skipping this step is what makes the whole procedure hand
-   you account #1 again.
+2. **Sign your browser out of the vendor, or open a private window.** Concretely:
+
+   - Open the vendor's own site in your **default browser** - the one the
+     login will actually open, not whichever one you had in mind. For Claude
+     that is `claude.ai`; for Codex it is the ChatGPT sign-in page.
+   - Sign out. Reload the page. You should be looking at a signed-out landing
+     page or a login form. If it still shows you an account, you signed out
+     somewhere else.
+   - Or, instead: plan to complete the whole sign-in in a private/incognito
+     window that has no session in it. If your default browser does not offer
+     to reuse the private window for the link the CLI opens, sign out
+     properly rather than fighting it.
+
+   Skipping this step is what makes the whole procedure hand you account #1
+   again, without an error, every time.
 
 3. **Open the widget's AI accounts pane and press `+`.** A provider picker
    opens.
 
 4. **Pick the vendor.** Only Claude Code and OpenAI Codex can actually report
-   usage - see section 6. The widget creates a disposable sandbox and opens a
-   console window running the vendor's own login command inside it.
+   usage - see section 7. Picking does not start anything yet: the browser
+   warning from section 1 appears. Read it, and click "My browser is ready -
+   continue" only if you actually did step 2. The widget then creates a
+   disposable sandbox and opens a console window running the vendor's own
+   login command inside it.
 
 5. **Complete the sign-in in that console, and in the browser it opens, as the
    second email address.** If the browser shows no account chooser and no
@@ -109,7 +222,7 @@ Do these in order. Step 2 is not optional.
 6. **Read the widget's reply.**
    - *account added* - the credential was captured and vaulted.
    - The duplicate message from section 1 - same account again. Nothing was
-     added. Go to section 3.
+     added. Go to section 4.
    - Anything else - the sign-in did not complete, and the message names the
      reason.
 
@@ -117,6 +230,28 @@ Do these in order. Step 2 is not optional.
    an email address out of a credential, so the default label just names the
    provider. Rename it yourself - in the pane, or with
    `aiacct rename <ACCOUNT_ID> "<NEW_LABEL>"`.
+
+### Re-authenticating an existing account
+
+Repairing a row that has gone dead is the same flow with one extra
+protection. Writing a new credential into an existing row replaces it
+outright, and both vendors kill the old refresh token the moment they issue a
+new one - so if your browser signed you in as somebody else, that write would
+destroy the account you were trying to repair, with nothing left to recover
+it from.
+
+The widget now checks, **before** the write, whether the credential that came
+back provably belongs to a *different* row in the vault. If it does, nothing
+is written and you get:
+
+> That sign-in came back as a different account, not this one, so nothing was
+> changed. Sign out in your browser, or open a private/incognito window, then
+> sign in with this account's own email address.
+
+Note the word *provably*. A credential that simply does not match the row
+being repaired is not treated as a conflict, because for Claude that is the
+normal result of any successful re-authentication - see section 6. Only a
+positive match against another row counts.
 
 ### Verifying it is genuinely a different account
 
@@ -134,18 +269,12 @@ Do not assume. Check:
    heavily used and one barely used makes this obvious. This needs network
    access, and a VPN in a gated region.
 
-Be clear about what the widget can and cannot prove here. It tells accounts
-apart by a **fingerprint built from non-secret credential fields - never from
-the token**. For Codex that fingerprint is an account identifier, which is a
-real identity check. For Claude it is derived from subscription type and
-expiry, which reliably collapses two copies of the *same* login into one
-entry, but is not an assertion about which email address signed in. If the
-credential shape is not one the widget recognises, it says it cannot tell
-whether the account is new rather than guessing.
+Be clear about what the widget can and cannot prove here; section 6 gives the
+detail.
 
 ---
 
-## 3. When the same account comes back anyway
+## 4. When the same account comes back anyway
 
 Work down this list. Each step has something specific to observe.
 
@@ -178,12 +307,14 @@ Work down this list. Each step has something specific to observe.
 6. **Run `aiacct doctor`.** Expected observation: a problem count of zero, and
    no credential files reported on disk that are not in the vault. If it
    reports unregistered credentials, or the same login in more than one
-   location, see section 5 - that distorts what you are seeing.
+   location, see section 6 - that distorts what you are seeing.
 
 7. **If `doctor` reports a stale registered copy, remove that row and
    re-import.** `aiacct remove <ACCOUNT_ID>`, then `aiacct import`. Expected
    observation: `import` prints the account it added and the path it came
-   from, rather than "Added 0 accounts".
+   from, rather than "Added 0 accounts". If `import` adds nothing and you
+   believe it should have, read section 5: a removed account is deliberately
+   blocked from coming back, and that block has to be lifted explicitly.
 
 If you reach the bottom of this list with a clean `doctor` and a browser that
 genuinely demands a password, and the vendor still returns account #1, the
@@ -192,7 +323,131 @@ lever on it.
 
 ---
 
-## 4. Checking the state of things from the command line
+## 5. Removing an account, and why it stays removed
+
+Removing an account used to mean only "delete the row". The next scan of the
+CLI credential files on disk would find the same login sitting there and add
+it straight back, which is indistinguishable from the software ignoring you.
+
+### What removal looks like now
+
+In the accounts pane, removal is a button labelled **Remove**, not a bare `×`
+glyph beside the refresh arrow. One click on it never deletes anything: it
+only opens a confirmation that says which account is about to go and that
+there is no undo short of signing in again. A second, deliberate click on
+"Remove permanently" is what actually removes it. Escape or Cancel backs out.
+If a command is already in flight the confirmation is dismissed, so a stale
+prompt cannot fire a delete against whatever row happens to be selected by
+then.
+
+`aiacct remove <ACCOUNT_ID>` does the same thing from the command line.
+
+### What removal records
+
+When a row is removed, the widget writes a small record of it - a
+**tombstone** - and only reports success once both the row is gone and the
+tombstone is written. Every later scan of the CLI credential files checks
+these records and skips anything that matches, so a credential file still
+sitting on your disk is not treated as consent to re-add the account.
+
+The tombstone file lives **beside** the vault, not inside it:
+
+- Windows: `%APPDATA%\net-watch-ui\accounts.json.forgotten`
+- Elsewhere: `~/.config/net-watch-ui/accounts.json.forgotten`
+
+That placement is the whole point. The vault file is exactly what gets deleted
+by an uninstall, a reset, or a recovery from a corrupted vault - and that is
+precisely the moment a record of "the user deleted these on purpose" has to
+keep working. **Deleting the vault does not undo a removal.** If you want a
+genuinely clean slate, delete the `.forgotten` file as well.
+
+The tombstone contains no secrets: the provider name, the non-secret
+fingerprint, the credential file path, and the time of removal.
+
+### Matching, and its deliberate over-reach
+
+A tombstone matches on either of two keys, and either one alone is enough to
+block:
+
+- the fingerprint - exact and durable for Codex, but not for Claude, where it
+  changes every time the token is refreshed (section 6);
+- the credential file path - which is what actually protects Claude, because
+  the path stays the same.
+
+The path key is conservative in your favour. If the *same* credential file is
+later genuinely re-used by a *different* login - you switched accounts in the
+CLI itself, rather than reinstalling - the import will keep skipping that file
+until you lift the block. That is a deliberate trade: a wrong "still
+forgotten" costs you one action to undo, while a silent resurrection costs you
+the belief that delete means delete.
+
+### Undoing a removal
+
+The undo exists in the vault module as `allow_reimport()`. **It is not yet
+wired to a button or to an `aiacct` subcommand** - nothing outside
+`aiaccounts.py` calls it today. To lift a block, run it directly:
+
+```
+python3 -c "import aiaccounts; print(aiaccounts.allow_reimport('claude'))"
+```
+
+Run that from the widget's directory. It prints how many tombstones it
+cleared; `0` means nothing matched. With only the provider name it clears
+**every** removal record for that provider - the blunt "let me start over"
+option. To lift exactly one, pass the credential file path it was removed
+with:
+
+```
+python3 -c "import aiaccounts; print(aiaccounts.allow_reimport('claude', cred_path='/home/you/.claude/.credentials.json'))"
+```
+
+`aiaccounts.list_forgotten()` prints the records currently on file, so you can
+see what there is to lift. After clearing, run `aiacct import` to let the
+account back in.
+
+---
+
+## 6. The one thing the widget cannot tell you: which Claude account is which
+
+The widget tells accounts apart with a **fingerprint built from non-secret
+credential fields - never from the token**. It is not derived from the token
+on purpose: tokens rotate on every refresh, so a token-based identity would
+report every refresh as a brand new account and fill the vault with copies of
+one login.
+
+| Provider | Fingerprint is built from | What that gives you |
+| --- | --- | --- |
+| Codex | the credential's account identifier | a real, stable identity check |
+| Claude | subscription type + exact expiry time | collapses two copies of the *same* login; nothing more |
+
+**Claude's credential file contains no email address and no account
+identifier at all.** There is nothing in it that names who signed in. The best
+available substitute is the subscription tier paired with the exact expiry
+millisecond, and that has one consequence you should know about:
+
+- **It drifts.** The expiry is rewritten every single time a token is issued
+  or refreshed. The same account fingerprints differently a minute later.
+- So duplicate detection for Claude is **not reliable**. It catches the
+  obvious case - the same credential file found in two places at the same
+  moment, such as a Windows copy and a WSL copy - and it will often miss two
+  sign-ins of the same account, because their expiry times differ. If you add
+  the same Claude account twice in two separate sign-ins, you may well end up
+  with two rows and no complaint.
+- Two Claude rows are therefore **not proof** of two different email
+  addresses. Use the usage-figures check in section 3 if you need to be sure.
+- It is also why the re-authentication guard in section 3 refuses only on a
+  positive match against another row. A Claude fingerprint that merely fails
+  to match the row being repaired is the normal, expected outcome of a
+  successful re-authentication; refusing on that would block every legitimate
+  repair.
+
+If the credential shape is not one the widget recognises at all, it says it
+cannot tell whether the account is new rather than guessing. "Unknown" means
+undetermined, not wrong.
+
+---
+
+## 7. Checking the state of things from the command line
 
 The management tool is `tools/aiacct.py`. It uses only the Python standard
 library, on purpose: a recovery tool must not be able to fail because a
@@ -204,6 +459,7 @@ python3 tools/aiacct.py <command>
 
 Commands: `list`, `show`, `add`, `remove`, `rename`, `import`, `usage`,
 `providers`, `doctor`, `repair`. Below, `aiacct` is shorthand for that line.
+There is no command here for tombstones; see section 5.
 
 Account ids are printed shortened; **any unique prefix works** wherever an
 `ACCOUNT_ID` is wanted, or pass `--full-ids` to `list` to see them whole. An
@@ -268,6 +524,11 @@ Two of its warnings matter especially:
   unregistered on disk. Run `aiacct import` to register them, then remove
   whichever duplicate is stale.*
 
+  One honest caveat: an unregistered credential may also be one you removed on
+  purpose, which `import` will now correctly refuse to bring back. `doctor`
+  does not currently distinguish the two cases. If `import` adds nothing, that
+  is the likely reason - see section 5.
+
 It also flags leftover `.tmp` files beside the vault; `aiacct repair` deletes
 those. `repair` is the one command here that removes things without being
 pointed at them, so it describes each action and asks first. Pass `-y` to act
@@ -277,10 +538,10 @@ guessing at consent.
 ### `aiacct import`
 
 Scans the known CLI credential locations and registers anything not already in
-the vault, leaving existing entries untouched. It distinguishes "every CLI
-login found on this machine is already registered" from "no CLI credential
-file was found in any known location", because a bare "0 accounts" reads like
-a failure.
+the vault, and not tombstoned, leaving existing entries untouched. It
+distinguishes "every CLI login found on this machine is already registered"
+from "no CLI credential file was found in any known location", because a bare
+"0 accounts" reads like a failure.
 
 ### `aiacct add <provider> <label> --from-file PATH`
 
@@ -303,7 +564,7 @@ refuses outright rather than pretending.
 
 ---
 
-## 5. The two-copies problem
+## 8. The two-copies problem
 
 If a vendor CLI is installed both on Windows and inside WSL, the same login
 exists twice - once in each home directory - and the two copies drift apart.
@@ -334,7 +595,7 @@ names and their separator.
 
 ---
 
-## 6. Which providers actually work today
+## 9. Which providers actually work today
 
 **Two.** Claude Code and OpenAI Codex.
 
@@ -352,11 +613,13 @@ endpoint yet; and `aiacct usage` refuses with a message saying there is no
 verified usage endpoint for it, so no quota can be read.
 
 Being in the picker is not evidence that a provider works. Only Claude Code
-and OpenAI Codex report quota.
+and OpenAI Codex report quota, and only those two have an isolated login at
+all - the sandbox refuses to run for anything the registry does not consider
+live.
 
 ---
 
-## 7. The three failure states, and what each actually means
+## 10. The three failure states, and what each actually means
 
 When a credential refresh fails, exactly one of three things is reported.
 Conflating them is the bug this feature was written to eliminate.
@@ -375,12 +638,12 @@ when it did not is the precise failure this design exists to prevent.
 kept. This is a provider-side problem, and the credential may well be fine. A
 bare 400 is deliberately *not* reported as "login expired".
 
-The same care applies to the status words in section 4: `unknown` means
+The same care applies to the status words in section 7: `unknown` means
 undetermined, not dead.
 
 ---
 
-## 8. The geographic gate
+## 11. The geographic gate
 
 Quota lookups and logins are gated behind a geographic check, and the check
 **fails closed** - if it cannot establish that your egress is acceptable, it
@@ -402,17 +665,19 @@ Do not try to route around the gate. It exists to protect your subscriptions.
 
 ---
 
-## 9. Where credentials live, and what that means for safety
+## 12. Where credentials live, and what that means for safety
 
 The widget's vault is a single file:
 
 - Windows: `%APPDATA%\net-watch-ui\accounts.json`
 - Elsewhere: `~/.config/net-watch-ui/accounts.json`
 
-The environment variable `AI_ACCOUNTS_FILE` overrides that path outright.
+The environment variable `AI_ACCOUNTS_FILE` overrides that path outright, and
+it moves the `.forgotten` tombstone file with it.
 
-Treat this file as a secret. **It holds live credentials, including refresh
-tokens** - enough to act as your subscriptions.
+Treat the vault as a secret. **It holds live credentials, including refresh
+tokens** - enough to act as your subscriptions. The `.forgotten` file beside it
+holds no secrets.
 
 `aiacct doctor` has an `== encryption at rest ==` section that classifies the
 file as it exists right now, and warns in as many words if the tokens on disk
@@ -424,8 +689,12 @@ printed mode is advisory and NTFS ACLs are what actually govern access.
 Two more things worth knowing:
 
 - **During a login, a real credential exists briefly in a plain file inside
-  the sandbox.** The sandbox is torn down unconditionally afterwards. If the
-  widget was killed mid-login rather than cancelled, check for leftovers.
+  the sandbox.** The sandbox is torn down unconditionally afterwards, and the
+  files inside it are overwritten before deletion. If a removal fails - a file
+  handle the operating system had not released yet, most often - the path is
+  recorded rather than silently forgotten, and the widget tries again when it
+  exits. If the widget was killed mid-login rather than cancelled, check for
+  leftover `ailogin-*` directories in your temporary directory.
 - **A surviving `.tmp` file beside the vault means an interrupted atomic
   write.** Those are extra copies of live credentials at rest. `aiacct doctor`
   flags them and `aiacct repair` deletes them once the vault itself reads
@@ -443,9 +712,17 @@ one is printed in any mode or in any error message.
 ## What this document does not claim
 
 - It does not claim a second account can be added without touching your
-  browser. It cannot.
+  browser. It cannot, and nothing in this software will ever change that. Sign
+  out at the vendor's site, or use a private window, before you start.
+- It does not claim the widget can prove two Claude credentials belong to two
+  different email addresses. Claude's credential file carries no email and no
+  account id; the fingerprint is subscription type plus expiry, and that
+  expiry changes on every token issue.
+- It does not claim duplicate detection is reliable for Claude. It is not, for
+  the reason directly above.
 - It does not claim any provider beyond Claude Code and OpenAI Codex reports
   usage. None do.
-- It does not claim the widget can prove two Claude credentials belong to two
-  different email addresses. It compares non-secret credential fields, which
-  is enough to spot the same login twice and not enough to assert identity.
+- It does not claim the undo for a removal is reachable from the interface. It
+  is a function call today, documented in section 5.
+- It does not claim the Codex variable-scrubbing list has been confirmed
+  against a live Codex CLI. It has not; it is an analogy to Claude's.

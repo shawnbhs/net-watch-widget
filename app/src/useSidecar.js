@@ -7,6 +7,15 @@ import { useEffect, useRef, useState } from 'react'
  * network panel and a failed check never clears the hardware readout. That is
  * the same guarantee the Tk build made by writing into separate labels; here it
  * has to be explicit, because a naive `setState(msg)` would replace everything.
+ *
+ * Not every message the sidecar sends earns a slice. `ai_accounts` -- roster
+ * snapshots, duplicate verdicts, login progress beats -- deliberately does not.
+ * The accounts pane subscribes to `window.nw.onData` itself, because it has to
+ * correlate each message with the command still pending on that row and with
+ * that row's backstop timer, and neither of those lives in this hook. Reducing
+ * the message here as well would keep a second copy of one fact that nothing
+ * reads. If a future consumer wants it from here, add the case together with
+ * the reader -- not before.
  */
 const EMPTY = {
   hello: null,
@@ -14,6 +23,9 @@ const EMPTY = {
   net: null,
   hw: null,
   ai: null,
+  // The provider registry, so the account picker can name vendors from the
+  // backend rather than only from its own built-in fallback list.
+  aiProviders: null,
   checks: null,
   tz: null,
   netstate: { up: true, busy: false },
@@ -108,6 +120,18 @@ function reduce(s, msg) {
     case 'checks':
       if (rest.loading) return { ...s, checks: { ...(s.checks ?? {}), loading: true } }
       return { ...s, checks: { ...rest, loading: false } }
+    case 'ai_providers':
+      // App.jsx reads `s.aiProviders` and hands it to the account pane, which
+      // treats a non-empty array as "the registry arrived". Without this case
+      // the value was never set, so the picker sat on its loading note and its
+      // built-in fallback list for the whole session -- the sidecar's registry
+      // was emitted and then dropped here, with nothing logged either side.
+      //
+      // The array itself, not the envelope: an empty one is the sidecar's own
+      // "not read yet" state (it emits providers=[] with err="unavailable"
+      // before the registry is loaded), and the pane distinguishes the two by
+      // length, so it must not be back-filled from a previous message.
+      return { ...s, aiProviders: rest.providers ?? [] }
     case 'error':
       return { ...s, errors: [...s.errors.slice(-9), rest] }
     default:

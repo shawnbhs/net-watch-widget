@@ -197,6 +197,11 @@ export function PaneProvider({ children }) {
    * Nothing goes to the main process from a quiet pass, because the panes are
    * being hidden in the same breath and a rect arriving after that would show
    * them again.
+   *
+   * The frost mode is the same situation held indefinitely rather than for one
+   * moment, so it runs every pass quiet -- see `schedule`. That is also why the
+   * cached signature is dropped here instead of updated: the main process was
+   * told nothing, so it must not be credited with having seen this batch.
    */
   const flush = useCallback((quiet = false) => {
     frame.current = 0
@@ -226,21 +231,31 @@ export function PaneProvider({ children }) {
   /**
    * Ask for a pass on the next frame.
    *
-   * While the pass is stopped this does not merely discard the result, it never
-   * requests the frame: a measurement is a forced layout flush, and doing one
-   * per frame to throw it away is precisely the cost this whole layer was built
-   * to avoid. It matters most in the suspended mode, which is what a machine
-   * running the widget very small is most likely to be busy during. What is
-   * remembered instead is that somebody wanted one, which is enough, because
-   * the restart measures unconditionally.
+   * Gated on the animation hold alone, and deliberately not on the frost latch.
+   * While a layout is animating this does not merely discard the result, it
+   * never requests the frame: a measurement is a forced layout flush, and doing
+   * one per frame to throw away a shape the cards are only passing through is
+   * precisely the cost this whole layer was built to avoid. What is remembered
+   * instead is that somebody wanted a pass, which is enough, because the
+   * restart measures unconditionally.
+   *
+   * The frost latch is not that. Under it the cards are settled, painted and
+   * measurable -- they are simply wearing their own background instead of a
+   * window -- and the subscribers standing on those cards still need to be told
+   * where they are. Skipping the pass froze their copy of the layout at
+   * whatever it was when the widget crossed below the frost floor, so the
+   * ground they walk on kept the geometry of a window size that no longer
+   * existed. The latch only ever meant "stop telling the main process", so that
+   * is all it does now: the pass runs, and runs `quiet`, which is the mechanism
+   * that already separates the two.
    */
   const schedule = useCallback(() => {
-    if (stopped()) { current.current = false; return }
+    if (held.current) { current.current = false; return }
     if (frame.current) return
     // Wrapped rather than passed straight to rAF: the callback is handed a
     // timestamp, which would arrive here as a truthy `quiet`.
-    frame.current = requestAnimationFrame(() => flush())
-  }, [flush, stopped])
+    frame.current = requestAnimationFrame(() => flush(frosted.current))
+  }, [flush])
 
   /**
    * Hide every pane now, and guarantee the next measurement is sent.
@@ -362,7 +377,18 @@ export function PaneProvider({ children }) {
       ro.disconnect()
       observer.current = null
       window.removeEventListener('resize', schedule)
-      if (frame.current) cancelAnimationFrame(frame.current)
+      // Cleared, not merely cancelled. `frame.current` is the pending-pass
+      // flag as well as the handle -- `schedule` refuses to queue a frame
+      // while it is set -- so cancelling without zeroing it leaves a third
+      // latch, one neither `held` nor `frosted` and one nothing here lifts:
+      // the id stays truthy and every later `schedule()` returns at the guard.
+      // Only `flush` and `stop` write it back to 0, and the frame that would
+      // have run `flush` is the one just cancelled. `stop` already does this;
+      // this is the same invariant on the other path out.
+      if (frame.current) {
+        cancelAnimationFrame(frame.current)
+        frame.current = 0
+      }
     }
   }, [schedule])
 

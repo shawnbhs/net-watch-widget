@@ -88,6 +88,33 @@ mistaking them for corruption, and the scheme byte says how the payload was
 produced. A file that carries no header at all is treated as a legacy
 unwrapped document and returned unchanged, which is how the pre-encryption
 plaintext vault keeps working across the upgrade.
+
+Empty is not the same as unreadable
+-----------------------------------
+
+The read path reports three different unhappy outcomes and refuses to blur
+them together, because a writer's correct response to each is different and
+one of those responses is destructive:
+
+  * The vault is absent or holds no bytes. Nothing to lose; a write may
+    proceed and create it.
+  * The vault exists and holds bytes that this process could not turn back
+    into a document -- sealed for another user or another machine, truncated,
+    corrupted, an unknown scheme, a version from a future build. Those bytes
+    are the only copy of the user's credentials. A write here is irreversible
+    deletion, and it must not happen by accident.
+  * The bytes could not be fetched at all (a lock, a permission denial). The
+    vault may be perfectly fine; nothing here can prove it either way, so it
+    is treated with the same caution as unreadable.
+
+The original shape of this module returned None for all three, which meant a
+vault this machine cannot decrypt was indistinguishable from a fresh install:
+the caller started empty, the next save wrote that empty document over the
+ciphertext, and the credentials were gone with no backup and no recovery path
+short of a manual re-login per account. read_secret_ex() exists to keep the
+three apart, and write_secret() refuses -- loudly, by raising -- rather than
+land a write on top of bytes it could not read. read_secret() keeps its old
+collapse-to-None signature so existing callers are unaffected.
 """
 
 import ctypes
@@ -111,6 +138,36 @@ SCHEME_PLAINTEXT = 2
 
 BACKEND_DPAPI = "dpapi-user"
 BACKEND_PLAINTEXT = "plaintext-fallback"
+
+# Read outcomes, kept apart by read_secret_ex(). These are part of the module's
+# API surface rather than internal detail because the whole point is that a
+# caller can branch on them; a status a caller cannot see is a status that
+# cannot protect anything.
+STATUS_OK = "ok"
+STATUS_ABSENT = "absent"
+STATUS_UNREADABLE = "unreadable"
+STATUS_ERROR = "error"
+
+
+class VaultUnreadableError(Exception):
+    """Raised instead of overwriting a vault whose contents could not be read.
+
+    Failing loudly is the entire value of this exception. A silent success on
+    this path converts a recoverable situation -- ciphertext the user could
+    still open by restoring their profile, signing in as the original user, or
+    supplying the old Windows password -- into permanent loss, since there is
+    deliberately no backup copy of the vault and the credentials inside it
+    cannot be regenerated without a manual re-login per account. A stall the
+    user can act on is strictly better than a data-destroying success.
+    """
+
+
+class VaultVerificationError(Exception):
+    """Raised when a freshly wrapped blob does not decrypt back to its input.
+
+    Checked in memory, before anything touches the target file, so a blob that
+    could never be reopened is never allowed to become the only copy.
+    """
 
 # Setting this environment variable to a truthy value forces the fallback path
 # even on a working Windows host. It exists for the self-test and for anyone
@@ -373,7 +430,7 @@ def blob_kind(blob_bytes):
     return "unknown"
 
 
-def write_secret(path, data_bytes):
+def write_secret(path, data_bytes, allow_unreadable_overwrite=False):
     """Atomically write a protected blob to path.
 
     The sequence is the same one aiaccounts.py uses for the plaintext vault,
@@ -390,8 +447,41 @@ def write_secret(path, data_bytes):
     copy of long-lived refresh tokens at rest, one that nothing ever cleaned
     up. On any failure the temp file is removed, so the directory is left
     exactly as it was found.
+
+    Two refusals guard the replace, and both raise rather than return, because
+    a caller that treats "written" as a boolean must not be able to mistake
+    either of them for success:
+
+      * If the file already at path could not be read -- it exists, it holds
+        bytes, and they did not unwrap -- the write is refused with
+        VaultUnreadableError. Those bytes are the only copy of whatever is
+        inside them, there is no backup by design, and replacing them is not
+        an operation anyone can undo. allow_unreadable_overwrite=True is the
+        deliberate escape hatch for a caller that has established the user
+        really does mean to discard the old vault; it is never the default.
+      * If the freshly wrapped blob does not decrypt back to the input, the
+        write is refused with VaultVerificationError. Checked in memory before
+        the temp file is even created, so a readable vault is never replaced by
+        a blob that cannot be reopened.
+
+    Both checks run before anything is created on disk, which preserves the
+    property that an interrupted write leaves the original byte for byte
+    intact.
     """
+    _existing, status = read_secret_ex(path)
+    if status in (STATUS_UNREADABLE, STATUS_ERROR) and not allow_unreadable_overwrite:
+        # The message names the path and the status only. Nothing derived from
+        # the blob or from the data being written goes into it, so this cannot
+        # leak credential material into a log or a traceback.
+        raise VaultUnreadableError(
+            "refusing to overwrite a vault whose current contents could not be "
+            "read (status=%s): %s" % (status, path)
+        )
     blob = protect(data_bytes)
+    if unprotect(blob) != bytes(data_bytes):
+        raise VaultVerificationError(
+            "refusing to write a blob that does not decrypt back to its input: %s" % path
+        )
     directory = os.path.dirname(os.path.abspath(path))
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, exist_ok=True)
@@ -431,28 +521,72 @@ def write_secret(path, data_bytes):
     return path
 
 
-def read_secret(path):
-    """Read and unprotect a file, returning bytes, or None.
+def read_secret_ex(path):
+    """Read and unprotect a file, returning (data, status).
 
-    None covers every unhappy outcome -- no file yet, unreadable file, corrupt
-    or foreign blob -- because the caller's response to all of them is
-    identical: start with an empty vault. Raising here would take the whole
-    widget down at logon over a file the user can simply re-populate, so this
-    function never raises.
+    status is one of STATUS_ABSENT, STATUS_UNREADABLE, STATUS_ERROR or
+    STATUS_OK, and data holds bytes only in the STATUS_OK case. Like
+    read_secret this never raises: a vault that throws on read would take the
+    widget down at logon over a file the user can re-populate.
+
+    STATUS_ABSENT covers both a missing file and a zero-length one, because a
+    file with no bytes in it holds no credentials and is safe to replace.
+
+    A blob that unwraps to zero bytes is STATUS_OK with b"", not ABSENT: the
+    decryption genuinely succeeded, and the caller deciding whether a write is
+    safe needs to know that the key worked.
     """
     try:
         with open(path, "rb") as f:
             blob = f.read()
     except (FileNotFoundError, NotADirectoryError):
-        return None
+        return (None, STATUS_ABSENT)
     except OSError:
-        return None
+        # The file is there in some form but its bytes cannot be fetched -- a
+        # scanner lock, a permission denial, a directory in its place. Nothing
+        # here can prove it is disposable, so it is not reported as absent.
+        return (None, STATUS_ERROR)
     if not blob:
-        return None
+        return (None, STATUS_ABSENT)
     try:
-        return unprotect(blob)
+        data = unprotect(blob)
     except Exception:
-        return None
+        return (None, STATUS_UNREADABLE)
+    if data is None:
+        return (None, STATUS_UNREADABLE)
+    return (data, STATUS_OK)
+
+
+def read_secret(path):
+    """Read and unprotect a file, returning bytes, or None.
+
+    None covers every unhappy outcome -- no file yet, unreadable file, corrupt
+    or foreign blob. This signature is kept exactly as it was because callers
+    depend on it, but it is now the lossy view: anything that needs to tell an
+    absent vault from one it could not open must call read_secret_ex(), and
+    anything that is about to WRITE must, because on this path the difference
+    is the difference between creating a vault and destroying one.
+    """
+    data, _status = read_secret_ex(path)
+    return data
+
+
+def readback_ok(path, expected_bytes):
+    """True only when path now reads back as exactly expected_bytes.
+
+    Offered here so a caller verifying its own write does not have to re-derive
+    the read statuses. Stronger than comparing parsed fields in two ways: it is
+    byte exact, and it returns False when the file that comes back is
+    unreadable rather than treating an unopenable vault as a successful write.
+
+    Nothing is logged or raised from here; both operands are secrets.
+    """
+    try:
+        expected = bytes(expected_bytes)
+    except Exception:
+        return False
+    data, status = read_secret_ex(path)
+    return status == STATUS_OK and data == expected
 
 
 def describe():
@@ -586,6 +720,58 @@ if __name__ == "__main__":
               "got=%r" % (read_secret(bad_path),))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("\n[7] empty is not unreadable, and an unreadable vault is not overwritten")
+    tmpdir7 = tempfile.mkdtemp(prefix="nwsec-f1-")
+    try:
+        missing = os.path.join(tmpdir7, "nope.json")
+        check("absent -> STATUS_ABSENT", read_secret_ex(missing) == (None, STATUS_ABSENT))
+
+        zero = os.path.join(tmpdir7, "zero.json")
+        open(zero, "wb").close()
+        check("zero length -> STATUS_ABSENT", read_secret_ex(zero) == (None, STATUS_ABSENT))
+
+        leg = os.path.join(tmpdir7, "legacy.json")
+        with open(leg, "wb") as f:
+            f.write(legacy)
+        check("legacy plaintext -> STATUS_OK", read_secret_ex(leg) == (legacy, STATUS_OK))
+
+        sealed_path = os.path.join(tmpdir7, "sealed.json")
+        write_secret(sealed_path, secret)
+        check("wrapped vault -> STATUS_OK", read_secret_ex(sealed_path) == (secret, STATUS_OK))
+        check("readback_ok true for what was written", readback_ok(sealed_path, secret) is True)
+        check("readback_ok false for other bytes", readback_ok(sealed_path, b"{}") is False)
+
+        # An undecryptable vault: headered, claims DPAPI, payload is garbage.
+        # On a fallback host there is no DPAPI to fail, so an unknown scheme
+        # byte is used instead -- unreadable on every platform.
+        bad = os.path.join(tmpdir7, "bad.json")
+        payload = (bytes([SCHEME_DPAPI_USER]) if available() else bytes([99]))
+        with open(bad, "wb") as f:
+            f.write(MAGIC + bytes([FORMAT_VERSION]) + payload + b"not a real blob")
+        before = open(bad, "rb").read()
+        got = read_secret_ex(bad)
+        check("undecryptable -> STATUS_UNREADABLE, not ABSENT", got == (None, STATUS_UNREADABLE),
+              "got=%r" % (got[1],))
+        check("read_secret() still collapses it to None", read_secret(bad) is None)
+        refused = False
+        try:
+            write_secret(bad, b'{"version": 1, "accounts": []}')
+        except VaultUnreadableError:
+            refused = True
+        check("write over unreadable vault raises", refused)
+        check("original bytes untouched by the refusal", open(bad, "rb").read() == before)
+        check("no temp left by the refusal",
+              not any(n.endswith(".tmp") for n in os.listdir(tmpdir7)))
+        forced = False
+        try:
+            write_secret(bad, secret, allow_unreadable_overwrite=True)
+            forced = read_secret_ex(bad) == (secret, STATUS_OK)
+        except Exception:
+            forced = False
+        check("explicit override still permits the overwrite", forced)
+    finally:
+        shutil.rmtree(tmpdir7, ignore_errors=True)
 
     print("\n[6] forced-unavailable fallback (child process, %s=1)" % DISABLE_ENV)
     child = r'''

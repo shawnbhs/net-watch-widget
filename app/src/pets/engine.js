@@ -73,7 +73,46 @@ const BUSY = new Set(['held', 'air', 'hop', 'land'])
  */
 export const OVERLAY_SIZE_FACTOR = 1.7
 
-const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v)
+/**
+ * The band a finished sprite height is held inside, in CSS px.
+ *
+ * The per-display factor below multiplies a number the user already controls
+ * with two sliders, so the product can reach either end of absurd: a pet too
+ * small to see and too small to click, or one that covers the screen it is
+ * standing on. Neither is recoverable by the user, because both are hard to
+ * grab. The cap also keeps the pet small enough that the size-derived bounds
+ * elsewhere in this file stay ordered -- see the note on `clamp` below.
+ */
+const PET_MIN_H = 16
+const PET_MAX_H = 512
+
+/**
+ * Sanity band for the per-display density factor `M`.
+ *
+ * `M` is a ratio of two real measurements, so a garbled EDID or a scale factor
+ * read from a display that has just been unplugged can hand back anything.
+ * These are far wider than any real desktop (the measured pair on the machine
+ * this was written for is 0.65 and 1.06) and exist only so a nonsense reading
+ * cannot reach the size chain at all.
+ */
+const DISPLAY_SCALE_MIN = 0.25
+const DISPLAY_SCALE_MAX = 4
+
+/** Band for the per-display taste multiplier `K`. Default 1, i.e. no opinion. */
+const DISPLAY_TASTE_MIN = 0.5
+const DISPLAY_TASTE_MAX = 2
+
+/**
+ * Returns the MIDPOINT when `lo > hi`, deliberately, and that is load-bearing:
+ * a pet wider than the world has no correct edge to sit against and the centre
+ * is the only symmetric answer (there is a regression test pinning exactly
+ * that). The consequence is that an inverted range never raises -- it silently
+ * relocates. Every bound in this file is `x +/- w * k` or `top + h + k`, so
+ * GROWING a pet is precisely what inverts them. Call sites that can now be
+ * reached with a larger pet than before therefore test `lo > hi` themselves and
+ * pick the standable end, rather than letting the midpoint through.
+ */
+const clamp = (v, lo, hi) => (lo > hi ? (lo + hi) / 2 : v < lo ? lo : v > hi ? hi : v)
 /**
  * A pet's own size multiplier, sanitised.
  *
@@ -125,7 +164,19 @@ export class Pet {
     /** This pet's own multiplier on the world size. See `petFactor`. */
     this.sizeFactor = petFactor(spec.size)
 
-    this.k = 1            // px per source pixel, constant per pet
+    this.k = 1            // px per source pixel, re-derived on every size change
+    /**
+     * The screen this pet is currently being sized against, and the factors
+     * that were in force the last time `layoutClip` ran.
+     *
+     * Kept so a seam crossing can be detected without asking the DOM, and so
+     * the per-frame check can return before writing any style. `display` is
+     * dropped whenever the display map is replaced, because an entry from a
+     * monitor that has been unplugged must not keep sizing anything.
+     */
+    this.display = null
+    this.dispM = 1
+    this.dispK = 1
     this.action = 'idle'
     this.w = 24           // drawn character width  (not the canvas)
     this.h = 24           // drawn character height (not the canvas)
@@ -180,9 +231,118 @@ export class Pet {
    * changing animation never resizes the character.
    */
   applySize() {
-    const target = this.world.petHeight() * this.species.scale * this.sizeFactor
+    // `M` and `K` stay two factors, never one product. `M` is measured -- the
+    // density of the panel under the pet, relative to the single CSS grid this
+    // window was given -- and is what holds the pet at a constant PHYSICAL size
+    // across monitors. `K` is an opinion about a particular screen. Folding
+    // them together would make a taste setting indistinguishable from a
+    // measurement the next time either has to be debugged.
+    const d = this.governingDisplay()
+    const M = this.world.displayScale(d)
+    const K = this.world.displayTaste(d)
+    const target = clamp(
+      this.world.petHeight() * this.species.scale * this.sizeFactor * M * K,
+      PET_MIN_H, PET_MAX_H,
+    )
+    this.dispM = M
+    this.dispK = K
     this.k = target / (this.variant.baseH || target)
+    const wOld = this.w
+    const hOld = this.h
     this.layoutClip()
+    // A drag is anchored to offsets captured at `pointerdown`, in the pixels of
+    // the size the pet had then. `applyDisplaySize` refuses a held pet outright,
+    // but the world-level paths -- the size slider, `setScale`, `setOpts` -- do
+    // not, and they land here. Left alone the offsets keep pointing at a body
+    // that is no longer that size: the grab point slides down towards the feet
+    // and, at a screen edge, the narrowed corridor shoves the pet away from a
+    // pointer that has not moved.
+    if (this.state === 'held') this.regrab(wOld, hOld)
+  }
+
+  /**
+   * The screen whose density sizes this pet, with a deadband at the seam.
+   *
+   * Without the deadband this oscillates every frame: `clampToWorld` writes
+   * `x` using the pet's own half-width, the new `x` can land back over the
+   * previous screen, that re-selects the previous size, which relaxes the
+   * clamp, which lets it move back. The pet flickers between two sizes on the
+   * boundary and `layoutClip` writes the DOM on every frame of it.
+   *
+   * So a different screen is only adopted once the pet's centre is properly
+   * inside it -- further in than the clamp could ever push it back out. A point
+   * over no display at all keeps the last good screen rather than falling back
+   * to a default, because the dead rectangle under a short monitor is exactly
+   * where a pet has no density to read and the old one is still the honest
+   * answer.
+   */
+  governingDisplay() {
+    const d = this.world.displayAt(this.x, this.y)
+    if (!d) return this.display
+    if (!this.display || d.id === this.display.id) {
+      this.display = d
+      return d
+    }
+    const pad = Math.max(8, this.w * 0.5)
+    // A screen narrower than the deadband could never be entered at all, and a
+    // pet that can never adopt it would wear the wrong size there forever.
+    const inside = d.width <= pad * 2
+      || (this.x >= d.x + pad && this.x <= d.x + d.width - pad)
+    if (!inside) return this.display
+    this.display = d
+    return d
+  }
+
+  /**
+   * Re-size this pet for the screen it is standing on. The ONLY place a live
+   * pet's size may change as a result of where it is.
+   *
+   * The order below is the whole of it, and none of the steps commute:
+   *
+   * 1. Some states own the pet's geometry outright. A drag is anchored to
+   *    offsets captured at `pointerdown`, and a hop and a fall are both arcs
+   *    frozen at take-off; resizing under any of the three moves the pet out
+   *    from under the thing that is steering it. This is the same guard
+   *    `setPlatforms` already applies, for the same reason.
+   * 2. The screen is resolved once, through the deadband, so steps 4-6 all
+   *    agree about which screen they are working against.
+   * 3. Nothing is written unless the factors actually moved. `layoutClip` has
+   *    no dirty check of its own, so without this a pet standing still writes
+   *    six style properties every frame for as long as it exists.
+   * 4. The size goes through `applySize`, never through `this.k` or
+   *    `this.w`/`this.h` directly: `render` reads the shadow's size back out of
+   *    its own inline CSS, so a size written anywhere but `layoutClip` leaves
+   *    the shadow at the old dimensions and mis-centred.
+   * 5. A pet that just grew still has its feet where they were -- the body
+   *    grows upward -- but its head can now be above its own screen's top edge,
+   *    and a platform pet can overhang further than the card allows.
+   *    `setSizeFactor` re-snaps platform pets and has never handled free ones;
+   *    a free pet crossing a seam is precisely the case it does not cover.
+   * 6. The world box is the bound that cannot go stale, so it goes last.
+   */
+  applyDisplaySize() {
+    if (this.state === 'held' || this.state === 'air' || this.state === 'hop') return
+
+    const d = this.governingDisplay()
+    if (!d) return
+
+    const M = this.world.displayScale(d)
+    const K = this.world.displayTaste(d)
+    // Half a percent: below that the rounding in `layoutClip` cannot produce a
+    // different pixel, so the write would be pure cost.
+    const same = (a, b) => Math.abs(a - b) <= Math.abs(b) * 0.005
+    if (same(M, this.dispM) && same(K, this.dispK)) return
+
+    this.applySize()
+
+    // A destination chosen at the old size can sit outside the bounds the new
+    // size produces, and the pet would then walk to the clamp and stop there.
+    this.target = null
+
+    if (this.mode === 'platform') this.snap()
+    else this.settleToFloor()
+
+    this.clampToWorld()
   }
 
   /**
@@ -219,8 +379,12 @@ export class Pet {
     this.anchorX = (bx + bw / 2) * k
     this.anchorY = (by + bh) * k
 
-    this.el.style.width = `${(cw * k).toFixed(1)}px`
-    this.el.style.height = `${(ch * k).toFixed(1)}px`
+    // The canvas itself needs a floor too, separate from the character box
+    // above: a pet scaled down enough (a tiny `sizeFactor` on a small world
+    // size) can make `cw * k` / `ch * k` round to 0px, which collapses the
+    // `<img>` to nothing -- invisible and, since it has no box, unclickable.
+    this.el.style.width = `${Math.max(1, cw * k).toFixed(1)}px`
+    this.el.style.height = `${Math.max(1, ch * k).toFixed(1)}px`
     // Flip and tilt around the character's feet, not the canvas corner.
     this.el.style.transformOrigin = `${this.anchorX.toFixed(1)}px ${this.anchorY.toFixed(1)}px`
 
@@ -258,19 +422,84 @@ export class Pet {
 
   get platform() { return this.world.platformById(this.platformId) }
 
+  /**
+   * Keep the drawn character inside the world, whatever the cards say.
+   *
+   * Platform clamps are all expressed against a card's own span, which is only
+   * as trustworthy as the last measurement of it. When the window shrinks
+   * faster than the cards are re-measured, that span still describes the old,
+   * wider window and walks the pet straight out of the visible area, where
+   * `overflow: hidden` slices it in half. The world box is the one bound that
+   * cannot go stale, so every position ultimately passes through here.
+   */
+  clampToWorld() {
+    const halfW = this.w * 0.5
+    const w = this.world.w
+    const h = this.world.h
+    if (w > 0) this.x = clamp(this.x, halfW, w - halfW)
+    // Feet, not centre: `y` is where the character stands.
+    //
+    // The lower bound is the floor of the screen under the pet, not the bottom
+    // of the world. The overlay covers whole displays, so the world's bottom
+    // edge runs *behind the taskbar*; clamping to it is what let a pet stand
+    // on the clock. `roamBounds()` already knew the right floor, but this runs
+    // after it on nine call sites and silently widened the box again.
+    //
+    // `Math.min` rather than the floor alone: a display map that has not
+    // arrived yet, or a point over no display at all, must not be able to
+    // clamp a pet *below* the world and out of sight.
+    //
+    // The head clearance is the top of the SCREEN the pet is over, not the top
+    // of the world -- the same asymmetry the floor above corrects, in the other
+    // direction. A screen that does not start at the world's own origin (any
+    // monitor mounted lower than its neighbour, which is the common case: the
+    // measured desktop's secondary starts 154 CSS px down) has a band of world
+    // above it that is part of no display and draws nothing. A pet clamped to
+    // `this.h` there keeps its feet inside the world and hangs its head in that
+    // blank band, and growing the pet for a dense panel is exactly what pushes
+    // the head up into it. `roamBounds` has always used `top + this.h`; this
+    // ran after it on nine call sites and quietly widened the box again.
+    //
+    // Applied only while the pet FITS between that top edge and the floor.
+    // When it does not, the display-absolute bound would invert the range, and
+    // `clamp` answers an inverted range with its midpoint -- which for a pet
+    // taller than its screen would be a NEW way to park it behind the taskbar,
+    // traded for a head that was merely clipped. The world-absolute clearance
+    // is the fallback because it is byte-for-byte the old behaviour: a pet too
+    // big for its screen is no worse off than it is today, and there is a green
+    // test pinning that midpoint for the pet-wider-than-the-world case.
+    if (h > 0) {
+      const { top, floor } = this.world.screenSpan(this.x, this.y)
+      const bottom = Number.isFinite(floor) ? Math.min(h, floor) : h
+      const head = Number.isFinite(top) && top > 0 ? top + this.h : this.h
+      this.y = clamp(this.y, head <= bottom ? head : this.h, bottom)
+    }
+  }
+
   snap() {
     if (this.mode === 'free') return
     const p = this.platform
     if (!p) return
     this.x = clamp(this.x, p.x1 + this.w * 0.4, p.x2 - this.w * 0.4)
     this.y = p.y
+    // The card's span is advisory; the window's is not.
+    this.clampToWorld()
   }
 
   moveTo(platform, keepX) {
     if (!platform) return
     this.platformId = platform.id
     this.cameFrom = null
-    if (!keepX) this.x = rand(platform.x1 + this.w, platform.x2 - this.w)
+    // `rand` has no inverted-range guard, and this corridor is a full sprite
+    // width in from each edge: a pet that grew wider than half the card gets a
+    // point OUTSIDE the card it is being placed on. This is the recovery path
+    // for a pet that fell off the world, so landing it off the card again is
+    // the one outcome it must not have.
+    if (!keepX) {
+      const lo = platform.x1 + this.w
+      const hi = platform.x2 - this.w
+      this.x = lo > hi ? (platform.x1 + platform.x2) / 2 : rand(lo, hi)
+    }
     this.snap()
     this.state = 'land'
     this.timer = 0.35
@@ -293,13 +522,33 @@ export class Pet {
    * is there for `pickHopTarget` when straight up or straight down is the card
    * the pet has just come from.
    */
+  /**
+   * Of these cards, the ones this pet has room to land on.
+   *
+   * `1.5 * w` is the comfortable figure -- room to land and then walk a little.
+   * It was also an absolute veto, and a pet sized up for a dense panel can be
+   * wide enough that EVERY card fails it. The pet then has nowhere to hop, for
+   * as long as it is that size, and simply stops using half its behaviour; it
+   * reads as the pet having frozen, with nothing to indicate why.
+   *
+   * So the comfortable width is preferred and a tighter one accepted rather
+   * than returning nothing. `1.1` is the floor because the walk clamp needs
+   * `0.8 * w` of card to keep a pet from turning round on the spot every frame
+   * -- landing somewhere it cannot stand would trade a frozen pet for a
+   * twitching one.
+   */
+  roomyOf(cards) {
+    const fits = (k) => cards.filter((p) => p.x2 - p.x1 > this.w * k)
+    const easy = fits(1.5)
+    return easy.length ? easy : fits(1.1)
+  }
+
   levelCards(delta) {
     const here = this.platform
     if (!here) return []
-    const roomy = (p) => p.x2 - p.x1 > this.w * 1.5
-    const side = this.world.platforms.filter((p) => (
-      roomy(p) && (delta < 0 ? p.y < here.y - LEVEL_EPS : p.y > here.y + LEVEL_EPS)
-    ))
+    const side = this.roomyOf(this.world.platforms.filter((p) => (
+      delta < 0 ? p.y < here.y - LEVEL_EPS : p.y > here.y + LEVEL_EPS
+    )))
     if (!side.length) return []
     // The nearest level in that direction, then every card sitting on it.
     const level = side.reduce((best, p) => (
@@ -333,13 +582,9 @@ export class Pet {
     const here = this.platform
     if (!here) return []
     const off = (p) => Math.abs(p.x1 + p.x2 - 2 * this.x)
-    return this.world.platforms
-      .filter((p) => (
-        p.id !== here.id
-        && p.x2 - p.x1 > this.w * 1.5
-        && Math.abs(p.y - here.y) <= LEVEL_EPS
-      ))
-      .sort((a, b) => off(a) - off(b))
+    return this.roomyOf(this.world.platforms.filter((p) => (
+      p.id !== here.id && Math.abs(p.y - here.y) <= LEVEL_EPS
+    ))).sort((a, b) => off(a) - off(b))
   }
 
   /** Move one platform up (-1) or down (+1) in visual order. */
@@ -366,13 +611,73 @@ export class Pet {
     this.setClip('held')
   }
 
+  /**
+   * Where a dragged pet is allowed to be, for a position it is being asked for.
+   *
+   * The bottom bound is the floor of the screen the pet would land over, not
+   * the bottom of the world -- the same bound `clampToWorld` is careful to use
+   * and the one the drag path was missing. The world's bottom edge runs behind
+   * the taskbar and, on a desktop whose monitors are different heights, across
+   * the dead rectangle under the shorter one: a pet let go in either place is
+   * out of sight, and the rectangle is also exactly where the size resolver has
+   * no panel density to read.
+   *
+   * The floor is resolved for the position being proposed, not the one the pet
+   * still has, so the bound changes on the frame the cursor crosses the seam
+   * rather than one frame late.
+   *
+   * `this.h > bottom` is spelled out: a pet taller than the band between the
+   * top of the world and that floor inverts the range, and `clamp` answers an
+   * inverted range with its midpoint, which would leave the pet floating in the
+   * middle of the screen under the cursor. The floor is the standable end.
+   */
+  dragClamp(px, py) {
+    const x = clamp(px, this.w * 0.5, this.world.w - this.w * 0.5)
+    const { floor } = this.world.screenSpan(x, py)
+    const bottom = Number.isFinite(floor) ? Math.min(this.world.h, floor) : this.world.h
+    const y = this.h > bottom ? bottom : clamp(py, this.h, bottom)
+    return { x, y }
+  }
+
+  /**
+   * Re-anchor a held pet whose size just changed under it.
+   *
+   * `grabDX`/`grabDY` are absolute pixels taken at `pointerdown`. Grab a pet by
+   * the head on the sparse panel and the offset is most of its height; make it
+   * half again as tall and that same offset is its belly, so the sprite appears
+   * to slide through the user's hand as it inflates. Scaling both offsets by
+   * the size ratio keeps hold of the same POINT ON THE BODY -- `grabDY` by the
+   * height because `y` is the feet and the body grows upward from them.
+   *
+   * Then the clamp is re-run from the last known cursor, so the pet settles at
+   * a legal position for its new size in the same frame rather than waiting for
+   * a `pointermove` that may never come if the pointer is holding still.
+   * Deliberately not via `dragTo`: that would recompute the tilt and the throw
+   * velocity from a zero-length move and quietly discard the flick the user is
+   * in the middle of.
+   */
+  regrab(wOld, hOld) {
+    if (wOld > 0) this.grabDX *= this.w / wOld
+    if (hOld > 0) this.grabDY *= this.h / hOld
+    const c = this.lastCursor
+    if (!c) return
+    const { x, y } = this.dragClamp(c.x + this.grabDX, c.y + this.grabDY)
+    this.x = x
+    this.y = y
+  }
+
   dragTo(cursorX, cursorY) {
     const now = performance.now()
     const dt = Math.max(8, now - this.lastCursor.t) / 1000
     const dx = cursorX - this.lastCursor.x
 
-    this.x = cursorX + this.grabDX
-    this.y = cursorY + this.grabDY
+    // A drag can carry the cursor anywhere, including straight off the edge of
+    // the widget or desktop -- clamp to the world box so the sprite never gets
+    // dragged out where it can neither be seen nor grabbed again, and to the
+    // floor of the screen under it so it cannot be parked behind the taskbar.
+    const at = this.dragClamp(cursorX + this.grabDX, cursorY + this.grabDY)
+    this.x = at.x
+    this.y = at.y
 
     // Swing the sprite into the direction of travel: it makes the pet feel
     // like it has weight, rather than being glued to the pointer.
@@ -393,6 +698,9 @@ export class Pet {
       const b = this.roamBounds()
       this.x = clamp(this.x, b.x1, b.x2)
       this.y = clamp(this.y, b.y1, b.y2)
+      // Roam bounds come from the display list, which lags an unplugged screen
+      // or a resized desktop; the world box is measured, so it cannot.
+      this.clampToWorld()
       this.state = 'roam'
       this.target = null
       this.setClip('idle')
@@ -519,7 +827,8 @@ export class Pet {
       return
     }
     // Coming home: fall onto whatever card is underneath.
-    const p = this.world.landingBelow(this.x, this.y) || this.world.nearest(this.x, this.y)
+    const p = this.world.landingBelow(this.x, this.y, this.w * 0.5)
+      || this.world.nearest(this.x, this.y)
     if (p) this.platformId = p.id
     this.state = 'air'
     this.vx = 0
@@ -563,8 +872,18 @@ export class Pet {
    */
   settleToFloor() {
     const b = this.roamBounds()
-    if (this.y >= b.y1 - 1 && this.y <= b.y2 + 1) return
-    const y = clamp(this.y, b.y1, b.y2)
+    // Both bounds carry the pet's own height (`y1 = top + h + 24`), so a pet
+    // too tall for the band between a screen's top edge and its floor inverts
+    // them. The old "am I already settled?" test compared against `y1` and `y2`
+    // separately, which no y on the number line can satisfy once y1 > y2 -- so
+    // this ran every roam frame and launched a hop every time, forever, while
+    // `clamp` parked the pet at the midpoint of a band it cannot fit in.
+    // Resolving the target first and asking whether we are already AT it is
+    // the same test when the band is sane, and terminates when it is not.
+    // The floor is the end to choose: a pet standing on the floor is visible
+    // and standable, and the midpoint is neither.
+    const y = b.y1 > b.y2 ? b.y2 : clamp(this.y, b.y1, b.y2)
+    if (Math.abs(this.y - y) <= 1) return
     this.hopToId = null
     this.hopTo(this.x, y, Math.min(120, Math.abs(y - this.y) * 0.45 + this.h * 0.6))
     this.target = null
@@ -583,8 +902,25 @@ export class Pet {
 
   // ── behaviour ───────────────────────────────────────────────────────────────
 
+  /**
+   * Walking pace, in CSS px per second.
+   *
+   * Pace is tied to height on purpose -- a bigger pet takes bigger strides --
+   * and that is what carries the per-display factor `M` through to motion: on a
+   * denser panel the pet is more CSS pixels tall, so it covers more CSS pixels
+   * per second, and both cancel to the SAME REAL-WORLD speed. A pet that kept a
+   * constant pixel pace would visibly trudge across the dense screen and scurry
+   * across the sparse one.
+   *
+   * `K` is divided back out because it is not a measurement. It is somebody's
+   * opinion that pets should look bigger on one screen, and letting an opinion
+   * about size silently become an opinion about speed makes the two impossible
+   * to tune independently -- turn the pet up on the big monitor and it starts
+   * sprinting, with nothing on screen to say why.
+   */
   speedPx() {
-    return BASE_SPEED * (this.h / 56) * this.world.opts.speed * this.tempo
+    const taste = this.dispK > 0 ? this.dispK : 1
+    return BASE_SPEED * (this.h / taste / 56) * this.world.opts.speed * this.tempo
   }
 
   /**
@@ -747,7 +1083,7 @@ export class Pet {
           this.vx = -Math.abs(this.vx) * 0.55
         }
 
-        const p = this.world.landingBelow(this.x, prevY)
+        const p = this.world.landingBelow(this.x, prevY, this.w * 0.5)
         if (p && this.y >= p.y) {
           this.platformId = p.id
           this.cameFrom = null
@@ -772,13 +1108,44 @@ export class Pet {
         // never a card to land on and the pet fell through the widget from the
         // top over and over. Waiting costs nothing: `setPlatforms` puts it back
         // in the air the moment there is ground to aim at.
-        if (this.y > this.world.h + 120) {
+        // A body length below the world, never a flat 120. The threshold is
+        // asking "is this sprite still visible?", and that question is answered
+        // in units of the sprite: 120px is most of the way past a 26px pet and
+        // nowhere near past a pet sized up for a dense panel, which can stand
+        // 512px tall (PET_MAX_H). Declaring THAT one lost snatches away a
+        // sprite whose head is still well inside the window and drops it on
+        // the lowest card -- a teleport, from the user's side, of a pet they
+        // can plainly see. The 120 stays as the floor so a small pet's
+        // threshold is unchanged, and the +24 matches `roamBounds`' own
+        // standing margin so the two bounds do not disagree by a hair.
+        if (this.y > this.world.h + Math.max(120, this.h + 24)) {
           const ground = this.world.lowest()
           if (ground) { this.moveTo(ground, false); break }
-          this.x = clamp(this.x, this.w, Math.max(this.w, this.world.w - this.w))
+          // Half-width per side, like every other horizontal bound in this
+          // file (`clampToWorld`, `dragClamp`, `roamBounds` all use `w * 0.5`
+          // or `w * 0.6`). A full `this.w` insets the corridor by a whole body
+          // on each side, which for a pet grown for a dense panel is most of a
+          // narrow world -- so the recovery that exists to put the pet back
+          // where it can be seen shoves it, in one frame, further than it
+          // would have travelled had it never been rescued.
+          //
+          // And the inversion is spelled out rather than hidden. The old
+          // `Math.max(this.w, ...)` collapsed an inverted range onto its LEFT
+          // inset, parking a pet wider than the world hard against a bound
+          // that is past the right edge. There is no corridor at all when the
+          // pet is wider than the world; the world's centre is the only
+          // symmetric answer, and it is the one `clampToWorld` gives, so the
+          // two agree instead of fighting on the next frame.
+          const halfW = this.w * 0.5
+          const lo = halfW
+          const hi = this.world.w - halfW
+          this.x = lo > hi ? this.world.w / 2 : clamp(this.x, lo, hi)
           this.y = this.world.h - 8
           this.vy = 0
           this.vx = 0
+          // `h - 8` is shallower than the sprite itself once the widget is
+          // small enough, which would hang its head out of the top edge.
+          this.clampToWorld()
           this.platformId = null
           this.state = 'idle'
           this.timer = rand(0.6, 1.4)
@@ -792,12 +1159,18 @@ export class Pet {
         const t = Math.min(1, this.hopT / this.hopDur)
         this.x = this.hopX0 + (this.hopX1 - this.hopX0) * t
         this.y = (this.hopY0 + (this.hopY1 - this.hopY0) * t) - Math.sin(Math.PI * t) * this.hopPeak
+        // The arc was aimed when the world was a different size, and its peak
+        // is unbounded upwards, so mid-flight needs the same bound as landing.
+        this.clampToWorld()
         // Lean into the take-off and out of the landing.
         this.tilt = Math.cos(Math.PI * t) * 9 * this.dir
         if (t >= 1) {
           this.x = this.hopX1
           this.y = this.hopY1
           this.tilt = 0
+          // Landing on a stale endpoint escapes the window just as surely as
+          // flying to one does.
+          this.clampToWorld()
           // The card it was aiming for may have gone -- a mode switch, a card
           // that collapsed -- in which case it falls instead of standing on a
           // platform that is no longer there.
@@ -917,6 +1290,9 @@ export class Pet {
         this.vxNow = this.dir * this.speedPx() * 3.1
         this.x += this.vxNow * dt
         if (lockY !== null) this.y = lockY
+        // The chase target was clamped to a card span or to roam bounds, both
+        // of which can describe a wider window than the one on screen now.
+        this.clampToWorld()
         break
       }
 
@@ -962,7 +1338,19 @@ export class Pet {
 
         const lo = p.x1 + this.w * 0.4
         const hi = p.x2 - this.w * 0.4
-        if (this.x <= lo || this.x >= hi) {
+        if (lo > hi) {
+          // The card is narrower than the pet needs to stand on it, which a
+          // pet that grew on a denser screen can reach. Turning here does not
+          // help: `clamp` answers an inverted range with its midpoint, and the
+          // midpoint of [lo, hi] when lo > hi lies PAST hi, so the edge test
+          // fires again on the very next frame and the pet turns on the spot
+          // forever. Park it in the middle of the card and idle instead; the
+          // idle timer ends the loop the way any other stop does.
+          this.x = (p.x1 + p.x2) / 2
+          this.state = 'idle'
+          this.timer = rand(0.4, 1.4)
+          this.setClip('idle')
+        } else if (this.x <= lo || this.x >= hi) {
           this.x = clamp(this.x, lo, hi)
           this.dir *= -1
           // Pause at the end of the card before turning back.
@@ -972,6 +1360,10 @@ export class Pet {
         } else if (this.timer <= 0) {
           if (this.world.opts.calm) { this.state = 'idle'; this.timer = 4; this.setClip('idle') } else this.decide()
         }
+        // After the turn, never instead of it: the card clamp above owns the
+        // deliberate overhang a pet is meant to have at a card's edge, and
+        // this only bites when the card is describing a window that is gone.
+        this.clampToWorld()
         break
       }
 
@@ -979,6 +1371,15 @@ export class Pet {
         this.state = 'idle'
         this.timer = 1
     }
+
+    // A pet that has just crossed a monitor seam is standing on a panel with a
+    // different pixel density, so its real-world size changed although nothing
+    // about the pet did. Here, rather than in any of the six branches that
+    // write `x` above: all of them join at this line, it is after the clamp and
+    // the settle that can still move the pet, and it is before `render` runs
+    // for this frame, so the new size is painted with the position that earned
+    // it instead of one frame late.
+    this.applyDisplaySize()
 
     // Ease the drag tilt back to level.
     if (this.state !== 'held') this.tilt += (0 - this.tilt) * Math.min(1, dt * 9)
@@ -1024,7 +1425,7 @@ export class Pet {
       groundY = this.state === 'hop' ? this.hopY1 : this.y
       spread = 1 + lift * 0.4
     } else if (this.state === 'air' || this.state === 'held' || this.state === 'hop') {
-      const p = this.world.landingBelow(this.x, this.y) || this.world.lowest()
+      const p = this.world.landingBelow(this.x, this.y, this.w * 0.5) || this.world.lowest()
       if (p) {
         groundY = p.y
         const gap = clamp((groundY - this.y) / 320, 0, 1)
@@ -1084,6 +1485,19 @@ export class World {
      */
     this.displays = []
 
+    /**
+     * The single CSS-to-device factor this WINDOW was given, `S`.
+     *
+     * One window has one CSS pixel, whatever the desktop under it looks like,
+     * and everything in `displays` has already been divided by this number to
+     * get here. It is therefore the denominator that turns a panel's own
+     * density back into "how much bigger or smaller than nominal should a pet
+     * be drawn over here".
+     *
+     * 0 means the host has not said. See `windowScaleOf` for what is used then.
+     */
+    this.windowScale = 0
+
     this.w = 0
     this.h = 0
     this.pets = []
@@ -1091,11 +1505,85 @@ export class World {
     this.cursor = { x: -9999, y: -9999, inside: false }
 
     this.running = false
+    /** Pending requestAnimationFrame handle, or 0 when no frame is scheduled. */
+    this.raf = 0
     this.last = 0
     this.frame = this.frame.bind(this)
   }
 
   petHeight() { return this.opts.size * this.scale }
+
+  /** The window's CSS-to-device factor, told or inferred. */
+  setWindowScale(s) {
+    const n = Number(s)
+    const next = Number.isFinite(n) && n > 0 ? n : 0
+    if (next === this.windowScale) return
+    this.windowScale = next
+    for (const p of this.pets) p.applySize()
+  }
+
+  /**
+   * `S`, with a fallback.
+   *
+   * Windows hands a window the scale factor of whichever monitor it covers most
+   * in device pixels, so for an overlay spanning the desktop that is the
+   * densest screen it meaningfully overlaps. The largest `sf` in the map is
+   * therefore the right guess when nobody has said, and it degrades to 1 on a
+   * payload that predates `sf` entirely -- which makes `M` exactly 1 and the
+   * whole per-display correction a no-op, rather than a wrong answer.
+   */
+  windowScaleOf() {
+    if (this.windowScale > 0) return this.windowScale
+    let max = 0
+    for (const d of this.displays) {
+      const sf = Number(d.sf)
+      if (Number.isFinite(sf) && sf > max) max = sf
+    }
+    return max > 0 ? max : 1
+  }
+
+  /**
+   * `M` -- how much bigger a pet must be drawn on this screen to come out the
+   * same PHYSICAL size as on the screen the window was scaled for.
+   *
+   * Real PPI is preferred because it is the actual answer: the window draws at
+   * `96 * S` dots per inch, the panel has `ppi`, and the ratio is the
+   * correction. `scaleFactor` is the fallback and only an approximation of it,
+   * because Windows rounds a display's scale to a user-facing percentage that
+   * has nothing to do with the panel's real dot pitch -- it recovers most of
+   * the error and is the best available when there is no EDID to read.
+   *
+   * Anything unusable returns exactly 1, which is the old behaviour, so a
+   * payload without the new fields installs and draws as it always did.
+   */
+  displayScale(d) {
+    if (!d) return 1
+    const S = this.windowScaleOf()
+    if (!(S > 0)) return 1
+
+    const ppi = Number(d.ppi)
+    const sf = Number(d.sf)
+    let m
+    if (Number.isFinite(ppi) && ppi > 0) m = ppi / (96 * S)
+    else if (Number.isFinite(sf) && sf > 0) m = sf / S
+    else return 1
+
+    if (!Number.isFinite(m) || m <= 0) return 1
+    return clamp(m, DISPLAY_SCALE_MIN, DISPLAY_SCALE_MAX)
+  }
+
+  /**
+   * `K` -- a deliberate per-screen opinion about size, on top of the measured
+   * correction. Held apart from `M` permanently: one is a measurement and one
+   * is a preference, and a bug in either is only findable while they are still
+   * two numbers.
+   */
+  displayTaste(d) {
+    if (!d) return 1
+    const k = Number(d.k)
+    if (!Number.isFinite(k) || k <= 0) return 1
+    return clamp(k, DISPLAY_TASTE_MIN, DISPLAY_TASTE_MAX)
+  }
 
   /**
    * The screen a point is on, or the one it belongs to if it is on none.
@@ -1156,6 +1644,19 @@ export class World {
         const b = p.roamBounds()
         p.y = clamp(before[i].yf * h, b.y1, b.y2)
       } else p.snap()
+      // Unconditionally, after either branch. This is the path the user's bug
+      // runs down: `snap()` clamps to a card, and at the instant the window
+      // shrinks those cards still span the old, wider window, so the pet is
+      // left outside the new one and sliced by `overflow: hidden`. The sprite
+      // also keeps its pixel size while the world loses width, so even a
+      // fraction that was safely inside before can land past the edge.
+      p.clampToWorld()
+      // A world resize moves a pet by a FRACTION of the width, so a pet can end
+      // up on a different monitor without having moved itself an inch. Nothing
+      // else would notice: `setSize` is not a crossing and not a display
+      // change, so without this the pet keeps the density of the screen it used
+      // to be on, indefinitely.
+      p.applyDisplaySize()
     })
   }
 
@@ -1168,16 +1669,31 @@ export class World {
    * or a taskbar that moved to the other edge without the desktop's overall
    * size changing at all, which `setSize` would not even see.
    */
-  setDisplays(list) {
+  setDisplays(list, windowScale) {
+    // Deliberately NOT tightened to require `sf` or `ppi`. A payload built
+    // before those existed must still install and simply produce M = 1;
+    // rejecting it here would turn an old payload into a silent no-op rather
+    // than an error anyone could see.
     this.displays = (Array.isArray(list) ? list : []).filter((d) => (
       d && Number.isFinite(d.x) && Number.isFinite(d.y)
       && d.width > 0 && d.height > 0 && Number.isFinite(d.floor)
     ))
+    const s = Number(windowScale)
+    if (Number.isFinite(s) && s > 0) this.windowScale = s
+
     for (const p of this.pets) {
-      if (p.mode !== 'free') continue
-      const b = p.roamBounds()
-      p.x = clamp(p.x, b.x1, b.x2)
-      p.y = clamp(p.y, b.y1, b.y2)
+      // Drop the cached screen first: it may be an entry that is no longer in
+      // the map at all, and a size taken from a monitor that has been unplugged
+      // is worse than no cache.
+      p.display = null
+      if (p.mode === 'free') {
+        const b = p.roamBounds()
+        p.x = clamp(p.x, b.x1, b.x2)
+        p.y = clamp(p.y, b.y1, b.y2)
+      }
+      // Platform pets too: a monitor swapped under a card changes the density
+      // its pet is standing at, even though the card has not moved.
+      p.applyDisplaySize()
     }
   }
 
@@ -1213,7 +1729,12 @@ export class World {
       if (pet.mode !== 'platform') continue
       if (pet.platformId && ids.has(pet.platformId)) {
         if (pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') pet.snap()
-      } else if (list.length && pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') {
+      } else if (pet.state !== 'held' && pet.state !== 'air' && pet.state !== 'hop') {
+        // Drop it into 'air' whether or not any platform survived the swap:
+        // the fall handler already lands it on whatever is below when there
+        // is ground, and settles it at the foot of the widget when there is
+        // none, so there is no need to special-case an empty platform list
+        // here and leave the pet stranded, floating over ground that is gone.
         pet.platformId = null
         pet.state = 'air'
         pet.vy = 0
@@ -1225,13 +1746,31 @@ export class World {
 
   platformById(id) { return this.platforms.find((p) => p.id === id) || null }
 
-  /** The nearest platform strictly below `y` whose span contains `x`. */
-  landingBelow(x, y) {
+  /**
+   * The nearest platform strictly below `y` whose span contains `x`.
+   *
+   * `pad` is how far outside a card's span `x` may be and still count as above
+   * it. `x` is the pet's CENTRE, so the honest answer is half a sprite width:
+   * that is the question being asked -- is any of this body over that card?
+   *
+   * The flat 24px it defaults to was written when every pet was about one size.
+   * A pet scaled up for a dense panel is wider than 48px all by itself, so its
+   * own body can be over a card that this says it is not above, and it falls
+   * straight past the card under its feet. `snap` compounds it: a standing pet
+   * is only clamped to `0.4 * w` inside the card's ends, so the sprite legally
+   * hangs over the edge and the two rules disagree about the same pet.
+   *
+   * Callers that know the pet pass `pet.w * 0.5`; the default keeps every
+   * caller that does not byte-identical, and the `Math.max` means a small pet
+   * never gets a TIGHTER tolerance than before.
+   */
+  landingBelow(x, y, pad = 24) {
+    const tol = Math.max(24, pad)
     let best = null
     let bestY = Infinity
     for (const p of this.platforms) {
       if (p.y < y - 1) continue
-      if (x < p.x1 - 24 || x > p.x2 + 24) continue
+      if (x < p.x1 - tol || x > p.x2 + tol) continue
       if (p.y < bestY) { bestY = p.y; best = p }
     }
     return best
@@ -1257,6 +1796,9 @@ export class World {
   add(spec) {
     const pet = new Pet(this, spec)
     this.pets.push(pet)
+    // The only place `pets` ever grows, and so the only place a world that
+    // parked itself for want of anything to animate can learn otherwise.
+    this.wake()
     return pet
   }
 
@@ -1339,16 +1881,46 @@ export class World {
     }
   }
 
+  /**
+   * Schedule a frame, if one is wanted and none is already pending.
+   *
+   * `running` means "this world should animate", not "a frame is queued" -- the
+   * two come apart whenever the loop parks itself with no pets to draw. The
+   * `raf` handle is what makes double-scheduling impossible, so this is safe
+   * to call from anywhere, as often as it likes.
+   */
+  wake() {
+    if (!this.running || this.raf || !this.pets.length) return
+    // Fresh clock: the gap since the last frame may be arbitrarily long, and
+    // a stale one would hand the first frame a jump instead of a step.
+    this.last = performance.now()
+    this.raf = requestAnimationFrame(this.frame)
+  }
+
   start() {
+    // Idempotent on purpose: PetLayer calls this on repeated renders.
     if (this.running) return
     this.running = true
     this.last = performance.now()
-    requestAnimationFrame(this.frame)
+    this.raf = requestAnimationFrame(this.frame)
   }
 
-  stop() { this.running = false }
+  /**
+   * Really stop, rather than letting one more frame through.
+   *
+   * Flipping the flag alone left a frame already queued to fire. On the
+   * desktop overlay -- a transparent, always-on-top window the size of the
+   * whole desktop, with `backgroundThrottling` disabled -- that loop went on
+   * compositing forever behind a layer nobody was looking at.
+   */
+  stop() {
+    this.running = false
+    if (this.raf) cancelAnimationFrame(this.raf)
+    this.raf = 0
+  }
 
   frame(now) {
+    this.raf = 0
     if (!this.running) return
     const dt = Math.min(0.05, (now - this.last) / 1000)
     this.last = now
@@ -1357,7 +1929,12 @@ export class World {
     this.resolveMeetings()
     for (const pet of this.pets) pet.render()
 
-    requestAnimationFrame(this.frame)
+    // Park rather than re-arm when there is nothing to draw. `add()` is the
+    // only way back into a non-empty world and it calls `wake()`; `running`
+    // deliberately stays true so that wake path needs no second flag, and so
+    // `start()` stays idempotent for the callers that rely on it.
+    if (!this.pets.length) return
+    this.raf = requestAnimationFrame(this.frame)
   }
 }
 

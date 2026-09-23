@@ -7,7 +7,17 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('nwPets', {
-  /** The display this overlay covers, including where the taskbar starts. */
+  /**
+   * The desktop this overlay covers: every display, not one.
+   *
+   * Pure passthrough, deliberately. Everything geometric in the payload --
+   * `displays[]`, `worldWidth`/`worldHeight`, each screen's `floor` -- is
+   * already in this window's CSS px, converted per monitor in the main
+   * process because a mixed-DPI desktop has no single scale. Nothing here
+   * may scale, offset or origin-shift it: a second monitor to the left has
+   * negative DIP coordinates, and re-deriving anything on this side is how
+   * the two ends stop agreeing.
+   */
   bounds: () => ipcRenderer.invoke('pets-bounds'),
 
   /** The roster and tuning. Called again on every change in the widget. */
@@ -17,7 +27,11 @@ contextBridge.exposeInMainWorld('nwPets', {
     return () => ipcRenderer.off('pets', handler)
   },
 
-  /** The display changed shape; the pets need re-fitting to it. */
+  /**
+   * The desktop changed shape -- resolution, layout, or which monitor's
+   * scale factor this window's CSS px is built from. Same payload as
+   * `bounds()`, same units, passed through untouched.
+   */
   onBounds(fn) {
     const handler = (_e, b) => fn(b)
     ipcRenderer.on('bounds', handler)

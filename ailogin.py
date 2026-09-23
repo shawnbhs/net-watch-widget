@@ -211,6 +211,25 @@ _XDG_DIRS = (
 #   cmd_key     the .env key core.py already uses for this provider's login
 #               command, reused verbatim so a user configures the command in
 #               exactly one place for both the old and the isolated path.
+#   unset_vars  names to `unset` INSIDE the distro before the CLI runs, e.g. a
+#               proxy credential the user's own ~/.bashrc exports that would
+#               make the CLI believe it is already authenticated and turn the
+#               login into a silent no-op. This is a REMOVAL list, unlike
+#               every field above it, and only takes effect on a wsl.exe/
+#               bash -c launch (see _wrap_wsl_login_command) -- that is the
+#               only point downstream of the rc file, so it is also the only
+#               point a removal can happen at all; a parent-side env edit
+#               cannot reach a variable the rc file creates on the far side
+#               of the interop boundary.
+#               .env key: AI_LOGIN_UNSET_VARS_<PROV>  (semicolon separated)
+#   login_suffix  words appended to the configured command's tail when it does
+#               not already contain the first of them, turning a bare CLI
+#               invocation that would open an interactive REPL into a real,
+#               non-interactive login subcommand. Empty means the configured
+#               command already names its own subcommand (true of codex's
+#               default, "... codex login"). Same wsl.exe/bash -c-only scope
+#               as unset_vars.
+#               .env key: AI_LOGIN_SUBCOMMAND_<PROV>  (space separated)
 _PROVIDER_ENV = {
     "claude": {
         "home_vars":  ("HOME",),
@@ -218,6 +237,14 @@ _PROVIDER_ENV = {
         "config_rel": ".claude",
         "cred_rel":   ".claude/.credentials.json",
         "cmd_key":    "AI_LOGIN_CMD_CLAUDE",
+        # `claude auth login` confirmed live against the installed CLI's own
+        # --help output ("auth" -> "login": "Sign in to your Anthropic
+        # account"). Bare `claude` opens the interactive REPL, and `/login`
+        # is a slash command typed INSIDE that REPL -- nothing here types it,
+        # so a bare invocation never performs an OAuth flow at all.
+        "unset_vars":   ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                          "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"),
+        "login_suffix": ("auth", "login"),
     },
     "codex": {
         "home_vars":  ("HOME",),
@@ -225,6 +252,12 @@ _PROVIDER_ENV = {
         "config_rel": ".codex",
         "cred_rel":   ".codex/auth.json",
         "cmd_key":    "AI_LOGIN_CMD_CODEX",
+        # The configured command already ends in "login" (.env), so no
+        # suffix is added here; the unset list is codex's analogue of
+        # claude's proxy variables, listed for the same reason -- an
+        # unproven guess, not yet confirmed against a live codex CLI.
+        "unset_vars":   ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        "login_suffix": (),
     },
 }
 
@@ -255,6 +288,17 @@ def provider_env_spec(provider):
         spec["config_var"] = (ENV.get(key, os.environ.get(key, "")) or "").strip()
     spec["config_rel"] = env_str("AI_LOGIN_CONFIG_REL_%s" % up, spec["config_rel"])
     spec["cred_rel"] = env_str("AI_LOGIN_CRED_REL_%s" % up, spec["cred_rel"])
+    raw_unset = env_str("AI_LOGIN_UNSET_VARS_%s" % up, "")
+    if raw_unset:
+        spec["unset_vars"] = tuple(
+            n.strip() for n in raw_unset.split(";") if n.strip())
+    else:
+        spec.setdefault("unset_vars", ())
+    raw_suffix = env_str("AI_LOGIN_SUBCOMMAND_%s" % up, "")
+    if raw_suffix:
+        spec["login_suffix"] = tuple(shlex.split(raw_suffix))
+    else:
+        spec.setdefault("login_suffix", ())
     return spec
 
 
@@ -416,14 +460,22 @@ class Sandbox(object):
     """
 
     __slots__ = ("provider", "dir", "env", "cred_path", "config_dir",
-                 "proc", "_closed", "_lock")
+                 "proc", "_closed", "_lock", "wsl_root")
 
-    def __init__(self, provider, directory, env, cred_path, config_dir):
+    def __init__(self, provider, directory, env, cred_path, config_dir,
+                 wsl_root=None):
         self.provider = provider
         self.dir = directory
         self.env = env
         self.cred_path = cred_path
         self.config_dir = config_dir
+        # The sandbox root translated to its WSL-side path ("/mnt/c/..."),
+        # computed once by create_sandbox via `wslpath`. None on a machine
+        # without WSL, or when the translation failed -- launch_login treats
+        # that as "cannot force HOME inside the distro" and falls back to the
+        # WSLENV-only behaviour rather than raising, since a Windows-only
+        # provider command never needed this in the first place.
+        self.wsl_root = wsl_root
         # The handle of the CLI launched into this sandbox, remembered so that
         # tear-down can stop it. Windows refuses to remove a directory while a
         # process holds a handle inside it -- and the child's working directory
@@ -648,10 +700,133 @@ def create_sandbox(provider):
                 existing.append(entry)
         env["WSLENV"] = ":".join(existing)
 
-    box = Sandbox(provider, root, env, cred_path, config_dir)
+    # WSLENV carries CLAUDE_CONFIG_DIR and the XDG vars across the interop
+    # boundary correctly (measured; see a2-sandbox.md) -- but NOT HOME. WSL's
+    # interop layer resets HOME from /etc/passwd on the far side regardless of
+    # HOME/p, in both login and non-login shells, so the sandbox's baseline
+    # isolation variable is silently dropped on every wsl.exe launch. The only
+    # remaining place to set it is inside the distro, in the command line
+    # itself (see _wrap_wsl_login_command), which needs the sandbox root
+    # already translated to its WSL-side path. That translation is done ONCE,
+    # here, rather than inside launch_login: calling `wslpath` on a value that
+    # WSLENV's own /p flag has already translated reproduces the doubled
+    # "/mnt/c/mnt/c/..." artifact seen during diagnosis, so this must be the
+    # single source of truth for the WSL-side path, computed from the
+    # UNtranslated Windows root exactly once.
+    wsl_root = None
+    if os.name == "nt":
+        try:
+            out = subprocess.run(
+                ["wsl.exe", "wslpath", "-a", "-u", root.replace("\\", "/")],
+                capture_output=True, text=True, timeout=10)
+            candidate = (out.stdout or "").strip()
+            if out.returncode == 0 and candidate:
+                wsl_root = candidate
+        except Exception:
+            # No WSL installed, wslpath missing, or the call simply failed.
+            # launch_login treats a None wsl_root as "cannot force HOME
+            # in-distro" and leaves the WSLENV-only behaviour in place rather
+            # than raising -- a provider command that never targets wsl.exe
+            # never needed this value anyway.
+            wsl_root = None
+
+    box = Sandbox(provider, root, env, cred_path, config_dir, wsl_root=wsl_root)
     with _LIVE_LOCK:
         _LIVE[os.path.normcase(root)] = box
     return box
+
+
+def _is_wsl_launcher(argv):
+    """True when argv[0] names the WSL interop executable."""
+    if not argv:
+        return False
+    head = os.path.basename(str(argv[0])).lower()
+    return head in ("wsl", "wsl.exe")
+
+
+def _wrap_wsl_login_command(provider, argv, wsl_root):
+    """Rewrite a `wsl.exe ... bash -c<flags> "<cmd>"` argv so the in-distro
+    command scrubs interfering vars and sets HOME itself, and carries the
+    provider's real login subcommand.
+
+    Returns argv unchanged when the shape is not recognised -- a provider
+    command that does not go through `bash -c*` gets none of this, which is
+    strictly the old behaviour rather than a broken new one; this function
+    only ever adds isolation, it never removes the caller's ability to run a
+    plain command.
+
+    WHY this happens in the command line rather than the environment: both
+    defects it fixes live downstream of things a Windows parent process
+    cannot reach. `~/.bashrc` re-creates ANTHROPIC_* variables INSIDE the
+    distro during shell start-up, after `bash -l` sources it -- a parent-side
+    env dict never contained them to begin with, so there is nothing there to
+    delete. And WSL's interop layer resets HOME from /etc/passwd on the far
+    side of the boundary regardless of what WSLENV carries (measured; see
+    a2-sandbox.md) -- so HOME can only be forced from inside the distro too.
+    Both fixes therefore have to be text baked into the command bash runs,
+    executed AFTER the rc file's own exports, which is exactly what placing
+    them in the trailing command string achieves.
+    """
+    if not _is_wsl_launcher(argv):
+        return argv
+    try:
+        dashdash = argv.index("--")
+    except ValueError:
+        return argv
+    rest = argv[dashdash + 1:]
+    if not rest:
+        return argv
+    shell = os.path.basename(str(rest[0])).lower()
+    if shell not in ("bash", "bash.exe"):
+        return argv
+    # The flags word (e.g. "-lic") must select -c, because everything after
+    # it is a single command STRING bash hands to the shell, not a further
+    # arg list -- rewriting anything else would silently break argv shapes
+    # this function was never designed to parse.
+    if len(rest) < 3:
+        return argv
+    flags = rest[1]
+    if not isinstance(flags, str) or "c" not in flags:
+        return argv
+    # Everything after the flags word is the command bash receives. Normally
+    # this is exactly one element (a single shlex token from .env, whether or
+    # not it happened to contain spaces); joining is a safety margin for a
+    # trailing-args edge case rather than the expected input shape.
+    base_cmd = " ".join(str(p) for p in rest[2:])
+
+    spec = provider_env_spec(provider) or {}
+    unset_vars = spec.get("unset_vars") or ()
+    suffix = spec.get("login_suffix") or ()
+
+    cmd = base_cmd
+    if suffix:
+        # Appended only when the command does not already end in the login
+        # subcommand -- a user who has already customised the command in
+        # .env to include it must not get it duplicated onto the tail.
+        cmd_words = shlex.split(cmd) if cmd else []
+        suffix_words = list(suffix)
+        already = (len(cmd_words) >= len(suffix_words)
+                   and cmd_words[-len(suffix_words):] == suffix_words)
+        if not already:
+            cmd = cmd + " " + " ".join(shlex.quote(w) for w in suffix_words)
+
+    prefix = ""
+    if unset_vars:
+        # Runs AFTER `bash -l` has already sourced the rc file (that is the
+        # only reason ANTHROPIC_* exists on this side at all), so the unset
+        # actually removes what the rc file just created -- a parent-side env
+        # edit could never do this, see the function docstring.
+        prefix += "unset " + " ".join(shlex.quote(v) for v in unset_vars) + "; "
+    if wsl_root:
+        # Set INSIDE the distro because WSLENV cannot carry HOME across the
+        # interop boundary at all (measured; see a2-sandbox.md). wsl_root is
+        # the WSL-side path computed once in create_sandbox from the
+        # untranslated Windows root, so this cannot double-translate into
+        # "/mnt/c/mnt/c/...".
+        prefix += "env HOME=%s " % shlex.quote(wsl_root)
+
+    wrapped = prefix + cmd
+    return list(argv[:dashdash + 1]) + list(rest[:2]) + [wrapped]
 
 
 def launch_login(provider, sandbox, argv=None, console=True):
@@ -680,8 +855,23 @@ def launch_login(provider, sandbox, argv=None, console=True):
     args = list(argv) if argv else login_command(provider)
     if not args:
         raise ValueError("no login command configured for %s" % provider)
+    # Only the production path (argv taken from .env) is rewritten. The
+    # self-test drives a throwaway local Python script through an explicit
+    # argv precisely so it can prove this module's plumbing without a vendor
+    # CLI in the loop; rewriting that argv as if it were a wsl.exe/bash -c
+    # command would be a no-op in practice (_wrap_wsl_login_command already
+    # ignores anything that is not shaped like one) but would also defeat the
+    # point of a caller-supplied argv being trusted verbatim.
+    if argv is None:
+        args = _wrap_wsl_login_command(provider, args, sandbox.wsl_root)
 
-    kwargs = {"env": sandbox.env, "cwd": sandbox.dir}
+    # tempfile.gettempdir() rather than sandbox.dir: Windows refuses to
+    # delete a directory that is a live process's working directory, and on
+    # the timeout path the CLI is -- by definition -- still running when
+    # destroy_sandbox tries to remove it. Using a cwd outside the sandbox
+    # entirely removes that race instead of relying solely on killing the
+    # process first.
+    kwargs = {"env": sandbox.env, "cwd": tempfile.gettempdir()}
     if os.name == "nt" and console:
         kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
     proc = subprocess.Popen(args, **kwargs)

@@ -441,15 +441,27 @@ function Widget() {
   // make, so its frost would stand proud of it -- the frost is stood down
   // instead and the cards paint themselves.
   const frostSuspended = scale < FROST_MIN_SCALE
-  const frostRef = useRef(frostSuspended)
-  frostRef.current = frostSuspended
 
-  // Resume only if the frost is allowed to exist at the current size. Several
-  // things finish and want the panes back -- the end of a mode animation, the
-  // end of a resize drag -- and none of them should be the route by which a
-  // suspended frost quietly comes back at a size it cannot fit.
+  // The end of a hold is the end of a hold, at every size.
+  //
+  // This used to skip `resume()` below FROST_MIN_SCALE, to stop the end of an
+  // animation or of a drag handing the frost back at a size it cannot be drawn
+  // at. That concern is real and this was the wrong place to answer it:
+  // `resume()` lifts the *animation* hold only, and the pane layer restarts the
+  // pass only when no latch is set -- the frost latch is already what keeps the
+  // frost down, and it is set for exactly as long as the widget is this small.
+  // So the guard protected nothing that was not already protected, and cost the
+  // thing the animation hold does that the frost latch does not: the hold stops
+  // the measurement pass outright, where the frost latch only silences the IPC.
+  //
+  // Dragging the zoom down past the floor therefore left the hold latched with
+  // nothing able to lift it. The cards went on shrinking with every further
+  // drag while the pets kept the rectangles measured at the moment of crossing,
+  // and a pet pinned to a card that no longer existed at that size ended up
+  // outside the window, where `overflow: hidden` on .nw-pets sliced it. A cold
+  // start at the same scale was always fine, because it never crossed.
   const resumeFrost = useCallback(() => {
-    if (!frostRef.current) resume()
+    resume()
   }, [resume])
 
   // The suspension itself, and the flag the stylesheet reads.
@@ -479,6 +491,13 @@ function Widget() {
   }, [frostSuspended, setFrostSuspended])
   usePaneSync(animating)
   usePaneSync(scale)
+  // What `animating` does for a mode switch, for a scale drag. Both latch the
+  // pass off at the start and lift it at the end, but only the animation path
+  // had anything that asked for a measurement once its latch was gone. A zoom
+  // change moves no layout-unit box, so neither the per-card observers nor a
+  // window `resize` can be relied on to arrive after the release -- without
+  // this the pets' ground stays whatever it was when the drag began.
+  usePaneSync(resizing)
 
   // How large this widget may be drawn on this screen, in this view. `null`
   // during the mode animation, because a box that is mid-tween is not a height

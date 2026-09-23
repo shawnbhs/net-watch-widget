@@ -3302,6 +3302,18 @@ def _migrated_already():
     because the failure this guards against is re-import: an account the user
     deliberately deleted reappearing at the next launch is worse than skipping
     an import that had nothing to add.
+
+    This latch is global and best-effort, and it is deliberately NOT the thing
+    that protects a deleted account. Both of its witnesses can genuinely go
+    away -- a reinstall, a corrupted-vault recovery, or a user clearing
+    %APPDATA% to "reset" the widget removes the vault document and the marker
+    file together -- and when they do, the import runs again from scratch.
+    The per-account guard that survives that is aiaccounts' tombstone file
+    (accounts.json.forgotten), which is a sibling of the vault rather than a
+    key inside it for exactly this reason. Every path that can add an account
+    from a CLI credential therefore consults is_tombstoned() on its own; the
+    latch only decides whether the sweep runs at all, never whether a
+    particular deleted account may come back.
     """
     if _vault is None:
         return True
@@ -3318,16 +3330,31 @@ def _mark_migrated():
     """Record that the import happened, in the vault or beside it.
 
     The vault is tried first and then READ BACK, because save() normalises the
-    document it is handed and is free to drop a key it does not know about —
-    which is exactly what happens today. A write that is assumed to have stuck
-    and did not is the worst outcome available here: every launch would
-    re-import, and an account the user deliberately deleted would come back
-    each time. So the flag is only trusted once it survives a round trip, and
-    a marker file beside the vault carries it otherwise.
+    document it is handed and is free to drop a key it does not know about.
+    That used to describe the actual behaviour: _coerce() returned exactly
+    {version, accounts} and ate this stamp on every save, so the in-vault
+    witness was always false in practice and the marker file was doing all the
+    work. aiaccounts' _coerce() now carries "imported_from_cli" through an
+    explicit allowlist, so the stamp genuinely persists. The read-back stays:
+    it is what made the silent failure survivable in the first place, and it
+    still covers the one case that matters -- a write that is assumed to have
+    stuck and did not, which would make every launch re-import.
+
+    The read-modify-write is the hazard now that the write lands. load()
+    answers an unreadable vault with an EMPTY document rather than an error
+    (a momentary antivirus lock on the file is enough), and saving that back
+    would replace every stored account with nothing just to record a boolean.
+    So the in-vault stamp is skipped whenever the load looks untrustworthy --
+    zero accounts returned while a non-empty vault file sits on disk -- and
+    the marker file carries the flag instead. Losing the stamp costs one
+    redundant import sweep, which the per-account tombstones already make
+    harmless; losing the accounts is unrecoverable.
     """
     stamp = int(time.time())
     try:
         doc = _vault.load() or {}
+        if not _vault_load_trustworthy(doc):
+            raise RuntimeError("vault read looks lossy; not writing it back")
         doc["imported_from_cli"] = stamp
         _vault.save(doc)
         if (_vault.load() or {}).get("imported_from_cli"):
@@ -3348,6 +3375,92 @@ def _mark_migrated():
         return False
 
 
+def _vault_load_trustworthy(doc):
+    """Whether a loaded vault document may safely be written back.
+
+    aiaccounts.load() never raises: any failure at all -- a truncated file, a
+    protected blob this machine cannot unwrap, an antivirus scanner holding
+    the file open for a moment -- comes back as an empty document that is
+    indistinguishable from a genuinely empty vault. That is the right answer
+    for reading (the widget starts with no accounts instead of a traceback)
+    and a trap for writing: anything that does load-modify-save on it turns a
+    transient read failure into permanent account loss.
+
+    "No accounts, but a non-empty vault file already exists on disk" is the
+    one cheap signal that separates the two. A truly empty vault has either no
+    file yet or a file whose account list really is empty, and in the second
+    case the worst outcome of being cautious is that a boolean flag goes to
+    the marker file instead. Unknown/unreadable file state is treated as
+    trustworthy so a stat() failure cannot block the flag forever.
+    """
+    try:
+        if (doc or {}).get("accounts"):
+            return True
+    except Exception:
+        return False
+    try:
+        path = _vault.accounts_file()
+    except Exception:
+        return True
+    try:
+        return not (path and os.path.isfile(path) and os.path.getsize(path) > 0)
+    except OSError:
+        return True
+
+
+def _tombstoned(pid, cred, path=None):
+    """Whether the user has deliberately deleted this exact credential.
+
+    Thin wrapper over aiaccounts.is_tombstoned() for two reasons. It keeps
+    core working against a vault module that predates tombstones (the function
+    is looked up rather than imported, so an older aiaccounts degrades to the
+    previous behaviour instead of raising at import time), and it fixes the
+    answer for the ambiguous cases: an exception from the tombstone store, or
+    a vault that cannot answer at all, must not read as "not forgotten".
+
+    The default on failure is therefore True -- skip the import. The two
+    outcomes are not symmetric: wrongly skipping costs an account that the
+    user can still add by hand or unblock with allow_reimport(), while
+    wrongly importing hands back an account the user deleted on purpose,
+    which is the complaint this whole path exists to answer, and it repeats
+    itself at every launch.
+    """
+    if _vault is None:
+        return True
+    fn = getattr(_vault, "is_tombstoned", None)
+    if fn is None:
+        # Vault too old to know about tombstones: nothing has ever been
+        # forgotten through it, so there is nothing to honour and no reason
+        # to block the import.
+        return False
+    try:
+        return bool(fn(pid, cred, path))
+    except Exception:
+        return True
+
+
+def _allow_reimport(pid, path=None):
+    """Undo a tombstone after the user explicitly re-adds that credential.
+
+    Deleting an account says "stop showing me this". Deliberately logging in
+    again at the same credential path says the opposite, and it is the newer
+    statement, so the tombstone that the deletion left behind is cleared.
+    Without this, a user who removes an account and then re-adds it through
+    the login button gets the row now and loses it again at the next import
+    sweep, with nothing on screen explaining why.
+
+    Best effort: failure here only means a stale tombstone lingers, which is
+    recoverable, so it never fails the login the user just completed.
+    """
+    fn = getattr(_vault, "allow_reimport", None)
+    if fn is None or not pid:
+        return 0
+    try:
+        return int(fn(pid, cred_path=path) or 0)
+    except Exception:
+        return 0
+
+
 def _import_sweep():
     """Import CLI credentials the vault's own scan cannot reach.
 
@@ -3365,6 +3478,12 @@ def _import_sweep():
     Deduplication reuses the vault's own fingerprint so the two sweeps agree on
     what counts as the same login; a provider that cannot fingerprint a file is
     skipped rather than imported as a mystery row. Returns the number added.
+
+    This sweep adds rows through add_account() directly, so it never passes
+    through import_from_cli()'s own tombstone check and has to make that check
+    itself -- otherwise it is a second, unguarded route back in for precisely
+    the account the user just deleted, and the more capable of the two, since
+    it reaches credential paths the vault's scan cannot.
     """
     if _vault is None:
         return 0
@@ -3396,6 +3515,11 @@ def _import_sweep():
             except Exception:
                 fp = None
             if not fp or fp in known:
+                continue
+            if _tombstoned(pid, cred, path):
+                # Deleted on purpose. Not counted as added and not recorded in
+                # `known` either: the tombstone, not this run's bookkeeping, is
+                # what has to keep saying no on every future launch.
                 continue
             known.add(fp)
             try:
@@ -3434,6 +3558,13 @@ def ai_migrate_once():
     as accounts without a single click. The stamp is written even when nothing
     was found, so a user who starts with no logins at all — and later deletes
     an account on purpose — is not handed it back at the next launch.
+
+    The stamp is not load-bearing for that promise any more, only an
+    optimisation that skips work. Both of the routes below -- the vault's own
+    import_from_cli() and the supplementary _import_sweep() -- now refuse a
+    tombstoned credential on their own, so this function may run again from a
+    clean slate (reinstall, vault reset, deleted marker) without resurrecting
+    anything the user removed.
     """
     if not ai_vault_ready():
         return 0, "vault unavailable"
@@ -3474,14 +3605,49 @@ def ai_migrate_once():
 
 
 # ── per-account poll ──────────────────────────────────────────────────────────
-# Accounts whose rotated credential could not be written down. This is a
-# latch rather than a return value because the two callers that discover the
-# failure are not the code that renders a row: the keepalive thread has no row
-# to return, and the account it just broke has to be reported as broken the
-# next time the UI asks about it, not silently poll as healthy. Cleared as
-# soon as a write for that account finally succeeds.
+# Accounts whose rotated credential could not be written down, mapped to the
+# reason. This is a latch rather than a return value because the two callers
+# that discover the failure are not the code that renders a row: the keepalive
+# thread has no row to return, and the account it just broke has to be
+# reported as broken the next time the UI asks about it, not silently poll as
+# healthy. Cleared as soon as a write for that account finally succeeds.
+#
+# The value used to be a bare True, which was enough to mark the account but
+# not to explain it: every cause -- a momentary scanner lock, a full disk, a
+# vault this machine simply cannot decrypt -- produced the same "credential
+# not saved" line and the same advice to wait. They do not have the same
+# remedy, and the one that never clears on its own is precisely the one the
+# user has to be told about, so the reason string is carried with the latch.
 AI_UNSAVED = {}
 _unsaved_lock = threading.Lock()
+
+# The fallback reason, used when nothing more specific is known.
+AI_UNSAVED_DEFAULT = "credential not saved"
+
+
+def _vault_refusal(exc):
+    """The displayable reason when `exc` is a vault refusal, else None.
+
+    A refusal (see aiaccounts.VAULT_REFUSALS) means the vault was deliberately
+    left alone because writing would have destroyed credentials that are still
+    recoverable. It is not a failure that a retry can clear, and it is the one
+    the user must be told about by name.
+
+    Routed through the vault module rather than importing aisecrets here, for
+    the same reason every other vault detail is: this file must keep working
+    with the vault module absent, and an older vault module that predates the
+    refusal types must degrade to exactly the previous behaviour -- which it
+    does, because the getattr misses and every exception stays generic.
+    """
+    if _vault is None or exc is None:
+        return None
+    try:
+        classify = getattr(_vault, "refusal_reason", None)
+        if classify is None:
+            return None
+        return classify(exc)
+    except Exception:
+        return None
 
 
 def _vault_store_cred(aid, cred):
@@ -3499,10 +3665,20 @@ def _vault_store_cred(aid, cred):
     account's login for good. update_cred() now returns a bool that is only
     True once the document has been read back off the disk, so a False here
     genuinely means the live credential exists nowhere but in memory.
+
+    A refusal is the exception to all of that and breaks out immediately. The
+    vault module raises one only when it declined to overwrite credentials it
+    could not read -- a vault sealed for another user or another machine. That
+    state does not change in 250 ms, so the second attempt is pure delay on a
+    path the UI is waiting on, and, far worse, the retry used to be the whole
+    story the user got: two silent failures and an account that never persists
+    with nothing naming the cause. The reason is latched instead, and every
+    row for this account carries it until a write finally succeeds.
     """
     if _vault is None or not aid:
         return False
     ok = False
+    reason = AI_UNSAVED_DEFAULT
     for attempt in (0, 1):
         if attempt:
             # Short, fixed pause rather than a backoff loop: this runs inside
@@ -3511,15 +3687,19 @@ def _vault_store_cred(aid, cred):
             time.sleep(0.25)
         try:
             ok = bool(_vault.update_cred(aid, cred))
-        except Exception:
+        except Exception as exc:
             ok = False
+            refused = _vault_refusal(exc)
+            if refused:
+                reason = refused
+                break
         if ok:
             break
     with _unsaved_lock:
         if ok:
             AI_UNSAVED.pop(aid, None)
         else:
-            AI_UNSAVED[aid] = True
+            AI_UNSAVED[aid] = reason
     return ok
 
 
@@ -3603,12 +3783,16 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
     if not ai_vault_ready():
         return _acct_row(acct, cred, "error", None, "vault unavailable")
     with _unsaved_lock:
-        unsaved = acct.get("id") in AI_UNSAVED
+        unsaved = AI_UNSAVED.get(acct.get("id"))
     if unsaved:
         # The background keepalive rotated this account's token and could not
         # write the replacement down. Whatever is in the vault is dead, so
-        # there is no point polling with it; say so instead.
-        return _acct_row(acct, cred, "error", None, "credential not saved")
+        # there is no point polling with it; say so instead -- and say WHICH
+        # of the causes it was, because a locked vault needs the user to do
+        # something and a busy disk does not.
+        return _acct_row(acct, cred, "error", None,
+                         unsaved if isinstance(unsaved, str)
+                         else AI_UNSAVED_DEFAULT)
     if not _provider_is_live(pid):
         # The registry's own wording, so the UI has one string to recognise.
         return _acct_row(acct, cred, "planned", None, "not supported yet")
@@ -3637,9 +3821,14 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
                 # with the process, while the vault still holds the token the
                 # provider killed when it issued this one -- the login would
                 # be gone at the next start with no warning anywhere. Better
-                # to fail loudly now, while the user can still see it.
+                # to fail loudly now, while the user can still see it. The
+                # reason comes from the latch _vault_store_cred just set, so a
+                # refusal is named here rather than reduced to "not saved".
+                with _unsaved_lock:
+                    why_unsaved = AI_UNSAVED.get(acct.get("id"))
                 return _acct_row(acct, cred, "error", None,
-                                 "credential not saved")
+                                 why_unsaved if isinstance(why_unsaved, str)
+                                 else AI_UNSAVED_DEFAULT)
             cred = new
             exp = None
             try:
@@ -3888,9 +4077,13 @@ def ai_login_capture(provider, label=None, account_id=None, wait=AI_LOGIN_WAIT):
             try:
                 stored = _vault.update_cred(account_id, cred)
             except Exception as exc:
-                return False, "vault write failed (%s)" % type(exc).__name__
+                # A refusal says the vault was left intact on purpose and no
+                # retry can change that, so it is reported in words the user
+                # can act on instead of as an exception class name.
+                return False, (_vault_refusal(exc)
+                               or "vault write failed (%s)" % type(exc).__name__)
             if not stored:
-                return False, "credential not saved"
+                return False, AI_UNSAVED_DEFAULT
             with _unsaved_lock:
                 AI_UNSAVED.pop(account_id, None)
             return True, "account re-authenticated"
@@ -3898,7 +4091,17 @@ def ai_login_capture(provider, label=None, account_id=None, wait=AI_LOGIN_WAIT):
             _vault.add_account(pid, label or _default_label(pid), cred,
                                source="login", cred_path=path)
         except Exception as exc:
-            return False, "vault write failed (%s)" % type(exc).__name__
+            # Same reasoning as the re-authentication branch above: name a
+            # refusal, since the user just finished a login whose result was
+            # not kept and the cause is one only they can clear.
+            return False, (_vault_refusal(exc)
+                           or "vault write failed (%s)" % type(exc).__name__)
+        # The user just asked for this account by hand, so any tombstone left
+        # by an earlier deletion of the same credential path is stale and is
+        # cleared. The add itself is deliberately NOT gated on the tombstone:
+        # refusing an account the user is standing there logging into would be
+        # the same silent disobedience in the other direction.
+        _allow_reimport(pid, path)
         return True, "account added"
     return False, "login not completed"
 

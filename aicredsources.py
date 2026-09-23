@@ -140,6 +140,13 @@ R_UNREADABLE = "present but unreadable"
 R_MALFORMED = "present but malformed"
 R_NO_SOURCE = "no discoverable credential source"
 R_UNKNOWN_PROVIDER = "unknown provider"
+# A file that is present and parseable but whose credential is older than
+# the refresh-token lifetime. It is deliberately NOT folded into
+# R_UNREADABLE: those two demand opposite actions from the user. Stale
+# means the login in THIS file is genuinely finished and only a real
+# re-login revives it; unreadable means the file we wanted was out of
+# reach and we still do not know whether the login is alive.
+R_STALE = "present but stale"
 
 # Kept in sync with aiproviders.PROVIDERS by hand rather than by import, so a
 # scan still enumerates every slug if that module is unavailable. The import
@@ -158,6 +165,51 @@ _SLUGS = ["claude", "codex", "cursor", "copilot", "windsurf", "devin",
 # age_seconds; what this module owns is the FACT of staleness against a stated
 # threshold, not the presentation policy that follows from it.
 WINDSURF_PLAN_STALE_AFTER = 6 * 3600
+
+# How far in the past a CLI credential's own expiry may sit before this module
+# refuses to hand it back as the answer.
+#
+# This exists because of a failure this project actually shipped. The same
+# Claude or Codex login lives in two places at once on this machine -- the
+# Windows user profile and a WSL home -- and aiaccounts.cli_cred_paths()
+# returns both. When a CLI logs out it does not delete its credential file, it
+# guts it: expiresAt drops to 0 and the refresh token disappears, leaving a
+# perfectly readable, perfectly parseable, perfectly dead document behind. A
+# picker that walks the candidates and takes the first readable one -- or even
+# the one with the latest expiry -- is safe only while every candidate is
+# readable. The moment the live copy becomes unreachable (a stopped WSL
+# distro, an unmounted share, a permissions change) the dead copy is the only
+# survivor, is silently promoted to "the credential", and the refresh that
+# follows fails with a 400 that gets shown to the user as an expired login --
+# for a login that was never broken. The real fault was an unreadable file.
+#
+# So the candidates are aged out, not merely ranked: a credential older than
+# the refresh token's own lifetime can never be revived and must never be
+# returned as if it could. 16 days matches aiproviders.CRED_MAX_STALE and
+# core.AI_CRED_MAX_STALE (Claude's measured refresh-token lifetime is ~15.8
+# days, and Codex's is not shorter). The value is re-read from aiproviders at
+# call time when that module is importable, so the three cannot drift apart.
+CRED_MAX_STALE = 16 * 86400
+
+
+def _max_stale():
+    """The refresh-token lifetime to age candidates against.
+
+    aiproviders owns this number for the whole widget; the local constant is
+    the fallback for the case where that module is unavailable, which is the
+    same posture this file already takes for sqlite3 and tomllib. A bad or
+    hostile value there must not disable the aging check, so anything that is
+    not a positive finite number falls back rather than being trusted.
+    """
+    try:
+        import aiproviders as _p
+        v = float(getattr(_p, "CRED_MAX_STALE", CRED_MAX_STALE))
+        if v > 0 and v == v and v != float("inf"):
+            return v
+    except Exception:
+        pass
+    return float(CRED_MAX_STALE)
+
 
 # The environment variables a user can export to supply a Cline key by hand.
 # Cline is the one vendor with no readable store at all, so this list is the
@@ -852,12 +904,213 @@ def _read_cline():
                                           ", ".join(_CLINE_ENV))
 
 
+def _cli_refresh_key_present(provider, doc):
+    """Does this document still carry a refresh token KEY? Boolean only.
+
+    Never touches the value. A logged-out CLI credential is not deleted, it is
+    gutted: the refresh token key disappears and the expiry drops to zero. The
+    presence of the key is therefore the single most reliable "is there
+    anything left to renew here" signal, and it is readable without ever
+    looking at a secret.
+    """
+    try:
+        if provider == "claude":
+            o = doc.get("claudeAiOauth")
+            return isinstance(o, dict) and bool(o.get("refreshToken"))
+        if provider == "codex":
+            t = doc.get("tokens")
+            return isinstance(t, dict) and bool(t.get("refresh_token"))
+    except Exception:
+        return False
+    return False
+
+
+def _cli_cred_expiry(provider, doc):
+    """This credential's own expiry as UNIX seconds, or None when unknown.
+
+    aiproviders.cred_expiry owns this per-vendor knowledge for the whole
+    widget, so it is asked first and only, so the two cannot drift. When that
+    module is unavailable the fallback reads the two plain, non-secret fields
+    this file is allowed to know about: Claude's epoch-MILLISECOND expiresAt
+    and Codex's last_refresh stamp. Both are timestamps, not tokens.
+
+    None means "cannot tell", and the caller must never promote that to
+    "dead": an unrecognised shape is not an expired login.
+    """
+    try:
+        import aiproviders as _p
+        v = _p.cred_expiry(provider, doc)
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        if provider == "claude":
+            o = doc.get("claudeAiOauth")
+            if isinstance(o, dict):
+                v = o.get("expiresAt")
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    # Zero is not "unknown" here, it is the gutted-file marker
+                    # a logged-out CLI leaves behind, and 1970 is correctly
+                    # older than any refresh-token lifetime.
+                    return float(v) / 1000.0
+        elif provider == "codex":
+            v = doc.get("last_refresh")
+            if isinstance(v, str) and v:
+                s = v.replace("Z", "+00:00")
+                return _dt.datetime.fromisoformat(s).timestamp()
+    except Exception:
+        pass
+    return None
+
+
+# Per-candidate verdicts. These are the vocabulary the whole stale-promotion
+# fix is built on, and they are deliberately four states rather than the two
+# ("worked" / "did not work") that let the original bug through.
+CAND_LIVE = "live"            # readable, parsed, and young enough to renew
+CAND_STALE = "stale"          # readable and parsed, but past renewal
+CAND_UNKNOWN_AGE = "unknown-age"   # readable, but the shape hides the expiry
+CAND_UNREADABLE = "unreadable"     # present but locked or malformed
+CAND_UNREACHABLE = "unreachable"   # we could not even get far enough to look
+CAND_ABSENT = "absent"             # we looked there and there is nothing
+
+
+def _cli_path_reachable(path):
+    """Could we actually get far enough to see whether this file is there?
+
+    This distinction is load-bearing, and missing it is how the original bug
+    reappears in a new disguise. os.path.exists() on a credential inside a
+    stopped WSL distro or an unmounted share returns False -- exactly the same
+    answer it gives for a machine where the user simply never logged in there.
+    Treating both as "not logged in" lets the surviving stale copy become the
+    only candidate all over again.
+
+    The tell is the ancestry. A credential lives at <home>/<vendor-dir>/<file>,
+    so if either the vendor directory or the home above it is present, we truly
+    did look and the file truly is not there. If NEITHER is present, the whole
+    location is out of reach and the honest answer is "cannot tell", not "no".
+
+    Purely local: existence checks on directories, no network, no reads.
+    """
+    try:
+        d = os.path.dirname(path)
+        return bool(_exists(d) or _exists(os.path.dirname(d)))
+    except Exception:
+        return False
+
+
+def _cli_candidate(provider, path, now=None):
+    """Classify one CLI credential file. Never returns a value from inside it.
+
+    The returned record carries the path, the verdict, the age in seconds and
+    a boolean for whether a refresh-token key is present. Every one of those
+    is safe to print, log and paste into a public bug report.
+    """
+    rec = {"path": path, "state": CAND_UNREADABLE, "age_seconds": None,
+           "expires_at": None, "expires_at_iso": None,
+           "has_refresh_key": False, "reason": None}
+    doc, why = _read_json_file(path)
+    if doc is None:
+        rec["reason"] = why
+        if not _exists(path):
+            rec["state"] = (CAND_ABSENT if _cli_path_reachable(path)
+                            else CAND_UNREACHABLE)
+            if rec["state"] == CAND_UNREACHABLE:
+                rec["reason"] = (
+                    "%s: %s is out of reach -- neither it nor the directory "
+                    "above it can be seen, which is what a stopped WSL distro, "
+                    "an unmounted share or a revoked permission looks like. "
+                    "Whether a login exists there is unknown, not absent."
+                    % (R_UNREADABLE, path))
+        return rec, None
+    if not isinstance(doc, dict):
+        rec["reason"] = "%s: %s is not a JSON object" % (R_MALFORMED, path)
+        return rec, None
+    rec["has_refresh_key"] = _cli_refresh_key_present(provider, doc)
+    exp = _cli_cred_expiry(provider, doc)
+    rec["expires_at"] = exp
+    rec["expires_at_iso"] = _iso(exp)
+    now = time.time() if now is None else now
+    limit = _max_stale()
+    if exp is None:
+        # Unknown age. Not stale -- "I cannot read the expiry out of this
+        # shape" must never graduate into "your login is dead" -- but not
+        # trusted over a candidate whose freshness is actually established,
+        # which is why the caller ranks it below CAND_LIVE.
+        rec["state"] = CAND_UNKNOWN_AGE
+    else:
+        rec["age_seconds"] = now - exp
+        if rec["age_seconds"] > limit or not rec["has_refresh_key"]:
+            # Two independent ways to be past saving, and both occur on this
+            # machine: an expiry further in the past than the refresh token's
+            # own lifetime, and a gutted file whose refresh key is simply gone.
+            rec["state"] = CAND_STALE
+            rec["reason"] = (
+                "%s: %s expired %.1f days ago%s, which is beyond the "
+                "refresh-token lifetime of %.1f days -- this copy cannot be "
+                "renewed and only a real re-login revives it"
+                % (R_STALE, path, (rec["age_seconds"] or 0) / 86400.0,
+                   "" if rec["has_refresh_key"] else " and carries no "
+                   "refresh-token key",
+                   limit / 86400.0))
+        else:
+            rec["state"] = CAND_LIVE
+    return rec, doc
+
+
+def cli_cred_candidates(provider):
+    """Every CLI credential candidate for one slug, classified, value-free.
+
+    Exported because the distinction it draws is exactly what a diagnostics
+    view has to show the user: which copies of this login exist, which of them
+    could be read at all, and which of the readable ones are past renewal.
+    Collapsing that into a single "found / not found" is what produced the
+    false alarm documented on _read_cli below. Never raises.
+    """
+    if not isinstance(provider, str) or provider not in ("claude", "codex"):
+        return []
+    out = []
+    try:
+        for rec in cred_locations(provider):
+            cand, _doc = _cli_candidate(provider, rec["path"])
+            out.append(cand)
+    except Exception:
+        return out
+    return out
+
+
 def _read_cli(provider):
-    """Claude and Codex: the first readable CLI credential file wins.
+    """Claude and Codex: the youngest still-renewable credential file wins.
 
     Path knowledge and JSON parsing both come from aiaccounts so the two
     modules cannot drift apart. This exists only so scan_all() can cover all
     twelve slugs uniformly; the real import path stays aiaccounts.import_from_cli.
+
+    The selection rule is the interesting part, and it is written against a
+    failure this project actually shipped. The same login exists twice on this
+    machine -- once in the Windows profile, once in a WSL home -- and one of
+    those copies is an abandoned leftover whose expiry is zero and whose
+    refresh token is gone. "First readable file wins" is correct exactly as
+    long as every copy is readable. Stop the WSL distro and the live copy
+    becomes unreachable, the dead leftover is the only survivor, it wins by
+    default, and the refresh attempt that follows fails with a 400 that the
+    user is shown as "login expired" -- for a login that is perfectly healthy.
+    An unreadable fresh file must never silently promote a stale one.
+
+    So candidates are AGED OUT rather than merely ranked, and the failure the
+    caller is told about names the real fault:
+
+      * a live candidate exists            -> it is returned, freshest first.
+      * every candidate is readable and
+        past the refresh-token lifetime    -> R_STALE. This one genuinely does
+                                              mean re-login.
+      * some candidate could not be read
+        and the only survivors are stale   -> R_UNREADABLE, naming the path we
+                                              could not reach. This one means
+                                              "fix the share / start the
+                                              distro", NOT "log in again", and
+                                              keeping the two apart is the
+                                              entire point of this function.
     """
     if _accounts is None:
         return None, ("%s: the aiaccounts module could not be imported, so the "
@@ -865,14 +1118,70 @@ def _read_cli(provider):
     paths = cred_locations(provider)
     if not paths:
         return None, "%s: no candidate path for %s" % (R_NOT_FOUND, provider)
-    last = None
-    for rec in paths:
-        doc, why = _read_json_file(rec["path"])
-        if doc is not None:
-            return doc, None
-        last = why
-    return None, last or ("%s: no readable credential file for %s"
-                          % (R_NOT_FOUND, provider))
+
+    live = []       # (expiry_or_-inf, index, path, doc)
+    unknown = []    # readable, age not determinable
+    stale = []      # readable, past renewal
+    blocked = []    # present but could not be read
+    missing = []    # simply not there
+    for i, rec in enumerate(paths):
+        path = rec["path"]
+        cand, doc = _cli_candidate(provider, path)
+        if cand["state"] == CAND_LIVE:
+            # Ties are broken by candidate order, which cred_locations
+            # already orders best-first, so an explicit .env path still wins
+            # over the default when two copies share an expiry.
+            live.append((cand["expires_at"] or 0.0, -i, path, doc))
+        elif cand["state"] == CAND_STALE:
+            stale.append(cand)
+        elif cand["state"] == CAND_UNKNOWN_AGE:
+            unknown.append((i, path, doc))
+        elif cand["state"] == CAND_ABSENT:
+            missing.append(cand)
+        else:
+            # Present-but-unreadable and out-of-reach are pooled on purpose.
+            # They differ in cause but not in consequence: in both, a copy of
+            # this login that we cannot judge exists somewhere in the candidate
+            # list, so no verdict drawn from the remaining copies is complete.
+            blocked.append(cand)
+
+    if live:
+        live.sort(key=lambda t: (t[0], t[1]))
+        return live[-1][3], None
+
+    # No candidate whose freshness could be established. A readable file of an
+    # unrecognised shape is still preferable to nothing -- refusing it would
+    # break every future credential format on the day the vendor changes it --
+    # but it is only reached once no live copy exists, so it can never shadow
+    # one.
+    if unknown:
+        return unknown[0][2], None
+
+    if blocked:
+        # The real fault. Reported as unreadable even though a stale copy is
+        # sitting right there, because handing that copy back is precisely the
+        # silent promotion this function exists to prevent, and because the
+        # user's next action is to restore access to the path below, not to
+        # redo a login that may well be fine.
+        note = ""
+        if stale:
+            note = (" A stale copy of this login is readable at %s, and it is "
+                    "deliberately NOT used: refreshing from it would fail and "
+                    "be reported as an expired login, which is not what is "
+                    "wrong here." % stale[0]["path"])
+        return None, ("%s: %s could not be read, so the freshest %s credential "
+                      "on this machine may simply be out of reach. This is not "
+                      "an expired login.%s"
+                      % (R_UNREADABLE, blocked[0]["path"], provider, note))
+
+    if stale:
+        # Every copy was readable and every copy is past saving. This is the
+        # one case where "log in again" is the honest advice.
+        return None, stale[0]["reason"]
+
+    return None, (missing[0]["reason"] if missing else
+                  ("%s: no readable credential file for %s"
+                   % (R_NOT_FOUND, provider)))
 
 
 _READERS = {
@@ -934,6 +1243,23 @@ def read_cred(provider, allow_subprocess=False):
             R_UNREADABLE, type(provider).__name__, type(e).__name__)
 
 
+def _cli_source(slug, cands, locs):
+    """Which path actually produced the answer, best-effort and value-free.
+
+    A stale candidate is never named as the source even when it is the only
+    file that exists, because "source" is read as "this is where your login
+    came from" and a leftover is not where it came from.
+    """
+    try:
+        for state in (CAND_LIVE, CAND_UNKNOWN_AGE):
+            for c in cands or []:
+                if c.get("state") == state:
+                    return c.get("path")
+        return next((l["path"] for l in locs if l.get("exists")), None)
+    except Exception:
+        return None
+
+
 def describe(slug):
     """A human-readable, credential-free summary of one slug's discovery story.
 
@@ -959,6 +1285,7 @@ def describe(slug):
                                         type(slug).__name__)}
         known = slug in provider_slugs()
         locs = cred_locations(slug)
+        cands = cli_cred_candidates(slug)
         cred, why = read_cred(slug)
         return {
             "provider": slug,
@@ -969,7 +1296,14 @@ def describe(slug):
             # paths, kinds, sizes and mtimes only, which is exactly the set of
             # facts that tells a user whether a login is live or left over.
             "locations": locs,
-            "source": next((l["path"] for l in locs if l.get("exists")), None),
+            # For the two CLI vendors the first EXISTING path is not
+            # necessarily the one that answered: a dead leftover can exist
+            # beside the live copy, and naming it here would misattribute the
+            # result in exactly the diagnostics view a user opens when
+            # something looks wrong. The chosen candidate is reported instead,
+            # with the per-candidate verdicts alongside it.
+            "candidates": cands,
+            "source": _cli_source(slug, cands, locs),
         }
     except Exception as e:
         return {"provider": None, "known": False, "found": False,
@@ -1018,8 +1352,17 @@ def scan_all(include_creds=True):
         # Which location actually produced the answer is the single most
         # useful diagnostic line, so it is recorded rather than left for the
         # reader to infer from the list.
+        cands = cli_cred_candidates(slug)
+        if cands:
+            # Value-free: paths, verdicts, ages and a has-refresh-key boolean.
+            # Carried even in the redacted scan because it is exactly what
+            # distinguishes "the fresh copy was unreachable" from "this login
+            # is over", and a diagnostics view that cannot tell those apart is
+            # how the false alarm happened in the first place.
+            rec["candidates"] = cands
+        chosen = _cli_source(slug, cands, locs)
         for loc in locs:
-            if loc.get("exists"):
+            if loc.get("exists") and (chosen is None or loc["path"] == chosen):
                 rec["source"] = loc["path"]
                 rec["source_kind"] = loc["kind"]
                 break
@@ -1238,6 +1581,46 @@ def _selftest():
         check("sqlite read leaves mtime and size untouched", before == after)
         check("sqlite read leaves no journal or wal beside the db",
               sorted(os.listdir(os.path.dirname(bad))) == listing_before)
+
+        # Aging out a stale CLI credential. Built directly against
+        # _cli_candidate so the fixture never has to impersonate a real home
+        # directory, and asserted on verdicts and booleans only -- no value
+        # from either document is read or compared.
+        cli_dir = os.path.join(root, "cli")
+        os.makedirs(cli_dir, exist_ok=True)
+        fresh_p = os.path.join(cli_dir, "fresh.json")
+        dead_p = os.path.join(cli_dir, "dead.json")
+        with open(fresh_p, "w", encoding="utf-8") as f:
+            json.dump({"claudeAiOauth": {
+                "accessToken": "FIXTURE", "refreshToken": "FIXTURE",
+                "expiresAt": int((time.time() + 3600) * 1000)}}, f)
+        with open(dead_p, "w", encoding="utf-8") as f:
+            # The exact shape a logged-out Claude CLI leaves behind: the file
+            # survives, the expiry is zero and the refresh key is gone.
+            json.dump({"claudeAiOauth": {"accessToken": "",
+                                         "expiresAt": 0}}, f)
+        c_fresh, _ = _cli_candidate("claude", fresh_p)
+        c_dead, _ = _cli_candidate("claude", dead_p)
+        c_gone, _ = _cli_candidate("claude", os.path.join(cli_dir, "nope.json"))
+        c_offline, _ = _cli_candidate(
+            "claude", os.path.join(root, "no-such-home", ".claude", "c.json"))
+        check("cli: a current credential classifies live",
+              c_fresh["state"] == CAND_LIVE, c_fresh.get("reason") or "")
+        check("cli: a gutted credential classifies stale",
+              c_dead["state"] == CAND_STALE)
+        check("cli: stale verdict notes the missing refresh key",
+              c_dead["has_refresh_key"] is False)
+        check("cli: stale reason is not the expired-login wording",
+              (c_dead["reason"] or "").startswith(R_STALE)
+              and "re-login" in (c_dead["reason"] or ""))
+        check("cli: an absent file in a reachable dir reads as absent",
+              c_gone["state"] == CAND_ABSENT)
+        check("cli: an out-of-reach home is unreachable, not absent",
+              c_offline["state"] == CAND_UNREACHABLE)
+        check("cli: neither absence nor unreachability is ever stale",
+              CAND_STALE not in (c_gone["state"], c_offline["state"]))
+        check("cli: stale and unreadable are different reason prefixes",
+              R_STALE != R_UNREADABLE)
 
         # A scan must cover every slug and must be redactable.
         scan = scan_all(include_creds=False)

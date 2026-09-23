@@ -213,9 +213,11 @@ restore, so you only need this if you are recovering by hand.
 The widget keeps pixel pets. They are optional, off until you add one, and they
 come in two kinds.
 
-Open the **Pets** card at the bottom of the full view. **+ Add a pet** shows all
-23 species; pick one, pick a colour if it has several, and it drops in. Each pet
-gets a row of its own with a **Widget / Screen** switch:
+Open the **Pets** card at the bottom of the full view. **+ Add a pet** shows
+every species in the catalogue — **25** of them as shipped — as a grid of
+thumbnails; pick one, pick a colour if it has several, optionally type a name,
+and it drops in from above onto whatever card is underneath. Each pet gets a row
+of its own with a **Widget / Screen** switch:
 
 - **Widget** — it lives on the widget. It walks the top edge of a card, hops
   between cards, and stands about on them. Its body reaches up over the card
@@ -225,12 +227,24 @@ gets a row of its own with a **Widget / Screen** switch:
   no window left above it to draw a pet in.
 - **Screen** — it leaves the widget and roams your desktop, walking and hopping
   wherever it likes and resting just above the taskbar. This opens a second,
-  full-screen, click-through window covering your **primary display**; it exists
-  only while at least one pet is out there, and closes itself when the last one
-  comes home.
+  transparent, click-through window spanning **every display you have** — its
+  rectangle is the union of all of them, and each screen contributes its own
+  floor at the bottom of that screen's work area, so a pet rests on the top edge
+  of the taskbar rather than over the clock. The window exists only while at
+  least one pet is out there and closes itself when the last one comes home, so
+  an empty desktop costs nothing. Add or unplug a monitor and the overlay
+  re-measures itself.
 
 The **New pets live in the** switch at the top of the card sets which of the two
 a newly added pet starts in. Nothing stops you having some of each.
+
+**Turning them off** is the same control as turning them on: there is no master
+switch, only the roster. Remove a pet with the **✕** on its row, or use **Clear**
+in the card header to remove every one of them at once. With no pets left the
+animation loop parks itself rather than idling — nothing is being drawn and
+nothing is being computed — and the desktop overlay window closes. The roster and
+the settings are stored in the widget's own local storage and come back the next
+time you start it.
 
 ### Handling them
 
@@ -248,11 +262,33 @@ drag-only.
 
 ### Settings
 
-The **⋯** button in the card's header opens the tuning: **size** (16–40px, and
-it scales with the widget), **speed**, **liveliness** (how much they move about
-versus lie down), **react to the cursor**, **dance breaks**, **contact
-shadows** and **reduced motion**. These apply to every pet at once — only the
-widget/screen choice is per pet. The roster and the settings are remembered.
+The **⋯** button in the card's header opens the tuning, which applies to every
+pet at once:
+
+| Control | Range | What it does |
+|---|---|---|
+| Size · all pets | 16–100 px | Drawn height before the widget's own scale; the default is 26 px |
+| Speed | 0.2x–2.5x | How fast they move |
+| Liveliness | 0–100 | How much they move about versus lie down — *lazy*, *balanced*, *hyper* |
+| React to the cursor | on/off | Pets notice the pointer and sometimes chase it |
+| Dance breaks | on/off | A pet stops where it is and has a shake |
+| Contact shadows | on/off | A soft shadow under each pet |
+| Reduced motion | on/off | Stops the wandering and keeps the pets still |
+
+Two things are per pet rather than global: the **Widget / Screen** switch, and
+what you get by clicking a pet's name in the roster — a **rename** field and a
+**size multiplier** from 0.5x to 4x that rides on top of the global size, so one
+pet can be made big without dragging everyone else up with it. The slider shows
+both the multiplier and the pixel height it works out to.
+
+Pets on the desktop are drawn about **1.7x** larger than the same figure in the
+widget, because a sprite sized to stand on a 43px-tall card is barely visible
+against a whole screen.
+
+A widget pet's body reaches *up* from its feet, so the size slider running to
+100 px is deliberate even though a widget card cannot show a pet that tall: the
+ceiling is there for the desktop half of the roster, which has a whole screen
+over its head.
 
 Pets are hidden while the widget is collapsed to its mini bar: a tab is a single
 card, and with the topmost one reserved as the ceiling there is no ground left
@@ -290,10 +326,11 @@ use, the next section is all it takes to add it.
 
 ### Adding your own sprites
 
-The species list is built by scanning `app/assets/pets/` at startup, so adding a
-folder of `<colour>_<action>_8fps.gif` clips there is enough to add a species —
-no code change. Re-measure them afterwards, or the pet will resize as it changes
-animation:
+The species list is not hard-coded anywhere. It is built by scanning
+`app/assets/pets/` at startup — 25 folders as shipped, each one a species, each
+file inside it a `<colour>_<action>_8fps.gif` clip — so adding a folder of clips
+there is enough to add a species, with no code change. Re-measure them
+afterwards, or the pet will resize as it changes animation:
 
 ```powershell
 pip install Pillow
@@ -320,6 +357,12 @@ Both credential keys accept several paths separated by `;`. Order does not
 decide the winner: every readable path is read and the copy whose token
 expires latest is used, so listing a stale leftover beside a live one is
 harmless. `~` and `%VARIABLES%` are expanded.
+
+The table above is the short list. **[`.env.example`](.env.example) is the
+authoritative one** — it carries every key the widget reads, including the
+`AI_LOGIN_*` keys that control how a sign-in is launched, each with its default
+and a note on what it is for. Read it there rather than here; it is kept current
+and this table is not repeated.
 
 Restart the widget after editing `.env`; it is read once at startup.
 
@@ -425,9 +468,59 @@ CLI's own sign-in in a console. The sign-in is a browser round-trip belonging to
 the vendor — the widget cannot automate it and never handles your password. When
 it finishes, the new credential is stored as its own account.
 
+That console is **not** your normal shell. Each sign-in is launched into a
+disposable sandbox directory that acts as a fake home: `HOME`, `USERPROFILE`,
+`HOMEDRIVE`/`HOMEPATH` and the `XDG_*` directories are all pointed inside it, and
+the CLI's own config variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) with them, so
+the CLI finds no previous login to reuse and is forced to actually ask. Proxy and
+API-key variables — `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` for Claude, `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` for Codex — are unset for that one child process only, because
+a CLI that thinks it is already authenticated turns the whole login into a silent
+no-op. The sandbox is created under your temp directory, refuses to be created
+anywhere near a real home or config directory, and is shredded and deleted the
+moment the credential has been copied into the vault. Nothing outside it is
+touched, and your own logins are left exactly as they were.
+
+Only one sign-in runs at a time. A second is refused rather than queued — two
+consoles waiting for one person is not something to spread across two sandboxes.
+
 The same **sign in** action is offered on an individual account whose login has
 genuinely expired, so you re-authenticate just that one and leave the others
 alone.
+
+### Read this before adding a second account
+
+**The sandbox fixes the CLI. It cannot fix your browser, and your browser is
+what decides which account you end up connected as.**
+
+An OAuth sign-in happens in your normal web browser, which the widget does not
+own and has no way to isolate. If you are still signed in to the provider's
+website as your first account, the handshake completes as *that* account
+immediately, without ever showing you a login form or asking which account you
+want. You will think you added the second one. You did not. There is no code
+change that fixes this — the credential the CLI hands back is a genuine, correct
+credential for the account your browser was already signed in as.
+
+So, **before** you start a second sign-in, do one of these:
+
+- sign out of the provider's website in your browser, or
+- open a private / incognito window and sign in to the provider there first, or
+- use a separate browser profile for the second account.
+
+Then run the widget's sign-in and complete it in that session.
+
+The widget checks the result rather than trusting it. If the credential that
+comes back belongs to an account you already have, the sign-in is **refused** and
+nothing is written to the vault — you get the message *"This is the same account
+you are already signed in as. Sign out in your browser, or open a
+private/incognito window, before signing in with the other email address."*
+Re-authenticating an existing account is checked the same way, and a sign-in that
+comes back as a *different* account is refused too, with *"That sign-in came back
+as a different account, not this one, so nothing was changed."* That second
+refusal matters: both providers kill the old refresh token the instant they issue
+a new one, so writing the wrong credential into a row would have destroyed the
+very account you were trying to repair.
 
 ### Which providers work today
 
@@ -503,6 +596,25 @@ volume for instance. `~` and `%VARIABLES%` are expanded.
 It is plain JSON. Deleting it loses nothing but the account list and the names
 you gave them; the CLIs' own logins are untouched and can be imported again.
 
+**Deleting an account stays deleted.** Removing a row does two things: it drops
+the entry from the vault, and it writes a small record of the removal to a
+separate file beside the vault — `accounts.json.forgotten` by default, and it
+follows `AI_ACCOUNTS_FILE` if you move the vault. That record is what stops the
+CLI import from quietly putting the account straight back the next time it finds
+the same credential file on disk. It lives outside the vault on purpose: deleting
+or resetting `accounts.json` — an uninstall, a reinstall, a corrupted-vault
+recovery — would otherwise un-delete every account you had ever removed. The
+record holds no secret, only which provider it was, a fingerprint, the path the
+credential was read from, and when you removed it.
+
+The trade-off is stated plainly in the code and worth knowing: a removal is also
+matched on the *file path* the credential came from, not only on its contents,
+because Claude's fingerprint changes every time its token is refreshed. So if you
+later log that same CLI in as a genuinely different account, the import will keep
+skipping that file until you allow it back. A removal that was too enthusiastic
+costs you one re-import; an account resurrecting itself costs you trust that
+delete means delete.
+
 ### Troubleshooting accounts
 
 **The same account appears twice, and one copy is wrong.**
@@ -511,14 +623,20 @@ WSL home, and the older of the two is a leftover. Imports fold identical logins
 together, but two genuinely different stored copies are two accounts. Delete the
 stale one from the list — nothing else in the vault is affected.
 
-**I signed in, and the widget still shows the old account.**
-Check *which* account the CLI actually ended up logged in as. The CLI holds one
-login, so signing in to a second account replaces the first in its own file; if
-you then sign in again as the original, the CLI has overwritten your new one.
-The widget's stored copies do not have this problem, which is the point of the
-vault — but a sign-in you launch goes through the CLI, so it inherits the CLI's
-single-slot behaviour while it runs. Sign in once per account, and let the
-widget keep the copies.
+**I signed in, and it added the account I already had.**
+This is the browser, not the widget, and it is the single most common way to
+lose an afternoon here. Your browser was still signed in to the provider as the
+first account, so the OAuth handshake completed as that account without asking.
+The widget detects it and refuses the write, so nothing was damaged — but the
+second account was never added. Sign out at the provider's website, or use a
+private window, and run the sign-in again. See
+[Read this before adding a second account](#read-this-before-adding-a-second-account).
+
+**A removed account will not come back when I want it to.**
+Removals are durable on purpose — see
+[Where the accounts are stored](#where-the-accounts-are-stored). The record of
+the removal sits in `accounts.json.forgotten` beside the vault, and the import
+keeps skipping that credential until the record is cleared.
 
 **Every account reads `offline` (or `VPN required`) and the network is fine.**
 The providers block some regions outright, and the widget will not send a quota

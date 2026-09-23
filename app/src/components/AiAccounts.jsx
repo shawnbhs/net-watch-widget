@@ -82,12 +82,47 @@ function settle(result, onValue) {
  * the other two ways a pending state clears.
  */
 const PENDING_MS = 12000
+/**
+ * The backstop for a command that is a human in a browser, not a function call.
+ *
+ * A sign-in sends exactly two progress beats (`sandbox`, then `console`, from
+ * sidecar.py:1723 and :1734) and then goes quiet for as long as the person
+ * takes. Under PENDING_MS the add line re-armed itself twelve seconds in and
+ * announced "got no answer -- nothing changed" while the sign-in window was
+ * still open and waiting, which is both wrong and the most discouraging
+ * possible moment to say it. Every exit from a sign-in -- completed, refused,
+ * cancelled, timed out, vault write failed -- sends a terminal `ai_accounts`
+ * message that clears the row, so this longer clock is the backstop for the
+ * sidecar dying mid-login, not the ordinary path.
+ */
+const LOGIN_PENDING_MS = 300000
 /** How long a notice stays fully legible before it begins to fade. */
 const NOTICE_HOLD_MS = 3800
 /** The fade itself. Must match the duration class on the notice element. */
 const NOTICE_FADE_MS = 700
-/** The longest error text this pane will draw. */
-const NOTICE_MAX = 110
+/**
+ * Historical clip length. No longer used to cut text -- the notice line now
+ * always wraps in full (see `clip` below) -- kept only as the width past
+ * which the caller may want to reconsider layout. Raised well past the
+ * sidecar's longest known message (the ~175-character duplicate-account
+ * verdict) so nothing near today's real traffic is anywhere close to it.
+ */
+const NOTICE_MAX = 320
+
+/**
+ * `t: 'error'` messages this pane is the right surface for, and how to say so.
+ *
+ * Deliberately not every `where` the sidecar uses: one that is always followed
+ * by an `ai_accounts` message carrying the same failure (`ai_account_login`,
+ * sidecar.py:1680) would announce twice and overwrite its own better-worded
+ * second line.
+ */
+const ERROR_LABEL = {
+  ai_accounts: 'Account poll failed',
+  ai_migrate: 'Adopting existing logins failed',
+  ai_login_teardown: 'Sign-in cleanup failed — a sandbox may be left on disk',
+}
+const OWNED_ERRORS = new Set(Object.keys(ERROR_LABEL))
 
 /** The key the add-account command is tracked under: it has no account yet. */
 const ADD_KEY = 'nw:add'
@@ -104,19 +139,17 @@ const CMD_LABEL = {
 }
 
 /**
- * Bound a message that came from outside this file, and say when it was bound.
+ * Normalise a message that came from outside this file. Never shortens it.
  *
  * The error text is produced by the main process and could in principle be any
- * length; a wall of it would push the card's measured rectangle out from under
- * its frosted pane. So it is clipped -- but clipped visibly. A string that ends
- * mid-word with no mark is a string the reader believes they read in full, and
+ * length. It used to be clipped with an ellipsis past `NOTICE_MAX`, but a
+ * string that ends mid-word with no mark reads as complete when it is not, and
  * silently dropping the tail of an error is how the informative half of a
- * message disappears without anyone noticing.
+ * message disappears without anyone noticing. The notice element wraps
+ * (`break-words`) instead, so the full text is always the one shown.
  */
-function clip(text, max = NOTICE_MAX) {
-  const s = String(text ?? '').replace(/\s+/g, ' ').trim()
-  if (s.length <= max) return { text: s, truncated: false }
-  return { text: `${s.slice(0, max)}…`, truncated: true }
+function clip(text) {
+  return String(text ?? '').replace(/\s+/g, ' ').trim()
 }
 
 /**
@@ -183,6 +216,10 @@ function rosterSig(list) {
 function useAiCommands(accounts) {
   const [pending, setPending] = useState({})
   const [notice, setNotice] = useState(null)
+  // The sidecar's last login `stage`, or null when no sign-in is running. Read
+  // from the same envelope as everything else here, so it cannot disagree with
+  // the pending table the way a second subscription eventually would.
+  const [stage, setStage] = useState(null)
   const timers = useRef({})
   const fade = useRef({ hold: 0, drop: 0 })
   // The array as of this render, and the pending table as of this render, both
@@ -208,13 +245,45 @@ function useAiCommands(accounts) {
     })
   }
 
-  const announce = (text) => {
+  /**
+   * Show one line. `bad` is the difference between a failure and a progress
+   * beat, and it is carried rather than assumed: this line is now the only
+   * place a sign-in reports itself, and rendering "a sign-in window is open"
+   * in the same alarm red as "vault write failed" teaches the user to read
+   * every notice as a fault.
+   */
+  const announce = (text, bad = true) => {
     clearTimeout(fade.current.hold)
     clearTimeout(fade.current.drop)
-    setNotice({ ...clip(text), fading: false })
+    const body = clip(text)
+    setNotice({ text: body, bad, fading: false })
+    // A short progress beat has been read by 3.8s. A refusal has not: the
+    // duplicate verdict and the wrong-account explanation are multi-sentence
+    // instructions about what to do in the browser, and they are the only
+    // record of why the sign-in the user just sat through changed nothing.
+    // Fading those out from under someone mid-sentence is how the explanation
+    // gets lost and the whole attempt reads as a silent failure again.
+    const hold = NOTICE_HOLD_MS * (body.length > 90 ? 4 : 1)
     fade.current.hold = setTimeout(
-      () => setNotice((n) => (n ? { ...n, fading: true } : n)), NOTICE_HOLD_MS)
-    fade.current.drop = setTimeout(() => setNotice(null), NOTICE_HOLD_MS + NOTICE_FADE_MS)
+      () => setNotice((n) => (n ? { ...n, fading: true } : n)), hold)
+    fade.current.drop = setTimeout(() => setNotice(null), hold + NOTICE_FADE_MS)
+  }
+
+  /** (Re)start one key's backstop clock. The only place that timer is built. */
+  const arm = (key, cmd, ms) => {
+    clearTimeout(timers.current[key])
+    timers.current[key] = setTimeout(() => {
+      forget([key])
+      announce(`${CMD_LABEL[cmd] ?? 'Command'} got no answer — nothing changed, try again.`)
+    }, ms)
+  }
+
+  /** Push every named row's backstop out, for work that legitimately runs long. */
+  const extend = (keys, ms) => {
+    for (const k of keys) {
+      const row = held.current[k]
+      if (row) arm(k, row.cmd, ms)
+    }
   }
 
   /** Mark a row busy, start its timeout, then send the command. */
@@ -223,11 +292,7 @@ function useAiCommands(accounts) {
       ? rosterSig(live.current)
       : accountSig(live.current.find((a) => a.id === key))
     setPending((p) => ({ ...p, [key]: { cmd, sig } }))
-    clearTimeout(timers.current[key])
-    timers.current[key] = setTimeout(() => {
-      forget([key])
-      announce(`${CMD_LABEL[cmd] ?? 'Command'} got no answer — nothing changed, try again.`)
-    }, PENDING_MS)
+    arm(key, cmd, PENDING_MS)
     run()
   }
 
@@ -267,17 +332,107 @@ function useAiCommands(accounts) {
   // exactly that window.
   useEffect(() => {
     const off = window.nw?.onData?.((msg) => {
-      if (!msg || msg.t !== 'ai_error') return
-      const cmd = typeof msg.cmd === 'string' ? msg.cmd : ''
-      const keys = Object.keys(held.current)
-      // `ai_error` names the command, not the account, so every row waiting on
-      // that command is released. When the name matches nothing -- an unknown
-      // command, or a refusal for something this pane never sent -- everything
-      // pending is released anyway: an extra re-enable costs one wasted click,
-      // a missed one costs the button for the rest of the session.
-      const hit = keys.filter((k) => held.current[k]?.cmd === cmd)
-      if (keys.length) forget(hit.length ? hit : keys)
-      announce(`${CMD_LABEL[cmd] ?? 'Command'} refused — ${msg.error ?? 'invalid arguments'}`)
+      if (!msg) return
+      if (msg.t === 'ai_error') {
+        setStage(null)
+        const cmd = typeof msg.cmd === 'string' ? msg.cmd : ''
+        const keys = Object.keys(held.current)
+        // `ai_error` names the command, not the account, so every row waiting on
+        // that command is released. When the name matches nothing -- an unknown
+        // command, or a refusal for something this pane never sent -- everything
+        // pending is released anyway: an extra re-enable costs one wasted click,
+        // a missed one costs the button for the rest of the session.
+        const hit = keys.filter((k) => held.current[k]?.cmd === cmd)
+        if (keys.length) forget(hit.length ? hit : keys)
+        announce(`${CMD_LABEL[cmd] ?? 'Command'} refused — ${msg.error ?? 'invalid arguments'}`)
+        return
+      }
+      if (msg.t === 'ai_accounts') {
+        // This pane used to hear nothing between sending `ai_account_add` and
+        // either the roster changing or the 12s PENDING_MS timeout, so a
+        // duplicate-account verdict or a login-in-progress notice from the
+        // sidecar never reached the user -- they just watched the timeout fire.
+        // Field names are the sidecar's, read from its emitter rather than
+        // guessed: `err` for a failure, `note` for a duplicate verdict or a
+        // login progress beat. An earlier draft read `notice`/`message`,
+        // which no emitter ever sets, so every one of these was silently
+        // dropped -- the same blackout this branch exists to end.
+        //
+        // `err` is checked first because a message carrying both is a
+        // failure that happens to explain itself, and the failure is the
+        // part the user must not miss.
+        const failed = typeof msg.err === 'string' && msg.err !== ''
+        const text = failed ? msg.err
+          : ((typeof msg.note === 'string' && msg.note) || null)
+        if (text) announce(text, failed)
+
+        if (msg.status === 'login') {
+          // Still running. This is the ONLY non-terminal value `status` ever
+          // takes on this envelope (sidecar.py:1337), so it is the only one
+          // that may leave a row pending -- and it must push that row's clock
+          // out, because what follows a beat is a human in a browser.
+          setStage(typeof msg.stage === 'string' ? msg.stage : null)
+          extend(Object.keys(held.current), LOGIN_PENDING_MS)
+          return
+        }
+
+        // Everything else on this envelope is a finished command. The sidecar
+        // emits `ai_accounts` for exactly two reasons -- a login progress beat
+        // (handled above) or the answer to a command -- so "not a beat" is a
+        // complete and checkable definition of terminal, and it covers every
+        // outcome by construction rather than by a list of strings that the
+        // next sidecar change would silently fall off the end of.
+        //
+        // This replaces a check for `status === 'refused'` alone, which read
+        // only the ADD_KEY row. A re-auth refused for an account mix-up
+        // (sidecar.py:1797) is sent while the pending key is that ACCOUNT's
+        // id, never ADD_KEY, so its row kept spinning for the full 12s and
+        // then claimed it "got no answer" -- the same self-contradiction the
+        // refused branch was added to remove, surviving on the other path.
+        // Every plain `err` exit -- "sign-in cancelled", "login not
+        // completed", "vault write failed", "no such account" -- carries no
+        // status at all and was left spinning by that check too.
+        //
+        // Releasing every pending row rather than a guessed subset follows the
+        // rule the `ai_error` branch above already states: this envelope names
+        // no command, an extra re-enable costs one wasted click, and a missed
+        // one costs the button for the rest of the session.
+        // The sign-in is over however it ended, so the stage it reached must
+        // not outlive it -- a stale 'console' would keep claiming a sign-in
+        // window is open after the one that was open has closed.
+        setStage(null)
+        const done = Object.keys(held.current)
+        if (done.length) forget(done)
+        return
+      }
+
+      // The sidecar's own `t: 'error'` envelope, for the failures that have no
+      // `ai_accounts` message behind them. `ai_accounts` (sidecar.py:459) is a
+      // whole-roster poll that threw; `ai_migrate` (:732) is first-run
+      // adoption; `ai_login_teardown` (:1845) means a sandbox holding a live
+      // credential may still be on disk. useSidecar.js collects these into
+      // `state.errors`, which nothing renders, so without this they reached a
+      // user-visible surface nowhere at all.
+      if (msg.t === 'error') {
+        const where = typeof msg.where === 'string' ? msg.where : ''
+        if (OWNED_ERRORS.has(where)) {
+          announce(`${ERROR_LABEL[where]} — ${msg.err ?? 'failed'}`)
+          return
+        }
+        // A command this build sends that this sidecar does not implement
+        // (sidecar.py:1975). Nothing else answers it, so the row would spin to
+        // its timeout and blame the network for a version mismatch.
+        if (where === 'stdin' && typeof msg.err === 'string'
+            && msg.err.startsWith('unknown command:')) {
+          const name = msg.err.slice('unknown command:'.length).trim()
+          if (name in CMD_LABEL) {
+            const keys = Object.keys(held.current)
+            const hit = keys.filter((k) => held.current[k]?.cmd === name)
+            if (hit.length) forget(hit)
+            announce(`${CMD_LABEL[name]} is not available in this sidecar build.`)
+          }
+        }
+      }
     })
     return () => { if (typeof off === 'function') off() }
   }, [])
@@ -290,7 +445,7 @@ function useAiCommands(accounts) {
     clearTimeout(fade.current.drop)
   }, [])
 
-  return { pending, notice, begin, announce }
+  return { pending, notice, stage, begin, announce }
 }
 
 /* ── the data, made uniform ────────────────────────────────────────────────── */
@@ -895,10 +1050,15 @@ function QuotaRow({ label, pct, reset, dim }) {
 function AccountDetail({ account, providers, busy, onCommand }) {
   const [renaming, setRenaming] = useState(false)
   const [draft, setDraft] = useState('')
+  const [confirmingRemove, setConfirmingRemove] = useState(false)
   const input = useRef(null)
 
-  useEffect(() => { setRenaming(false) }, [account?.id])
+  useEffect(() => { setRenaming(false); setConfirmingRemove(false) }, [account?.id])
   useEffect(() => { if (renaming) input.current?.focus() }, [renaming])
+  // A command in flight is exactly the moment a stale confirm prompt must not
+  // survive: the click that follows it would resend a remove for whatever
+  // account is selected by then, not the one the user meant.
+  useEffect(() => { if (busy) setConfirmingRemove(false) }, [busy])
 
   if (!account) {
     return (
@@ -969,17 +1129,75 @@ function AccountDetail({ account, providers, busy, onCommand }) {
         >
           &#8635;
         </button>
+        {/* This used to be a bare "×" glyph the same size and colour as the
+            refresh "↻" beside it, one pixel apart, with no confirmation --
+            indistinguishable at a glance and one click from permanently
+            deleting the vault row. It now carries a word, so it reads
+            differently from refresh without being read at all, and it never
+            fires the delete on the first click: it only arms the confirm
+            step below. */}
         <button
           type="button"
           disabled={busy}
+          aria-haspopup="true"
+          aria-expanded={confirmingRemove}
           title={busy ? 'Waiting for the last command' : 'Remove this account from the vault'}
-          onClick={() => onCommand(account.id, 'ai_account_remove', () => bridge.remove(account.id))}
-          className={'shrink-0 text-[10px] leading-none transition '
-            + (busy ? 'cursor-default text-faint' : 'text-muted hover:text-bad')}
+          onClick={() => setConfirmingRemove(true)}
+          className={'shrink-0 rounded-[4px] px-1 text-[9px] leading-none transition '
+            + (busy ? 'cursor-default text-faint' : 'text-muted hover:bg-white/10 hover:text-bad')}
         >
-          &#10005;
+          Remove
         </button>
       </div>
+
+      {confirmingRemove && (
+        /* The permanent, unrecoverable half of this action lives here, not on
+           the button above: one click only ever arms this row, never deletes
+           anything. `role="alertdialog"` and the autofocused "Remove" button
+           make the choice reachable with a keyboard exactly the way the arm
+           click was, and Escape backs out the same as clicking Cancel. */
+        <div
+          role="alertdialog"
+          aria-label="Confirm account removal"
+          className="glass-text mt-1 rounded-[6px] border border-edge-soft bg-white/[0.06] px-1.5 py-1"
+        >
+          {/* Precisely what the vault does, not a rounded-off version of it.
+              Removal also writes a tombstone (aiaccounts.py:386) so the
+              automatic import sweep cannot resurrect the row, and signing in
+              again clears that tombstone (core.py:4038). "No undo" would be
+              the wrong warning -- the credential really is gone, but the way
+              back is a sign-in, and there is no button in this app that
+              restores it without one. */}
+          <div className="break-words text-[9.5px] leading-snug text-ink-2">
+            Remove {account.label || name} from the vault? This deletes its stored
+            credential, and nothing in this app puts it back: the only way to
+            return this account is to sign in to it again.
+          </div>
+          <div className="mt-1 flex items-center gap-1">
+            <button
+              type="button"
+              autoFocus
+              onKeyDown={(e) => { if (e.key === 'Escape') setConfirmingRemove(false) }}
+              onClick={() => {
+                setConfirmingRemove(false)
+                onCommand(account.id, 'ai_account_remove', () => bridge.remove(account.id))
+              }}
+              className={'rounded-[5px] bg-bad/20 px-1.5 py-[2px] text-[9.5px] leading-snug '
+                + 'text-bad transition hover:bg-bad/30 ' + FOCUS_RING}
+            >
+              Remove permanently
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmingRemove(false)}
+              className={'rounded-[5px] px-1.5 py-[2px] text-[9.5px] leading-snug text-muted '
+                + 'transition hover:bg-white/10 hover:text-ink ' + FOCUS_RING}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="glass-text break-words text-[9px] leading-snug text-faint">
         {name}{expiry ? ` · ${expiry}` : ''}
@@ -1034,9 +1252,75 @@ function AccountDetail({ account, providers, busy, onCommand }) {
 
 /* ── the panel ─────────────────────────────────────────────────────────────── */
 
+/**
+ * The screen between picking a provider and actually starting its sign-in.
+ *
+ * The thing that decides which account gets connected is not this app and
+ * not the CLI sandbox -- it is whichever account the system browser already
+ * has a session for. A perfectly clean CLI still hands the OAuth flow to a
+ * browser that is signed in as account #1, and the flow completes as #1
+ * without ever asking, which is exactly the silent-reconnect bug this screen
+ * exists to prevent. That fact used to live only in a tooltip on the picker
+ * row, and a tooltip nobody reads before clicking is not a warning, it is
+ * decoration. This is a click of its own, so the user has to see it -- and
+ * it is asked every time, not once ever: it is cheap to click through if the
+ * browser is already right (a sign-out or a private window), and skipping it
+ * "for good" would put the very first user who forgets right back where this
+ * bug started.
+ */
+function SignInWarning({ provider, onConfirm, onCancel }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onCancel() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onCancel])
+
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-label={`Before signing in to ${provider.name}`}
+      className="absolute inset-x-0 top-0 z-20 flex max-h-full flex-col overflow-hidden
+                 rounded-[8px] border border-edge-soft bg-black/80 p-1.5"
+    >
+      <div className="glass-text break-words text-[10px] leading-snug text-ink-2">
+        Your web browser decides which account you sign in as here, not this app.
+      </div>
+      <div className="glass-text mt-1 break-words text-[9.5px] leading-snug text-faint">
+        If your browser is already signed in to {provider.name} as an account you
+        do not want to add, this will connect that account again instead of asking.
+        To add a different one, sign out on {provider.name}'s own site first, or
+        open the sign-in in a private / incognito window.
+      </div>
+      <div className="mt-1.5 flex items-center gap-1">
+        <button
+          type="button"
+          autoFocus
+          onClick={onConfirm}
+          className={'rounded-[5px] border border-edge-soft bg-white/[0.08] px-1.5 py-[2px] '
+            + 'text-[9.5px] leading-snug text-ink transition hover:bg-white/20 ' + FOCUS_RING}
+        >
+          My browser is ready — continue
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className={'rounded-[5px] px-1.5 py-[2px] text-[9.5px] leading-snug text-muted '
+            + 'transition hover:bg-white/10 hover:text-ink ' + FOCUS_RING}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export function AiAccounts({ ai, providers: registry }) {
   const [query, setQuery] = useState('')
   const [picking, setPicking] = useState(false)
+  // The provider a sign-in was requested for, held here only until the user
+  // acknowledges the browser-session warning above or backs out of it.
+  const [pendingProvider, setPendingProvider] = useState(null)
   // The id, never the position. The accounts array reorders as each account
   // finishes its own poll, so a remembered index would quietly start pointing
   // at a different account -- and the whole point of this pane is knowing which
@@ -1056,7 +1340,7 @@ export function AiAccounts({ ai, providers: registry }) {
   // it falls back, so emptiness cannot be the signal. This is.
   const registryArrived = Boolean((registry ?? fetched)?.length)
   const accounts = useMemo(() => accountsOf(ai), [ai])
-  const { pending, notice, begin } = useAiCommands(accounts)
+  const { pending, notice, stage, begin } = useAiCommands(accounts)
 
   const shown = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -1158,39 +1442,59 @@ export function AiAccounts({ ai, providers: registry }) {
           busy={Boolean(pending[ADD_KEY])}
           onPick={(p) => {
             setPicking(false)
-            // The label is the user's to change; a default that names the
-            // provider is better than an empty row while the login runs.
-            begin(ADD_KEY, 'ai_account_add', () => bridge.add(p.id, p.name))
+            // Sign-in does not start here any more -- it starts once the
+            // browser-session warning below is acknowledged.
+            setPendingProvider(p)
           }}
           onClose={() => setPicking(false)}
         />
       )}
 
+      {pendingProvider && (
+        <SignInWarning
+          provider={pendingProvider}
+          onConfirm={() => {
+            const p = pendingProvider
+            setPendingProvider(null)
+            // The label is the user's to change; a default that names the
+            // provider is better than an empty row while the login runs.
+            begin(ADD_KEY, 'ai_account_add', () => bridge.add(p.id, p.name))
+          }}
+          onCancel={() => setPendingProvider(null)}
+        />
+      )}
+
       {/* The add command has no row of its own to wear a pending mark, so it
           says so here, on the line the notice already occupies. */}
+      {/* "Adding the account…" is true for the second before the sandbox is
+          built and false for the several minutes after it, when what is
+          actually happening is a person signing in at a browser window. The
+          line follows the sidecar's own stage so it never contradicts the
+          notice printed directly beneath it. */}
       {pending[ADD_KEY] && (
-        <div className="mt-1 flex items-center gap-1">
-          <Busy />
-          <span className="glass-text text-[9.5px] leading-snug text-faint">
-            Adding the account…
+        <div className="mt-1 flex items-start gap-1">
+          <Busy className="mt-[1px]" />
+          <span className="glass-text min-w-0 flex-1 break-words text-[9.5px] leading-snug text-faint">
+            {stage === 'console'
+              ? 'Waiting for you to finish signing in — the sign-in window is open.'
+              : 'Adding the account…'}
           </span>
         </div>
       )}
 
+      {/* `break-words` and no width cap: this line carries the sidecar's own
+          sentences, which include the ~175-character duplicate verdict and the
+          longer wrong-account explanation, and both are only useful whole. It
+          wraps to as many lines as it needs and is never shortened. */}
       {notice && (
         <div
           role="status"
-          title={notice.truncated
-            ? 'The message was longer than this pane can show; it ends with an ellipsis.'
-            : undefined}
-          className={'glass-text mt-1 break-words text-[9.5px] leading-snug text-bad '
+          className={'glass-text mt-1 break-words text-[9.5px] leading-snug '
             + 'transition-opacity duration-700 '
+            + (notice.bad ? 'text-bad ' : 'text-muted ')
             + (notice.fading ? 'opacity-0' : 'opacity-100')}
         >
           {notice.text}
-          {notice.truncated && (
-            <span className="text-faint"> (message shortened)</span>
-          )}
         </div>
       )}
     </div>

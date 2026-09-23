@@ -645,7 +645,32 @@ def ai_account_login(aid):
     isolated_login("", account_id=aid)
 
 
+def _vault_write_err(exc, fallback):
+    """One error string for a vault write that raised, refusal or not.
+
+    A refusal (the vault could not be read, so it was not overwritten) is
+    named in words the user can act on; anything else falls back to the
+    caller's verb. str(exc) is used only as a last resort and only for
+    non-refusals, because these exceptions come from a layer whose messages
+    are written for a traceback, not for a status line.
+    """
+    refused = core._vault_refusal(exc) if hasattr(core, "_vault_refusal") else None
+    if refused:
+        return refused
+    return str(exc) or fallback
+
+
 def ai_account_remove(aid):
+    """Remove an account, and only say so once the vault says it is gone.
+
+    remove_account() -> forget_account() returns a bool that is True only
+    after the vault has been written AND read back and the tombstone has
+    landed. Discarding it is not a cosmetic slip: on a failed write the UI is
+    told "removed", the pane clears its pending row, and the account is still
+    on disk and reappears at the next process start -- the user believes a
+    deletion happened that did not. _vault_store_cred has always checked its
+    bool; these two paths now agree that a vault write can fail.
+    """
     if not _vault_or_err("remove"):
         return
     try:
@@ -656,15 +681,27 @@ def ai_account_remove(aid):
         ai_accounts_emit(err="no such account")
         return
     try:
-        core._vault.remove_account(aid)
+        gone = bool(core._vault.remove_account(aid))
     except Exception as exc:
-        ai_accounts_emit(err=str(exc) or "remove failed")
+        ai_accounts_emit(err=_vault_write_err(exc, "remove failed"))
+        return
+    if not gone:
+        # The row is still in the vault. Emitting the current roster with an
+        # error rather than a note is what puts the account back in front of
+        # the user instead of quietly leaving a stale pane behind.
+        ai_accounts_emit(err="remove failed: the account is still stored")
         return
     ai_accounts_emit(note="removed")
     _ai_now.set()
 
 
 def ai_account_rename(aid, label):
+    """Rename an account, and only say so once the new label is on disk.
+
+    Same contract as remove above: rename_account() reports whether save()
+    proved the document landed, so a discarded False leaves the pane showing a
+    label that reverts at the next process start.
+    """
     if not _vault_or_err("rename"):
         return
     if not label:
@@ -678,9 +715,12 @@ def ai_account_rename(aid, label):
         ai_accounts_emit(err="no such account")
         return
     try:
-        core._vault.rename_account(aid, label)
+        renamed = bool(core._vault.rename_account(aid, label))
     except Exception as exc:
-        ai_accounts_emit(err=str(exc) or "rename failed")
+        ai_accounts_emit(err=_vault_write_err(exc, "rename failed"))
+        return
+    if not renamed:
+        ai_accounts_emit(err="rename failed: the stored label is unchanged")
         return
     ai_accounts_emit(note="renamed")
 
@@ -757,6 +797,160 @@ except Exception:
     aicredsources = None
 
 
+# ── durable account identity ──────────────────────────────────────────────────
+# A fingerprint is this file's answer to "is this the same account". For codex
+# it always was one: `tokens.account_id` is a real id. For claude it was
+# `subscriptionType + expiresAt`, and `expiresAt` is a token expiry rewritten
+# on every single issue -- so signing in again as the SAME person produced a
+# fingerprint matching nothing stored, and the account was filed as new. That
+# is the reported bug, and it also meant the re-authentication guard below
+# could never fire, because a positive match was unreachable.
+#
+# `aiproviders` now resolves a durable id for claude (`oauthAccount.accountUuid`,
+# read from the CLI's own local state file -- a local read, no network) and
+# publishes a matcher that answers to the durable form AND the legacy one, so
+# rows written by older builds keep matching without rewriting the vault.
+#
+# None of this is load-bearing. Every helper here degrades to the single
+# legacy string when the durable API is absent, which is exactly what this
+# file did before, and a missing module costs one comparison rather than the
+# whole widget.
+
+try:
+    import aiproviders  # noqa: E402  (durable identity; may be absent)
+except Exception:
+    aiproviders = None
+
+
+# The stored form of a claude durable fingerprint. Public by construction:
+# `is_durable_fingerprint` answers from this prefix alone, so a caller holding
+# only the string can read it back.
+_ACCT_FP_PREFIX = "claude:acct:"
+
+
+def _ident_fn(name):
+    """The durable-identity helper called `name`, or None.
+
+    The vault is asked first and the provider registry second, deliberately.
+    The vault owns what counts as the same account for storage, so if it has
+    adopted the durable scheme its answer is the one every path in this file
+    must agree with; falling through to `aiproviders` only covers the window
+    where the registry has the capability and the vault has not adopted it
+    yet. Bound by name at each call rather than once at import, because both
+    modules are owned elsewhere and may gain the function after this one has
+    already loaded.
+    """
+    for mod in (getattr(core, "_vault", None), aiproviders):
+        fn = getattr(mod, name, None) if mod is not None else None
+        if callable(fn):
+            return fn
+    return None
+
+
+def _legacy_fp(provider, cred):
+    """The vault's own single-string fingerprint, or "" when it has none.
+
+    The vault owns the definition; taking it from anywhere else would let the
+    guard below and the import path disagree about what counts as the same
+    account.
+    """
+    try:
+        fp = core._vault.cred_fingerprint(provider, cred)
+    except Exception:
+        return ""
+    return str(fp) if fp else ""
+
+
+def _fp_candidates(provider, cred, cred_path=None):
+    """Every fingerprint form this credential answers to, best first.
+
+    Matching a set rather than one string is the back-compatibility mechanism:
+    a row stored before durable identity existed carries the legacy string, a
+    row stored since carries the durable one, and comparing candidate sets
+    matches either without migrating a single file.
+
+    `cred_path` is the file this credential was read out of, and for claude it
+    is how the durable id is found at all -- the CLI writes the account id
+    beside the credential, not inside it. Pass it ONLY for a credential just
+    read off disk. For a credential already held in the vault, pass nothing:
+    a stored row's recorded path is usually the user's shared home, whose
+    state file names whichever account the CLI is signed in as *now* rather
+    than the account that row holds. Resolving a stored row through it would
+    attribute row B to account A, and the guard below would then refuse A's
+    own legitimate re-authentication -- the exact failure it must not cause.
+    """
+    fn = _ident_fn("cred_fingerprint_candidates")
+    if fn is not None:
+        try:
+            out = fn(provider, cred, cred_path)
+        except TypeError:
+            # A vault that exposes the name with the older two-argument shape.
+            try:
+                out = fn(provider, cred)
+            except Exception:
+                out = None
+        except Exception:
+            out = None
+        if out:
+            return [str(f) for f in out if f]
+    fp = _legacy_fp(provider, cred)
+    return [fp] if fp else []
+
+
+def _capture_identity(provider, cred, cred_path):
+    """Staple the durable account id onto a credential just captured.
+
+    This is the one moment the answer is knowable. The id lives beside the
+    credential rather than inside it, so it can only be resolved while the
+    home it was written into still belongs to this account: a login sandbox is
+    destroyed within seconds of the sign-in, and a shared home starts
+    answering for whichever account signs in next. Writing the id onto the
+    credential makes the row that goes into the vault self-describing, so
+    every later check -- the next duplicate verdict, the next re-auth guard --
+    reads it straight off the object with no file access and no ambiguity
+    about which home it came from.
+
+    Only the opaque account id is copied. The same state file carries an email
+    address, which is personal data this widget has no reason to store and
+    which no caller needs, since equality is the only question ever asked.
+
+    Returns a stapled copy when there is something to staple and the original
+    otherwise. Never raises, never rewrites an id the credential already
+    carries, and never touches token material.
+    """
+    if not isinstance(cred, dict):
+        return cred
+    fn = _ident_fn("cred_identity")
+    if fn is None:
+        return cred
+    try:
+        ident = fn(provider, cred, cred_path) or {}
+    except TypeError:
+        try:
+            ident = fn(provider, cred) or {}
+        except Exception:
+            return cred
+    except Exception:
+        return cred
+    if not isinstance(ident, dict) or ident.get("kind") != "account_uuid":
+        # codex needs nothing stapled: its id is already inside the credential.
+        # An email-only or legacy answer is deliberately not persisted -- the
+        # first is personal data, the second is a token expiry that would be
+        # stale the moment it was written.
+        return cred
+    fp = str(ident.get("fp") or "")
+    if not fp.startswith(_ACCT_FP_PREFIX):
+        return cred
+    uid = fp[len(_ACCT_FP_PREFIX):].strip()
+    if not uid:
+        return cred
+    if cred.get("accountUuid") or isinstance(cred.get("oauthAccount"), dict):
+        return cred
+    out = dict(cred)
+    out["oauthAccount"] = {"accountUuid": uid}
+    return out
+
+
 def _discovery_or_err(where):
     """True when the discovery layer is importable; otherwise says so."""
     if aicredsources is not None:
@@ -792,11 +986,17 @@ def _safe_locations(locs):
 def _vault_fingerprints():
     """{fingerprint: account id} and {(provider, cred_path): id} for the vault.
 
-    Both indexes come from the vault's own `cred_fingerprint`, deliberately
+    Both indexes come from the vault's own definition of identity, deliberately
     rather than from a second implementation written here: `core._import_sweep`
     already reuses that helper, and a third opinion about what counts as the
     same login would eventually disagree with the other two and either
     duplicate a row or hide one.
+
+    A row is indexed under EVERY form it answers to, not just its best one, so
+    one lookup matches a row stored before durable identity existed and a row
+    stored since. Resolved from the stored object alone -- see
+    `_fp_candidates` for why a stored row's own path is the wrong thing to
+    consult.
     """
     by_fp, by_path = {}, {}
     try:
@@ -807,12 +1007,11 @@ def _vault_fingerprints():
         if not isinstance(a, dict):
             continue
         aid = a.get("id")
-        try:
-            fp = core._vault.cred_fingerprint(a.get("provider"), a.get("cred"))
-        except Exception:
-            fp = None
-        if fp:
-            by_fp[fp] = aid
+        for fp in _fp_candidates(a.get("provider"), a.get("cred")):
+            # setdefault, not assignment: if two rows really do answer to one
+            # fingerprint the first wins, so the report is stable rather than
+            # dependent on vault order.
+            by_fp.setdefault(fp, aid)
         path = a.get("cred_path")
         if path:
             by_path[(a.get("provider"), path)] = aid
@@ -835,18 +1034,18 @@ def _in_vault(provider, source_path, by_fp, by_path):
             cred, _why = aicredsources.read_cred(provider)
         except Exception:
             cred = None
-    fp = None
-    if cred is not None:
-        try:
-            fp = core._vault.cred_fingerprint(provider, cred)
-        except Exception:
-            fp = None
+    # Resolved against the file it was actually read from: for claude the
+    # account id sits beside the credential, so without the path this degrades
+    # to the legacy expiry string and a known account reads as unknown.
+    cands = _fp_candidates(provider, cred, source_path) if cred is not None \
+        else []
     # The credential object dies with this frame. It is read only to compute a
     # fingerprint and is never returned, never stored and never logged, so it
     # cannot reach a renderer log line or a crash report.
     del cred
-    if fp and fp in by_fp:
-        return True, by_fp[fp], "fingerprint"
+    for fp in cands:
+        if fp in by_fp:
+            return True, by_fp[fp], "fingerprint"
     if source_path and (provider, source_path) in by_path:
         return True, by_path[(provider, source_path)], "path"
     return False, None, None
@@ -969,18 +1168,20 @@ def ai_cred_import(provider, path=None, label=None):
         ai_accounts_emit(err=why or "no credential found for %s" % provider,
                          note="import")
         return
-    try:
-        fp = core._vault.cred_fingerprint(provider, cred)
-    except Exception:
-        fp = None
     by_fp, by_path = _vault_fingerprints()
     source = path or next((l.get("path") for l in locs
                            if isinstance(l, dict) and l.get("exists")), None)
-    if fp and fp in by_fp:
+    # `source` is resolved before the comparison rather than after, because it
+    # is an input to it now: the durable id for claude is read from beside the
+    # credential file, so the path is what makes this check able to recognise
+    # an account whose token has rotated since it was stored.
+    cands = _fp_candidates(provider, cred, source)
+    hit = next((by_fp[f] for f in cands if f in by_fp), None)
+    if hit:
         ai_accounts_emit(err="that account is already in the vault",
-                         note="import", account_id=by_fp[fp])
+                         note="import", account_id=hit)
         return
-    if not fp and source and (provider, source) in by_path:
+    if not cands and source and (provider, source) in by_path:
         # Without a fingerprint the identity claim is weaker, so the path is
         # the only duplicate signal available; refusing on it is the safer of
         # the two mistakes, because a duplicate row polls twice and shows the
@@ -997,7 +1198,11 @@ def ai_cred_import(provider, path=None, label=None):
         acct = core._vault.add_account(provider, name, cred, source="import",
                                        cred_path=source)
     except Exception as exc:
-        ai_accounts_emit(err=str(exc) or "import failed", note="import")
+        # A refusal is named from its type rather than its text: the message
+        # aisecrets builds carries the vault path, and this string goes to
+        # stdout. Everything else keeps the previous str(exc) wording.
+        ai_accounts_emit(err=_vault_write_err(exc, "import failed"),
+                         note="import")
         return
     finally:
         # Same rule as the scan: the credential was needed to write the vault
@@ -1311,6 +1516,96 @@ _DUPLICATE_MSG = (
     "Sign out in your browser, or open a private/incognito window, "
     "before signing in with the other email address.")
 
+# A refused re-authentication needs its own words. "Duplicate" is the wrong
+# frame for it: nothing was being added, and the danger runs the other way --
+# the write would have replaced this row's credential with a different
+# account's, and the provider kills the old refresh token the moment it issues
+# a new one, so the account being repaired would have been the one destroyed.
+_WRONG_ACCOUNT_MSG = (
+    "That sign-in came back as a different account%s, not this one, so "
+    "nothing was changed. Sign out in your browser, or open a "
+    "private/incognito window, then sign in with this account's own email "
+    "address.")
+
+
+def _login_refused(stage, message, provider=""):
+    """A sign-in that finished but must not be written to the vault.
+
+    Sent on the same `ai_accounts` envelope every other account message uses,
+    so it arrives in the one reducer case the accounts card already has.
+    Inventing a message type for a refusal would need its own consumer on the
+    renderer side, and a channel with no consumer is exactly how this verdict
+    used to be lost. `status` is deliberately not "login": the sign-in is over
+    and the card must stop waiting rather than draw one more progress beat.
+    """
+    ai_accounts_emit(err=message, note=stage, status="refused", stage=stage,
+                     provider=provider or "")
+
+
+def _fp_owners(pid, cred, accounts, cred_path=None):
+    """Ids of stored accounts this credential provably belongs to.
+
+    Computed here instead of relying on the login module's verdict alone,
+    because the guard below is protecting an irreversible overwrite and needs
+    to know *which* row a match belongs to, not merely that some row matches.
+    It is also the only comparison in the login path that sees durable
+    identity: the login module fingerprints the old way, so for claude its
+    verdict is always "new" no matter who signed in.
+
+    The captured credential is resolved against the file it came out of, so
+    its durable id is available; each stored row is resolved from its own
+    object only, for the reason spelled out in `_fp_candidates`. Both sides
+    answer to their legacy form as well, so a row written before this change
+    still matches while its token has not rotated.
+    """
+    cands = set(_fp_candidates(pid, cred, cred_path))
+    if not cands:
+        return []
+    owners = []
+    for acct in accounts or []:
+        try:
+            if acct.get("provider") != pid:
+                continue
+            if cands.intersection(_fp_candidates(pid, acct.get("cred"))):
+                aid = str(acct.get("id") or "")
+                if aid and aid not in owners:
+                    owners.append(aid)
+        except Exception:
+            continue
+    return owners
+
+
+def _reauth_conflict(dup, dup_id, pid, cred, accounts, account_id,
+                     cred_path=None):
+    """Id of the OTHER account this credential provably belongs to, or "".
+
+    Only a positive match against a *different* row is evidence of a mix-up.
+    A fingerprint that merely DIFFERS from the row being re-authenticated is
+    the ordinary, expected result -- every sign-in mints a new token, and a
+    legacy fingerprint is built from that token's expiry -- so refusing on a
+    difference would block every legitimate re-authentication, which is a far
+    worse failure than the one this guard exists to prevent. That direction is
+    deliberate and must stay this way.
+
+    What durable identity changes is not the direction but the reach. A
+    positive match against another row used to be unreachable for claude, so
+    this guard was inert for the provider it was written for; resolved through
+    the account id it fires exactly when the browser handed back an account
+    that is already stored under a different row.
+
+    The same reasoning covers the degenerate "duplicate, but of what" answer:
+    a bound duplicate function that returns a bare True names no row, and for
+    a provider whose fingerprint is stable that True is usually the target row
+    itself. Unattributable is therefore not treated as a conflict.
+    """
+    owners = _fp_owners(pid, cred, accounts, cred_path)
+    if dup and dup_id and str(dup_id) not in owners:
+        owners.append(str(dup_id))
+    for oid in owners:
+        if oid and oid != account_id:
+            return oid
+    return ""
+
 
 def _kill_proc_tree(proc):
     """Stop the login console and anything it started. Never raises."""
@@ -1520,29 +1815,77 @@ def isolated_login(provider, label="", account_id=None):
         except Exception:
             known = []
 
+        # The sandbox is a private home, so the CLI state file inside it names
+        # the account that just signed in -- and teardown deletes it seconds
+        # from now. Resolving identity here, against that path, is the only
+        # chance to get a correct answer; stapling it onto the credential
+        # carries the answer into the vault row so no later check has to go
+        # looking for a home that no longer exists.
+        cred_path = getattr(handle, "cred_path", None)
+        if not cred_path and isinstance(handle, dict):
+            cred_path = handle.get("cred_path")
+        cred = _capture_identity(pid, cred, cred_path)
+
         dup, dup_id = _dup_verdict(api, pid, cred, known)
-        if dup and not account_id:
-            # Adding a second identical row would hide the problem instead of
-            # naming it, and the user would be left with two cards showing one
-            # account's numbers twice.
-            name = _account_label(known, dup_id)
-            ai_accounts_emit(err=_DUPLICATE_MSG
-                             % (" (%s)" % name if name else ""),
-                             note="duplicate")
-            return
+        if account_id:
+            # The destructive case, and the reason this branch exists at all.
+            # `update_cred` replaces the targeted row's credential wholesale,
+            # and the provider invalidates the old refresh token as soon as it
+            # issues a new one. If the browser signed the user in as somebody
+            # else, writing here would end that account's access with nothing
+            # left to recover it from. Checked before the write, never after.
+            other = _reauth_conflict(dup, dup_id, pid, cred, known, account_id,
+                                     cred_path)
+            if other:
+                name = _account_label(known, other)
+                _login_refused("account-mismatch", _WRONG_ACCOUNT_MSG
+                               % (" (%s)" % name if name else ""), pid)
+                return
+        else:
+            # `owners` is consulted alongside the login module's verdict, not
+            # instead of it. That module fingerprints the credential the old
+            # way, so for claude its answer is always "new" -- a fresh sign-in
+            # as the same person mints a new token expiry, and the old scheme
+            # read that as a different account. This is the path the reported
+            # bug walked down every single time: the browser was still signed
+            # in as the first account, the sign-in completed as that account
+            # without asking, and a second row was written for it.
+            owners = _fp_owners(pid, cred, known, cred_path)
+            if dup or owners:
+                # Adding a second identical row would hide the problem instead
+                # of naming it, and the user would be left with two cards
+                # showing one account's numbers twice.
+                name = _account_label(known,
+                                      dup_id or (owners[0] if owners else ""))
+                _login_refused("duplicate", _DUPLICATE_MSG
+                               % (" (%s)" % name if name else ""), pid)
+                return
 
         try:
             if account_id:
-                core._vault.update_cred(account_id, cred)
+                # update_cred returns True only once the document has been
+                # read back off the disk. A discarded False here would tell
+                # the user the login they just completed was kept when the
+                # only live copy is the one about to go out of scope -- the
+                # provider has already killed the token in the vault.
+                if not core._vault.update_cred(account_id, cred):
+                    ai_accounts_emit(err=core.AI_UNSAVED_DEFAULT)
+                    return
                 note = "account re-authenticated"
             else:
                 shown = label or _default_login_label(pid)
                 core._vault.add_account(pid, shown, cred, source="login")
                 note = "account added"
         except Exception as exc:
-            # The type name only: a vault write failure can carry the path or
-            # the payload in its message, and this string goes to stdout.
-            ai_accounts_emit(err="vault write failed (%s)" % type(exc).__name__)
+            # A refusal is named, because the vault was left intact on purpose
+            # and only the user can clear that state; its reason string is
+            # built from the exception TYPE and contains nothing from the
+            # vault or the payload. Anything else keeps the old type-name-only
+            # wording, since a generic vault error can carry the path or the
+            # credential in its message and this string goes to stdout.
+            ai_accounts_emit(err=(core._vault_refusal(exc)
+                                  or "vault write failed (%s)"
+                                  % type(exc).__name__))
             return
         ai_accounts_emit(note=note)
         _ai_now.set()

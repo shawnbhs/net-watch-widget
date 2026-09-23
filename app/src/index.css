@@ -239,9 +239,29 @@ body {
    already been applied to. It is also transparent to the mouse: a full-window
    layer that took clicks would swallow every one of them meant for a card. Only
    the sprites themselves take the pointer, which is what makes a pet draggable
-   without the widget behind it going deaf. */
+   without the widget behind it going deaf.
+
+   `inset: 0` is load-bearing twice over, and insetting this layer to match the
+   shell's side gutter -- which looks like the fix for a pet clipped at the
+   window edge -- breaks both.
+
+   First, the origin. A sprite is an absolutely positioned child of this box, so
+   its coordinates are measured from this box's padding edge; the platforms it
+   stands on and the cursor it reacts to are viewport coordinates
+   (`getBoundingClientRect`, `clientX`). The two agree only while this box's
+   origin *is* the viewport origin. Move it in by the gutter and every pet
+   draws that far left of the card it is standing on, and hit-testing a drag
+   misses by the same amount.
+
+   Second, the room. The gutter is the one strip of window that is *not* card,
+   so a full-window layer is what gives a pet perched at a card's edge somewhere
+   to overhang into -- the engine deliberately lets a sprite hang about a tenth
+   of its width past the platform. Insetting to the card box removes exactly
+   that margin and clips sooner, not later. A pet still cut off is standing
+   outside the window, which is a position to fix, not a box. */
 .nw-pets {
   position: fixed;
+  /* See above: this is the viewport origin the engine's coordinates assume. */
   inset: 0;
   z-index: 40;
   overflow: hidden;

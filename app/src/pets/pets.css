@@ -15,6 +15,17 @@
      a crisp sprite into a smudge. */
   image-rendering: pixelated;
   will-change: transform;
+  /* Tailwind's preflight puts `max-width: 100%` on every `img`, and the
+     widget document has preflight while the overlay document does not. The
+     engine sizes this element by writing `width` and `height` inline from
+     one scale factor, so a capped width squashes the art horizontally while
+     the inline height stands -- and the character box and anchor it computed
+     alongside them no longer match what is drawn, which moves a pet's feet
+     off the card and its grab target off the pet. Measured on the widest
+     canvas in metrics.json (morph, 100px canvas per 24px character): at a
+     380px window, size 50 at 4x draws 380px wide instead of 750px, a 49%
+     squash, while the overlay draws the same pet unsquashed. */
+  max-width: none;
 }
 
 .pet-sprite.is-held {

@@ -121,7 +121,22 @@ function createWindow() {
   // The overlay goes with it. It is a window of its own, so leaving it open
   // would both keep `window-all-closed` from firing and leave pets wandering a
   // desktop whose widget no longer exists.
-  win.on('closed', () => { win = null; destroyPanes(); pets.closeOverlay() })
+  win.on('closed', () => {
+    win = null
+    // These outlive the window they were started for: a recreate would find a
+    // timer still holding a reference to the dead one, and a second drag would
+    // be racing the first window's leftovers.
+    clearTimeout(moveCoalesce)
+    moveCoalesce = null
+    clearTimeout(moveIdle)
+    moveIdle = null
+    moving = false
+    // Forgotten so the next window re-announces its display on first load
+    // instead of matching the id the dead one happened to end on.
+    lastDisplayId = null
+    destroyPanes()
+    pets.closeOverlay()
+  })
 
   win.on('move', onWindowMove)
   // The first report, for a page that has not moved yet: without it the
@@ -430,8 +445,13 @@ function paneBounds(origin, sf, r) {
     // backstop against a future one that forgets -- not a minimum size for the
     // widget. A zero-width window is not a thing the OS will make; a small
     // widget is.
-    width: Math.max(1, Math.round(r.w)),
-    height: Math.max(1, Math.round(r.h)),
+    // Snapped through the same device-pixel grid as x and y above. Rounding the
+    // edges on one grid and the extent on another lets a card's right edge land
+    // a pixel off its neighbour's left one, and which way it lands changes with
+    // the scale factor -- so the seam between two cards moves when the widget
+    // crosses between a 1.5x and a 1.0x panel.
+    width: Math.max(1, Math.round(snap(r.w))),
+    height: Math.max(1, Math.round(snap(r.h))),
   }
 }
 
@@ -593,23 +613,77 @@ function checkDisplay() {
     width: d.workArea.width,
     height: d.workArea.height,
   })
+  // The overlay is a separate window spanning every display, and pets.js only
+  // recomputes its geometry on display-metrics-changed / added / removed. None
+  // of those fire when the widget merely walks onto another monitor, even
+  // though that is exactly when the pets' floor and the overlay's device scale
+  // change -- which is why they stopped appearing after a trip across the
+  // seam. Push it again from here, through the public accessors only.
+  //
+  // The payload only: the geometry is pets.js's to own, and re-asserting it
+  // from here actively broke the desktop span. `overlayBounds()` with no
+  // argument describes the frame the window *currently has*, so this handed
+  // back whatever rectangle Windows had last clamped the overlay to -- it could
+  // never restore the full-desktop union, only re-confirm the loss of it. Worse,
+  // a setBounds issued while the widget is crossing a DPI seam is re-read in
+  // the scale of whichever monitor the overlay is associated with at that
+  // instant, so the same numbers denote a different rectangle going in than
+  // coming out, and the overlay shrank a little on every crossing. Measured:
+  // the window held 100% of the device desktop until a re-ask of its own live
+  // bounds cut it to 63%.
+  const overlay = pets.overlayWindow()
+  if (overlay) overlay.webContents.send('bounds', pets.overlayBounds())
+}
+
+/**
+ * Coalescing timer for a burst of move events, and how long it holds them.
+ *
+ * Windows emits `move` far faster than a frame during a drag, and faster still
+ * in the moment a window crosses between two panels of different DPI. The work
+ * this handler used to do on every single one of them -- stringify the bounds
+ * for a trace that is usually off, read the bounds again, match a display, and
+ * then one native `setBounds` per pane -- is several native round trips per
+ * event, and at the DPI change it is what turned a drag between the two
+ * monitors into a stall. Nothing downstream of it needs to see every event:
+ * the display can only change once per crossing and the panes are hidden for
+ * the whole drag anyway, so one pass per frame is as much as the answer can
+ * change. Only the frost hiding stays on the raw event, below.
+ *
+ * `null` when no pass is pending, which is also what makes this leading-edge:
+ * the first event of a burst schedules the pass, the rest ride on it.
+ */
+let moveCoalesce = null
+const MOVE_COALESCE_MS = 16
+
+function flushMove() {
+  moveCoalesce = null
+  if (!win || win.isDestroyed()) return
+  // Guarded rather than left to `trace`: the argument is a JSON.stringify of a
+  // fresh native getBounds, and it was being paid on every move event of every
+  // drag whether or not --trace was passed.
+  if (TRACE) trace('move', JSON.stringify(win.getBounds()))
+  checkDisplay()
+  // While a hand is dragging, the panes are hidden and get placed once at
+  // drag-end by `syncPanes`; moving them under the hand is work nobody sees.
+  if (!dragging) repositionPanes()
 }
 
 function onWindowMove() {
   if (!win || win.isDestroyed()) return
-  trace('move', JSON.stringify(win.getBounds()))
-  checkDisplay()
-  if (!dragging) {
-    repositionPanes()
-    return
-  }
-  if (!moving) {
+  // The one thing that cannot wait for the coalescing window. A pane left
+  // visible for even a frame of the drag is the trailing frosted rectangle the
+  // whole hide-while-moving mechanism exists to prevent, so it is hidden on the
+  // first raw event; it is idempotent after that because of the `moving` flag.
+  if (dragging && !moving) {
     moving = true
     hidePanes()
     win.webContents.send('moving', true)
   }
+  if (moveCoalesce === null) moveCoalesce = setTimeout(flushMove, MOVE_COALESCE_MS)
+  if (!dragging) return
   clearTimeout(moveIdle)
   moveIdle = setTimeout(() => {
+    moveIdle = null
     moving = false
     if (!win || win.isDestroyed()) return
     win.webContents.send('moving', false)
@@ -1214,6 +1288,41 @@ const AI_COMMANDS = {
   },
 }
 
+const MAX_COPY = 256   // an address or a latency figure, not a document
+
+/**
+ * The rest of the verbs the renderer may put on this channel.
+ *
+ * Split from AI_COMMANDS only because a refusal here is silent: these back a
+ * button that fires and forgets, so there is no disabled row waiting on a
+ * reply, and answering an `ai_error` for a copy click would surface an alarm
+ * in the accounts pane about something that never happened there.
+ *
+ * The membership rule is what matters: this table is the set of verbs the
+ * shipped UI actually sends, not the set the sidecar happens to understand.
+ * The sidecar's dispatcher also answers ai_cred_scan, ai_cred_import,
+ * ai_windsurf_cached, ai_login_cancel, open_log and style_pane; no call site
+ * in app/src/ sends any of them, so they are deliberately absent and a
+ * compromised renderer cannot reach them by naming one. style_pane in
+ * particular is still sent -- by this process, from syncPanes, with a handle
+ * the renderer never sees -- and that path does not come through here.
+ */
+const RENDERER_COMMANDS = {
+  refresh: () => ({}),
+  checks: () => ({}),
+  net_toggle: () => ({}),
+  copy: (c) => {
+    // A figure read off a card. Numbers are accepted and stringified because
+    // the sidecar's clipboard write calls .strip() on whatever arrives: a raw
+    // number would be swallowed there as an exception, which is a copy button
+    // that quietly does nothing.
+    const raw = typeof c.text === 'number' && Number.isFinite(c.text)
+      ? String(c.text) : c.text
+    const text = safeText(raw, MAX_COPY)
+    return text ? { text } : null
+  },
+}
+
 /**
  * Tell the pane that a command of its was refused.
  *
@@ -1287,22 +1396,41 @@ ipcMain.on('cmd', (_e, cmd) => {
     shell.openExternal(String(cmd.url))
     return
   }
-  // The AI commands carry renderer-typed strings onto the sidecar's stdin, so
-  // they are rebuilt from checked fields instead of being forwarded as they
-  // arrived. Everything else on this channel is a fixed verb with no payload
-  // the renderer chose, and keeps the old straight-through path.
+  // Every verb is rebuilt from checked fields instead of being forwarded as it
+  // arrived, and a verb that is in neither table is dropped here rather than
+  // handed to the sidecar to reject. The difference matters: this channel is
+  // the one thing a compromised renderer can still speak on, and the sidecar
+  // understands strictly more verbs than the UI ever sends -- two of which
+  // touch credential material. Forwarding the unknown ones made that gap
+  // reachable; refusing them makes the set closed in the one place the
+  // renderer cannot rewrite.
   const name = typeof cmd?.cmd === 'string' ? cmd.cmd : null
-  if (name && Object.hasOwn(AI_COMMANDS, name)) {
-    let fields = null
-    // A builder reads fields off an object the renderer handed over; a getter
-    // that throws there would come out of the IPC dispatcher and take the main
-    // process down with it, which blanks the widget.
-    try { fields = AI_COMMANDS[name](cmd) } catch { fields = null }
-    if (!fields) { aiRefuse(name); return }
-    toSidecar({ cmd: name, ...fields })
+  // Object.hasOwn, not `in` and not a bare lookup: an inherited member such as
+  // 'constructor' or '__proto__' is not a command, and must not resolve to a
+  // function that then gets called with renderer input.
+  const isAi = name !== null && Object.hasOwn(AI_COMMANDS, name)
+  const build = isAi ? AI_COMMANDS[name]
+    : (name !== null && Object.hasOwn(RENDERER_COMMANDS, name)
+      ? RENDERER_COMMANDS[name] : null)
+  if (!build) {
+    // Named, so the next mismatch between a UI build and this table shows up
+    // as one traced line instead of a button that silently does nothing. The
+    // verb only -- the payload is not logged, because an id typed into the
+    // wrong box is exactly the shape a pasted credential arrives in.
+    trace('cmd', 'dropped unknown verb', String(name))
     return
   }
-  toSidecar(cmd)
+  let fields = null
+  // A builder reads fields off an object the renderer handed over; a getter
+  // that throws there would come out of the IPC dispatcher and take the main
+  // process down with it, which blanks the widget.
+  try { fields = build(cmd) } catch { fields = null }
+  if (!fields) {
+    if (isAi) { aiRefuse(name); return }
+    trace('cmd', 'refused', name)
+    return
+  }
+  toSidecar({ cmd: name, ...fields })
 })
 /**
  * Size the window to the content, and move it if the mode has changed.

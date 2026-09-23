@@ -1317,6 +1317,366 @@ def t24_teardown_is_idempotent():
     return (not os.path.exists(d)), "tear-down is safe to call twice"
 
 
+# ===========================================================================
+# WSL in-distro child tests -- the ONLY cases here that cross the interop
+# boundary, and the only ones that could have caught the HOME leak
+# ===========================================================================
+# Every other test in this file inspects the environment dict that ailogin
+# BUILDS on the Python side. That dict was perfectly correct the whole time
+# four separate defects were live, because none of them lived on the Python
+# side:
+#
+#   1. WSL's interop layer resets HOME from /etc/passwd on the far side of the
+#      boundary no matter what WSLENV carries, so the sandbox HOME never
+#      reached the in-distro process and the CLI read the user's real
+#      ~/.claude.json -- handing back the FIRST account again.
+#   2. The user's shell rc exports ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
+#      `bash -lic` sources that rc, which put the CLI in API mode, so the OAuth
+#      flow silently never ran at all.
+#   3. `claude auth login` was never appended, so a bare invocation opened the
+#      interactive REPL instead of performing a sign-in.
+#   4. `wslpath` was handed a native Windows path containing BACKSLASHES. The
+#      interop layer eats backslashes as escapes, so "C:\Users\..." arrived
+#      inside the distro as "C:Usersshaya..." and wslpath exited 1 -- which
+#      made wsl_root None, which made fix (1) a no-op even after it was
+#      written.
+#
+# A Python-side env-dict assertion cannot observe any of those. The only
+# honest probe is to spawn a REAL child through the SAME wrapper the login
+# path uses and read what that child actually printed.
+
+WSL_PROVIDER = "claude"       # the provider whose command targets wsl.exe
+_WSL_REPORTS = {}             # spawning an in-distro child costs seconds
+
+
+def _wsl_launcher_argv():
+    """The configured login argv, only if it really launches wsl.exe."""
+    if ailogin is None:
+        return None
+    try:
+        argv = ailogin.login_command(WSL_PROVIDER) or []
+    except Exception:
+        return None
+    if not argv:
+        return None
+    if os.path.basename(str(argv[0])).lower() not in ("wsl", "wsl.exe"):
+        return None
+    if "--" not in argv:
+        return None
+    return list(argv)
+
+
+def wsl_unavailable_reason():
+    """Why these tests cannot run here, or None when they can.
+
+    Detection is deliberately layered, because "no WSL" is not one condition
+    and a suite that must stay runnable on a machine without WSL may not fail
+    on any of them:
+
+      * not Windows at all -- there is no interop boundary to cross;
+      * wsl.exe is not on PATH -- WSL is not installed;
+      * the configured login command does not go through wsl.exe -- the
+        wrapper under test is never reached on this machine's configuration;
+      * `wsl.exe -d <distro> -- true` does not exit 0 -- WSL is installed but
+        the distro is missing, stopped, or broken.
+
+    Each returns a Skip reason, never a failure.
+    """
+    if ailogin is None:
+        return "ailogin not importable"
+    if os.name != "nt":
+        return "not Windows: there is no WSL interop boundary to cross"
+    if shutil.which("wsl.exe") is None:
+        return "wsl.exe is not on PATH (WSL not installed)"
+    argv = _wsl_launcher_argv()
+    if argv is None:
+        return ("the configured %s login command does not launch wsl.exe, so "
+                "the in-distro wrapper is never used here" % WSL_PROVIDER)
+    dd = argv.index("--")
+    probe = list(argv[:dd + 1]) + ["true"]
+    try:
+        p = subprocess.run(probe, capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        return "WSL probe raised %s (distro unavailable)" % type(e).__name__
+    if p.returncode != 0:
+        return ("WSL probe exited %s (distro missing or not running)"
+                % p.returncode)
+    return None
+
+
+def need_wsl():
+    why = wsl_unavailable_reason()
+    if why:
+        raise Skip(why)
+
+
+# ---------------------------------------------------------------------------
+# the in-distro probe command
+# ---------------------------------------------------------------------------
+# `printenv`, NEVER `echo "$HOME"`.
+#
+# THIS IS NOT A STYLE PREFERENCE. DO NOT "SIMPLIFY" IT BACK.
+#
+# The fix under test works by prefixing the command bash runs with
+# `env HOME=<sandbox> ...`. bash expands $HOME while PARSING the command
+# string -- before the `env HOME=...` prefix has executed -- so an
+# echo-based probe reports the OLD value and makes a WORKING fix look
+# broken. Measured on this machine through the fixed wrapper:
+#
+#     env HOME=<sandbox> echo "$HOME"   ->  /home/shawn      (the trap)
+#     env HOME=<sandbox> printenv       ->  HOME=<sandbox>   (the truth)
+#
+# printenv is a separate executable that reads the environment it is
+# actually handed at exec time, which is the only thing this test wants to
+# know. An earlier cycle was lost to exactly this trap.
+#
+# The trailing "#" absorbs the provider's login subcommand: the wrapper
+# appends `auth login` to the command tail, and bash treats everything after
+# the # as a comment. So the probe stays `printenv` and nothing resembling a
+# vendor login is ever executed.
+WSL_PROBE_COMMAND = "printenv #"
+
+
+def _parse_env_dump(text):
+    """printenv output -> {name: value}. Values are never printed by callers."""
+    env = {}
+    for line in (text or "").splitlines():
+        if "=" in line:
+            name, _, value = line.partition("=")
+            if name:
+                env[name] = value
+    return env
+
+
+def _spawn_in_distro(box, wrapped):
+    """Run a probe argv with the sandbox's env and report what it printed."""
+    p = subprocess.run(wrapped, capture_output=True, text=True, timeout=180,
+                       env=h_env(box), cwd=tempfile.gettempdir())
+    return p, _parse_env_dump(p.stdout)
+
+
+def wsl_child_report(raw=False):
+    """Spawn ONE in-distro child and cache what it saw.
+
+    raw=False  through ailogin's own wrapper -- the production path.
+    raw=True   the unwrapped `wsl.exe ... bash -lic <cmd>` argv, i.e. exactly
+               what the login ran BEFORE the fix. Used as a sensitivity
+               control: if the raw child does not leak, this machine cannot
+               demonstrate the bug and the wrapped assertions would be
+               vacuous, so that is reported rather than silently passed.
+
+    Returns (sandbox_dir, wsl_root, env_dict, returncode).
+    """
+    key = bool(raw)
+    if key in _WSL_REPORTS:
+        return _WSL_REPORTS[key]
+    need_wsl()
+    argv = _wsl_launcher_argv()
+    dd = argv.index("--")
+    rest = argv[dd + 1:]
+    if len(rest) < 3 or "c" not in str(rest[1]):
+        raise Skip("configured command is not a `bash -<flags>c <cmd>` shape")
+    probe_argv = list(argv[:dd + 1]) + list(rest[:2]) + [WSL_PROBE_COMMAND]
+
+    box = new_sandbox(WSL_PROVIDER)
+    try:
+        wsl_root = getattr(box, "wsl_root", None)
+        if raw:
+            wrapped = probe_argv
+        else:
+            wrap = getattr(ailogin, "_wrap_wsl_login_command", None)
+            if wrap is None:
+                # NOT a Skip. A module with no in-distro wrapper launches the
+                # raw argv, and the raw argv is precisely what leaked the real
+                # HOME and the rc file's ANTHROPIC* variables. Falling back to
+                # it means the assertions below FAIL on such a module instead
+                # of quietly excusing it -- which is the whole point of these
+                # cases, since the Python-side tests passed throughout.
+                finding("ailogin exposes no _wrap_wsl_login_command, so the "
+                        "login command reaches the distro unmodified: HOME "
+                        "cannot be forced past the interop boundary and the "
+                        "shell rc's variables are never removed.")
+                wrapped = probe_argv
+            else:
+                wrapped = wrap(WSL_PROVIDER, probe_argv, wsl_root)
+        p, env = _spawn_in_distro(box, wrapped)
+        out = (os.path.realpath(h_dir(box)), wsl_root, env, p.returncode)
+    finally:
+        teardown_quietly(box)
+    _WSL_REPORTS[key] = out
+    return out
+
+
+def _linux_tail(win_path):
+    """The distro-visible tail of a Windows sandbox path, lower-cased.
+
+    The sandbox root is compared by its final component rather than by whole
+    string: /mnt/c/... vs C:\... are the same directory seen from two sides,
+    and the mount prefix is not what this test is about.
+    """
+    return os.path.basename(str(win_path or "").rstrip("\\/")).lower()
+
+
+def w01_wsl_child_is_reachable():
+    """The rig itself: an in-distro child really runs and really reports."""
+    d, wsl_root, env, rc = wsl_child_report()
+    if rc != 0:
+        return False, "the in-distro probe exited %s" % rc
+    if not env:
+        return False, "the in-distro child printed no environment at all"
+    return True, ("in-distro child ran and reported %d variables (probe was "
+                  "`%s`, no vendor CLI involved)" % (len(env),
+                                                     WSL_PROBE_COMMAND))
+
+
+def w02_wslpath_survives_a_windows_path():
+    """The backslash defect, asserted directly.
+
+    create_sandbox translates the sandbox root with `wslpath`. It was passing
+    the NATIVE path, backslashes and all; the interop layer consumes those as
+    escapes, wslpath receives "C:Usersshaya..." and exits 1, and wsl_root
+    silently becomes None -- which disables the in-distro HOME fix entirely.
+    Two things are asserted: the translation succeeded at all, and a
+    backslash-bearing path really is the thing that breaks it (so this case
+    cannot pass for an unrelated reason).
+    """
+    need_wsl()
+    d, wsl_root, _env, _rc = wsl_child_report()
+    if not wsl_root:
+        return False, ("create_sandbox produced no WSL-side root: `wslpath` "
+                       "failed, so HOME cannot be forced inside the distro "
+                       "and the sandbox is bypassed entirely")
+    if _linux_tail(wsl_root) != _linux_tail(d):
+        return False, ("WSL-side root %r does not name the sandbox directory"
+                       % os.path.basename(str(wsl_root)))
+    if "/mnt/" in wsl_root and wsl_root.count("/mnt/") > 1:
+        return False, "WSL-side root was double-translated (/mnt/c/mnt/c/...)"
+    # Now prove the failure mode is real and is about backslashes.
+    back = subprocess.run(["wsl.exe", "wslpath", "-a", "-u", d],
+                          capture_output=True, text=True, timeout=90)
+    fwd = subprocess.run(["wsl.exe", "wslpath", "-a", "-u",
+                          d.replace("\\", "/")],
+                         capture_output=True, text=True, timeout=90)
+    if fwd.returncode != 0:
+        return False, "wslpath rejected even the forward-slash form"
+    if back.returncode == 0:
+        finding("wslpath accepted a backslash-bearing Windows path on this "
+                "machine, so this case can no longer distinguish the fixed "
+                "form from the broken one; the interop escaping behaviour may "
+                "have changed and the assertion needs re-grounding.")
+        return True, ("wsl_root resolved; backslash form also accepted here, "
+                      "so the negative control did not fire")
+    return True, ("wsl_root resolved from the forward-slash form; the "
+                  "backslash form still exits %s (the original defect)"
+                  % back.returncode)
+
+
+def w03_in_distro_child_home_is_the_sandbox():
+    """THE regression. What HOME does the process inside the distro see?
+
+    Before the fix this was /home/shawn -- the user's real home, holding the
+    session the CLI then reused, which is the entire reported bug.
+    """
+    d, wsl_root, env, rc = wsl_child_report()
+    home = env.get("HOME") or ""
+    if not home:
+        return False, "the in-distro child reported no HOME at all"
+    if not wsl_root:
+        return False, ("HOME=%r: no WSL-side sandbox root was computed, so "
+                       "nothing overrode the distro's own HOME" % home)
+    if home.rstrip("/") != str(wsl_root).rstrip("/"):
+        return False, ("the in-distro child sees HOME=%r, NOT the sandbox "
+                       "root %r: the CLI would read the user's existing "
+                       "session and sign the FIRST account in again"
+                       % (home, wsl_root))
+    if _linux_tail(home) != _linux_tail(d):
+        return False, "HOME does not name this sandbox directory"
+    return True, ("the in-distro child's HOME is the sandbox root (probed "
+                  "with printenv, not echo -- see the comment above)")
+
+
+def w04_in_distro_child_config_dir_is_the_sandbox():
+    """CLAUDE_CONFIG_DIR must cross the boundary and land in the sandbox.
+
+    Some CLIs honour the dedicated config variable and ignore HOME, so this
+    is a second, independent route to the user's real credential file.
+    """
+    d, _wsl_root, env, _rc = wsl_child_report()
+    spec = None
+    try:
+        spec = ailogin.provider_env_spec(WSL_PROVIDER)
+    except Exception:
+        pass
+    var = (spec or {}).get("config_var") or "CLAUDE_CONFIG_DIR"
+    val = env.get(var) or ""
+    if not val:
+        return False, ("%s never reached the in-distro child: a CLI that "
+                       "honours it would read the real config directory"
+                       % var)
+    tail = _linux_tail(d)
+    parts = [p.lower() for p in val.replace("\\", "/").split("/") if p]
+    if tail not in parts:
+        return False, ("%s=%r does not point inside this sandbox" % (var, val))
+    if parts[-1] != str((spec or {}).get("config_rel") or ".claude").lower():
+        finding("%s reached the child but its last component is %r rather "
+                "than the configured config_rel" % (var, parts[-1]))
+    return True, "%s points inside the sandbox on the distro side" % var
+
+
+def w05_in_distro_child_sees_no_anthropic_vars():
+    """The rc-file defect: the login child must see ZERO ANTHROPIC* names.
+
+    The user's shell rc exports a proxy base URL and auth token. `bash -lic`
+    sources that rc, so those variables exist INSIDE the distro no matter what
+    the Windows parent's env dict contains -- and their presence puts the CLI
+    into API mode, where the OAuth sign-in silently never happens and the
+    login appears to "work" while adding nothing.
+
+    Only the COUNT and the NAMES are reported; no value is ever read or
+    printed. The user's rc files are not modified by this test -- the removal
+    happens only in the login child's own command line.
+    """
+    _d, _wsl_root, env, _rc = wsl_child_report()
+    names = sorted(k for k in env if k.upper().startswith("ANTHROPIC"))
+    if names:
+        return False, ("the in-distro login child still sees %d ANTHROPIC* "
+                       "variable(s) (%s): the CLI runs in API mode and the "
+                       "OAuth login never happens" % (len(names),
+                                                      ", ".join(names)))
+    return True, "the in-distro login child sees 0 ANTHROPIC* variables"
+
+
+def w06_unwrapped_child_demonstrates_the_bug():
+    """Sensitivity control: the probe must be able to SEE the old behaviour.
+
+    Runs the same probe through the UNwrapped argv -- byte for byte what the
+    login executed before the fix. That child is expected to report the user's
+    real home and/or the rc file's ANTHROPIC* variables. If it does not, this
+    machine cannot exhibit the defect at all and w03/w05 would be passing
+    vacuously, which is reported as a Skip rather than a green tick.
+    """
+    d, _wsl_root, wrapped_env, _rc = wsl_child_report(raw=False)
+    _d2, _wr2, raw_env, raw_rc = wsl_child_report(raw=True)
+    if raw_rc != 0 or not raw_env:
+        raise Skip("the unwrapped control child did not run")
+    raw_home = raw_env.get("HOME") or ""
+    raw_anth = sorted(k for k in raw_env if k.upper().startswith("ANTHROPIC"))
+    leaks_home = _linux_tail(raw_home) != _linux_tail(_d2)
+    if not leaks_home and not raw_anth:
+        raise Skip("this machine's distro leaks neither HOME nor ANTHROPIC* "
+                   "without the wrapper, so the wrapped assertions cannot be "
+                   "shown to be non-vacuous here")
+    wrapped_anth = [k for k in wrapped_env if k.upper().startswith("ANTHROPIC")]
+    if leaks_home and _linux_tail(wrapped_env.get("HOME") or "") != _linux_tail(d):
+        return False, "the wrapper did not change the HOME the child sees"
+    if raw_anth and wrapped_anth:
+        return False, "the wrapper did not remove the rc file's ANTHROPIC* vars"
+    return True, ("unwrapped child leaks (home_outside_sandbox=%s, "
+                  "ANTHROPIC*=%d); the wrapper removes both, so the "
+                  "assertions above are not vacuous"
+                  % (leaks_home, len(raw_anth)))
+
+
 # ---- safety assertions, re-checked after everything has run ----------------
 def z01_no_network_attempted():
     if NETWORK_ATTEMPTS:
@@ -1411,6 +1771,13 @@ TESTS = [
     ("22 launch refuses a destroyed sandbox", t22_launch_refuses_a_destroyed_sandbox),
     ("23 two sandboxes are independent", t23_two_sandboxes_are_independent),
     ("24 teardown is idempotent", t24_teardown_is_idempotent),
+
+    ("w01 WSL: a real in-distro child runs and reports", w01_wsl_child_is_reachable),
+    ("w02 WSL: wslpath converts the sandbox root (backslash bug)", w02_wslpath_survives_a_windows_path),
+    ("w03 WSL: in-distro child HOME is the sandbox, not ~shawn", w03_in_distro_child_home_is_the_sandbox),
+    ("w04 WSL: in-distro child config dir is in the sandbox", w04_in_distro_child_config_dir_is_the_sandbox),
+    ("w05 WSL: in-distro child sees 0 ANTHROPIC* variables", w05_in_distro_child_sees_no_anthropic_vars),
+    ("w06 WSL: unwrapped child still shows the old leak", w06_unwrapped_child_demonstrates_the_bug),
 
     ("z01 safety: no network request was attempted", z01_no_network_attempted),
     ("z02 safety: no real credential store was opened", z02_no_credential_store_touched),

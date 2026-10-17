@@ -4134,6 +4134,14 @@ def _ai_record_outcome(key, pid, result):
             pass
 
 
+def _ai_login_dead(key):
+    """Whether `key` is held because its login is dead, not rate limited."""
+    try:
+        return aipolicy.snapshot()["keys"].get(key, {}).get("kind") == "login_dead"
+    except Exception:
+        return False
+
+
 def _ai_hold_secs(key, pid):
     """Seconds of hold on key: its own, or its provider's 429/block hold."""
     return max(float(aipolicy.hold_left(key) or 0),
@@ -4263,7 +4271,12 @@ def ai_poll_accounts_due(manual=False, lead=AI_REFRESH_LEAD,
         # while any key of this provider is under a 429 or block hold.
         claimed, left = aipolicy.claim(key, pid, manual=manual)
         if not claimed:
+            # A dead-login hold must still offer the sign-in button; calling
+            # it "rate limited" hides the only fix (a fresh login).
             placeholder = (_acct_row(a, a.get("cred"), "error", None,
+                                     "LOGIN_EXPIRED:%s" % pid, True)
+                           if _ai_login_dead(key) else
+                           _acct_row(a, a.get("cred"), "error", None,
                                      "rate limited")
                            if _ai_hold_secs(key, pid) > 0 else
                            _acct_row(a, a.get("cred"), "wait", None,
@@ -4308,7 +4321,9 @@ def ai_poll_legacy(manual=False, spacing=AI_ACCT_SPACING):
             _ai_note_dead(key, _newest_cli_cred(pid)[1])
         claimed, left = aipolicy.claim(key, pid, manual=manual)
         if not claimed:
-            placeholder = ({"err": "rate limited", "rate_limited": True}
+            placeholder = ({"err": "LOGIN_EXPIRED:%s" % pid}
+                           if _ai_login_dead(key) else
+                           {"err": "rate limited", "rate_limited": True}
                            if _ai_hold_secs(key, pid) > 0
                            else {"err": AI_WAITING})
             out[pid] = _ai_held(key, left, placeholder)

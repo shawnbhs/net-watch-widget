@@ -1029,6 +1029,11 @@ def ai_account_refresh(aid):
 def _ai_refresh_refused(key, left):
     """Answer a per-account press that may not send: how long, and why."""
     secs = max(1, int(left + 0.999))
+    if core._ai_login_dead(key):
+        # Refreshing cannot fix a dead login; say what does.
+        ai_accounts_emit(err="LOGIN_EXPIRED:%s" % key.split(":", 1)[0],
+                         status="wait", seconds=secs, reason="login expired")
+        return
     held = _ai_rl_hold(key.split(":", 1)[0]) > 0
     ai_accounts_emit(err=("rate limited, %ds left" if held
                           else "polled recently, %ds left") % secs,

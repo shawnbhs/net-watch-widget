@@ -2330,6 +2330,25 @@ def w_sc_refresh_respects_provider_hold():
     return n == 0, "claude:legacy held -> per-account claude refresh requests %d (want 0)" % n
 
 
+def w_login_dead_hold_offers_sign_in():
+    """A dead-login hold must show the sign-in fault, never "rate limited"."""
+    require(aipolicy, "record_login_dead")
+    with Rig(vault="ok") as r:
+        fresh()
+        aipolicy.record_login_dead("claude:acct-claude-1", "claude")
+        rows, requested = core.ai_poll_accounts_due(manual=True)
+        row = next((x for x in rows if x.get("id") == "acct-claude-1"), {})
+        r.sc.ai_account_refresh("acct-claude-1")
+        errs = [f.get("err") for k, f in r.ev if k == "ai_accounts"]
+        n = sum(1 for q in r.requests if q.startswith("claude:"))
+    err = str(row.get("error") or "")
+    ok = (row.get("needs_login") is True and err.startswith("LOGIN_EXPIRED")
+          and any(str(e or "").startswith("LOGIN_EXPIRED") for e in errs)
+          and n == 0)
+    return ok, "row needs_login=%r error=%r; press emits %r; claude requests %d (want True, LOGIN_EXPIRED, 0)" % (
+        row.get("needs_login"), err, errs, n)
+
+
 # ---------------------------------------------------------------------------
 # final safety
 # ---------------------------------------------------------------------------
@@ -2542,6 +2561,8 @@ TESTS = [
      w_sc_double_refresh_one_request),
     ("113 sidecar: per-account refresh respects the provider hold",
      w_sc_refresh_respects_provider_hold),
+    ("114 dead-login hold offers sign-in, not 'rate limited'",
+     w_login_dead_hold_offers_sign_in),
 
     ("69 safety: real per-user state file untouched",
      s98_real_state_file_untouched),

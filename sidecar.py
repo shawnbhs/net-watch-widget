@@ -66,6 +66,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import chrome  # noqa: E402  (path must be set before these imports)
+import aipolicy  # noqa: E402
 import core  # noqa: E402
 
 # The country tables are full of flag emoji and box-drawing characters, and the
@@ -137,6 +138,14 @@ _refresh_now = threading.Event()
 
 # ── network ───────────────────────────────────────────────────────────────────
 
+def _geo_invalidate():
+    """Drop core's cached geo verdict; never raises."""
+    try:
+        core.geo_invalidate()
+    except Exception:
+        pass
+
+
 def refresh_once():
     """One public-IP / ping / route cycle, mirroring IPBar._do_refresh."""
     res = {}
@@ -181,6 +190,12 @@ def refresh_once():
         emit("hist", items=[{"at": a, "ip": i} for a, i in _state["hist"]])
 
     if nip not in ("?", "Error"):
+        if nip != _state["ip"] or c1 != _state.get("code"):
+            # The cached geo verdict was computed for the old egress. A new
+            # address must be judged afresh before any provider request goes
+            # out, or a dropped tunnel rides a stale "ok" for up to the cache
+            # lifetime.
+            _geo_invalidate()
         _state["ip"] = nip
         # Run the quick checks when, and only when, their answer could have
         # changed: the first time an address is known, and on every change after
@@ -315,66 +330,116 @@ def ai_cache_save(payload):
         pass
 
 
-def ai_cache_mark(retry=0):
-    """Record that a poll was *attempted*, and how long we were told to wait.
+def ai_cache_mark():
+    """Record that a request was *made*, for the startup schedule fallback.
 
-    Kept apart from the reading itself because a poll that fails is still a
-    poll: it is the request the rate limiter counted, and it is the one fact
-    the next launch needs. Remembering only the last good reading means every
-    restart begins a brand new schedule -- which is how a fifteen-minute poll
-    becomes one per launch, and how an afternoon of restarts turns a one-hour
-    lockout into a permanent one, each launch spending its first request
-    re-earning the backoff the previous launch threw away.
+    The schedule itself lives in aipolicy now: every provider key has its own
+    last-poll time, next-due time and rate-limit hold, persisted on every
+    change, so a restart picks each one back up instead of starting a fresh
+    schedule and re-earning the backoff the previous launch was given. A
+    `retry_until` left by an older build has already been imported into
+    aipolicy by ai_cache_migrate, so it is dropped here.
     """
     try:
         doc = core._read_json(AI_CACHE) or {}
-        now = time.time()
-        doc["tried"] = now
-        if retry:
-            doc["retry_until"] = now + retry
-        else:
-            doc.pop("retry_until", None)
+        doc["tried"] = time.time()
+        doc.pop("retry_until", None)
         core._write_json_atomic(AI_CACHE, doc)
     except Exception:
         pass
 
 
-def ai_cache_hold():
-    """Seconds left of a rate-limit backoff, or 0."""
+def _ai_policy_keys():
+    """Every provider key aipolicy has state for, as (key, provider) pairs."""
     try:
-        doc = core._read_json(AI_CACHE) or {}
+        keys = (aipolicy.snapshot() or {}).get("keys") or {}
+        return [(k, (v or {}).get("provider") or k.split(":", 1)[0])
+                for k, v in keys.items()]
+    except Exception:
+        return []
+
+
+def _ai_rl_hold(provider):
+    """Seconds of 429/block hold on provider, across all its keys; never raises."""
+    try:
+        return float(aipolicy.provider_hold_left(provider) or 0)
     except Exception:
         return 0.0
-    return max(0.0, float(doc.get("retry_until") or 0) - time.time())
 
 
-def ai_cache_due():
-    """(seconds to wait before the first poll, when the last one was).
+def _ai_key_hold(key, provider):
+    """Seconds before key may be asked: its own hold or its provider's."""
+    try:
+        own = float(aipolicy.hold_left(key) or 0)
+    except Exception:
+        own = 0.0
+    return max(own, _ai_rl_hold(provider))
 
-    A restart is not a reason to ask again. The widget is restarted for
-    reasons that have nothing to do with usage -- an update, a reboot, a crash,
-    an afternoon of development -- and the endpoints charge for the privilege.
+
+def ai_cache_hold():
+    """Seconds left of the longest per-provider rate-limit hold, or 0."""
+    providers = {p for _, p in _ai_policy_keys()} | {"claude", "codex"}
+    return max([0.0] + [_ai_rl_hold(p) for p in providers])
+
+
+def ai_cache_migrate():
+    """Carry an older build's `retry_until` hold into aipolicy, once.
+
+    That build kept a single hold for both providers in the AI cache. Without
+    importing it, the first launch after an upgrade would see no aipolicy
+    state and ask both providers at once -- a restart shortening a hold. The
+    hold is seeded for every provider the old build polled; seed_hold never
+    shortens one aipolicy already has. The field is removed afterwards so it
+    is imported exactly once.
     """
     try:
         doc = core._read_json(AI_CACHE) or {}
+        until = float(doc.get("retry_until") or 0)
     except Exception:
-        return 0.0, 0.0
+        return
+    if until > time.time():
+        for pid in ("claude", "codex"):
+            aipolicy.seed_hold(pid, until)
+    if "retry_until" in doc:
+        doc.pop("retry_until", None)
+        try:
+            core._write_json_atomic(AI_CACHE, doc)
+        except Exception:
+            pass
+
+
+def ai_cache_due():
+    """(seconds to wait before the first poll, when the last request was).
+
+    A restart is not a reason to ask again. The wait comes from aipolicy's
+    persisted per-key schedule, holds included, so a restart can never shorten
+    a rate-limit hold or pull a scheduled poll forward. Before aipolicy has
+    any state (the first launch of this build) the older `tried` stamp keeps
+    an upgrade from turning into an immediate request.
+    """
+    ai_cache_migrate()
+    try:
+        doc = core._read_json(AI_CACHE) or {}
+    except Exception:
+        doc = {}
     now = time.time()
     last = float(doc.get("tried") or doc.get("at") or 0)
-    wait = max(0.0, core.AI_POLL_BASE - (now - last)) if last else 0.0
-    hold = float(doc.get("retry_until") or 0)
-    return (max(wait, hold - now) if hold > now else wait), last
+    if _ai_policy_keys():
+        return max(0.0, float(aipolicy.next_wake() or 0)), last
+    fresh = max(0.0, core.AI_POLL_BASE - (now - last)) if last else 0.0
+    return max(fresh, ai_cache_hold()), last
 
 
 def ai_cache_emit():
     """Show the last good reading immediately, marked stale.
 
-    The usage endpoints are rate limited, back off for an hour at a time, and
-    are only polled every fifteen minutes at best. Without this the panel is
-    five empty rows for the whole of that -- and empty reads as "no data
-    exists", when what is true is "this is what it was, and we cannot ask again
-    yet". A percentage from twenty minutes ago is worth a great deal more than
-    a dash, provided it is labelled as old.
+    The usage endpoints are rate limited and each provider is polled on its own
+    schedule -- a minute for some, several for others, far longer under a
+    hold. Without this the panel is five empty rows until the first poll
+    lands, and empty reads as "no data exists", when what is true is "this is
+    what it was, and we cannot ask again yet". A percentage from twenty
+    minutes ago is worth a great deal more than a dash, provided it is
+    labelled as old.
     """
     try:
         doc = core._read_json(AI_CACHE) or {}
@@ -387,22 +452,30 @@ def ai_cache_emit():
         pass
 
 
+AI_CRASH_WAIT = 300   # an ai_tick that raised waits this long, then retries
+AI_WAKE_MAX = 60      # the loop re-checks the schedule at least this often
+
+
 def ai_loop():
-    fails = 0
     # Pick the schedule back up rather than starting a new one. Without this
-    # the first act of every launch is a request, and the backoff a previous
-    # launch was told to observe is lost with it.
-    first, last = ai_cache_due()
+    # the first act of every launch is a request, and the holds a previous
+    # launch was told to observe are lost with it.
+    first, _ = ai_cache_due()
     manual = bool(first > 0 and _ai_now.wait(first))
     if manual:
         _ai_now.clear()
+    last_manual = 0.0
     while not _STOP.is_set():
-        wait = 3600
         try:
-            wait, fails, last = ai_tick(fails, last, manual)
+            wait, last_manual = ai_tick(last_manual, manual)
         except Exception as exc:
             emit("error", where="ai", err=str(exc))
-            wait = core.AI_FAIL_BACKOFF
+            # The tick may have died after its 'polling' emit; only an 'ai'
+            # message stops the refresh spinner.
+            emit("ai", status="wait", seconds=AI_CRASH_WAIT, reason="error")
+            wait = AI_CRASH_WAIT
+        if wait is None:
+            wait = _ai_wake()
         manual = _ai_now.wait(max(5, wait))
         if manual:
             _ai_now.clear()
@@ -411,99 +484,266 @@ def ai_loop():
 _ai_now = threading.Event()
 
 
-def ai_tick(fails, last, manual):
-    """One usage poll. Returns (seconds to wait, fails, last-poll time).
+AI_VAULT_RETRY = 60   # an unreadable vault is looked at again after this
 
-    The backoff and the region latch are the reason this is not a plain timer:
-    a provider that blocks a region will keep blocking it, and retrying is how
-    a status widget turns into something that looks like abuse.
+
+def _ai_active_keys():
+    """(key, provider) pairs core polls now, or None before the first tick.
+
+    Only these keys decide whether to wake and whether to say "polling".
+    A key aipolicy still remembers for an account that was removed, or for
+    the legacy files after the vault took over, is never asked again, and
+    letting it count would keep the loop at the five-second floor forever.
+    """
+    try:
+        keys = core.ai_active_keys()
+    except Exception:
+        return None
+    if keys is None:
+        return None
+    return [(k, k.split(":", 1)[0]) for k in keys if isinstance(k, str)]
+
+
+def _ai_wake():
+    """Seconds until the soonest active key is due, capped at AI_WAKE_MAX."""
+    keys = _ai_active_keys()
+    if not keys:
+        return AI_WAKE_MAX
+    try:
+        return min(float(aipolicy.next_wake(keys=[k for k, _ in keys])),
+                   AI_WAKE_MAX)
+    except Exception:
+        return AI_WAKE_MAX
+
+
+def _ai_any_due(manual=False):
+    """Whether any active key would be sent a request now.
+
+    With no active keys known yet (before the first tick) a tick runs to
+    find out; core still asks aipolicy per key before any request.
+    """
+    keys = _ai_active_keys()
+    if not keys:
+        return True
+    return any(aipolicy.due(k, p, manual=manual)[0] for k, p in keys)
+
+
+def _ai_next_due(manual=False):
+    """Seconds until the soonest active key may be asked again."""
+    keys = _ai_active_keys() or []
+    lefts = [aipolicy.due(k, p, manual=manual)[1] for k, p in keys]
+    return min([float(x or 0) for x in lefts] or [float(AI_WAKE_MAX)])
+
+
+def _ai_vault_state():
+    """"absent", "empty", "accounts" or "unreadable" for the account vault.
+
+    The legacy credential files are a fallback for a machine with no vault,
+    not for a vault that failed to read: the same account can sit in both,
+    under a different policy key, and reading it through the files while
+    its vault key is rate limited would renew the hold.
+    """
+    try:
+        if not core.ai_vault_ready():
+            return "absent"
+        return "accounts" if core._vault.list_accounts() else "empty"
+    except Exception:
+        return "unreadable"
+
+
+def _ai_cached():
+    """The last good payload on disk, or {}."""
+    try:
+        return (core._read_json(AI_CACHE) or {}).get("ai") or {}
+    except Exception:
+        return {}
+
+
+def _ai_hold_of(row):
+    """Seconds of rate-limit hold behind one account row (0 when none)."""
+    pid = row.get("provider") or ""
+    return _ai_key_hold(aipolicy.key(pid, row.get("id")), pid)
+
+
+def _ai_settle_rows(rows):
+    """Make the rows say what the UI expects of them.
+
+    core marks every account it did not ask this tick with `held`, but the
+    roster draws a `held` row as stale -- right for a rate limit, wrong for an
+    account that is simply between polls. So `held` survives only where a
+    hold is real. An account with no reading yet this run (the first interval
+    after a restart) shows its cached row instead of a blank placeholder.
+    """
+    cached = {r.get("id"): r for r in (_ai_cached().get("accounts") or [])
+              if isinstance(r, dict)}
+    out = []
+    for row in rows:
+        row = dict(row)
+        if row.get("error") == getattr(core, "AI_WAITING", None) \
+                and row.get("id") in cached:
+            row = dict(cached[row.get("id")], label=row.get("label"))
+        hold = _ai_hold_of(row)
+        if hold > 0:
+            row["held"] = max(1, int(hold + 0.999))
+        else:
+            row.pop("held", None)
+        out.append(row)
+    return out
+
+
+def _ai_holds(rows, claude, codex):
+    """Seconds of hold per provider key behind this tick's readings.
+
+    Only keys aipolicy tracks count: an account that was never set up, or a
+    provider that is not live, has no schedule and must not keep "every
+    provider is held" from ever being true.
+    """
+    known = {k for k, _ in _ai_policy_keys()}
+    if rows:
+        keys = [(aipolicy.key(r.get("provider") or "", r.get("id")),
+                 r.get("provider") or "") for r in rows]
+    else:
+        keys = [(aipolicy.key(p, None), p) for p, raw in (("claude", claude),
+                                                            ("codex", codex))
+                if raw.get("err") not in core.NOT_CONFIGURED]
+    return [_ai_rl_hold(p) for k, p in keys if k in known]
+
+
+def ai_tick(last_manual, manual):
+    """One pass of the usage scheduler. Returns (seconds to wait, last press).
+
+    A wait of None means "until aipolicy says the next provider is due". Each
+    provider key keeps its own cadence and its own rate-limit hold, so a 429
+    from one vendor no longer stops the others from being read, and a manual
+    press never overrides a hold.
+
+    The region latch and the geo gate are the reason this is not a plain
+    timer: a provider that blocks a region will keep blocking it, and retrying
+    is how a status widget turns into something that looks like abuse.
     """
     if not core.AI_ENABLED:
-        return 3600, fails, last
+        return 3600, last_manual
 
     now = time.time()
-    if manual and now - last < core.AI_POLL_MIN:
-        emit("ai", status="wait", seconds=int(core.AI_POLL_MIN - (now - last)))
-        return core.AI_POLL_BASE, fails, last
-
-    # A backoff is not advice that can be overruled by pressing the button
-    # harder. A request made during one comes back 429 and renews the hour, so
-    # forcing a refresh through a rate limit makes it strictly worse than doing
-    # nothing. Say how much is left instead.
-    hold = ai_cache_hold()
-    if hold > 0:
-        emit("ai", status="wait", seconds=int(hold), reason="rate limited")
-        return hold, fails, last
+    if manual and now - last_manual < aipolicy.MANUAL_MIN:
+        left = aipolicy.MANUAL_MIN - (now - last_manual)
+        emit("ai", status="wait", seconds=max(1, int(left + 0.999)))
+        return None, last_manual
+    if manual:
+        last_manual = now
+    if not _ai_any_due(manual):
+        # Nothing would leave the machine, so there is no geo check and no
+        # 'polling'. A press still gets an answer: how long until it can.
+        if manual:
+            _ai_emit_wait(manual)
+        return None, last_manual
 
     if core.AI_LATCH["blocked"]:
         emit("ai", off=True, reason=core.AI_LATCH["reason"])
-        return 3600, fails, last
+        return 3600, last_manual
 
     ok, cc, why = core.geo_verdict(_state.get("ip"), _state.get("code"),
                                    force=manual)
     if not ok:
         emit("ai", off=True,
              reason="VPN required" if cc == "IR" else "VPN required (%s)" % why)
-        return (90 if cc == "IR" else 120), fails, last
+        return (90 if cc == "IR" else 120), last_manual
 
-    last = now
-    emit("ai", status="polling")
     # The vault is the source of truth when it exists, because it is the only
     # one that can hold two accounts for the same provider. With no vault, or
-    # an empty one, this falls straight back to the two credential files the
-    # widget has always read, so nothing about a fresh install changes.
-    rows = []
-    try:
-        rows = core.ai_poll_accounts()
-    except Exception as exc:
-        emit("error", where="ai_accounts", err=str(exc))
-        rows = []
-    if rows:
+    # an empty one, this falls back to the two credential files the widget
+    # has always read. A vault that exists but cannot be read is an error,
+    # never a reason to use the files (see _ai_vault_state). Both paths ask
+    # aipolicy per key and send only what is due; a key that is not due comes
+    # back as its last result.
+    vault = _ai_vault_state()
+    if vault == "unreadable":
+        return _ai_vault_failed("vault unreadable"), last_manual
+    emit("ai", status="polling")
+    if vault == "accounts":
+        try:
+            rows, requested = core.ai_poll_accounts_due(manual)
+        except Exception as exc:
+            rows, requested = None, False
+            emit("error", where="ai_accounts", err=type(exc).__name__)
+        if not rows:
+            return _ai_vault_failed("vault poll failed"), last_manual
         claude, codex = core.ai_legacy_pair(rows)
+        rows = _ai_settle_rows(rows)
     else:
-        claude = core.fetch_claude_usage()
-        time.sleep(random.uniform(1.5, 5.0))  # don't fire both at one instant
-        codex = core.fetch_gpt_usage()
+        rows = []
+        claude, codex, requested = core.ai_poll_legacy(manual)
 
-    # If the tunnel dropped between the two calls the readings are from the
-    # wrong exit, so they are discarded rather than displayed.
+    holds = _ai_holds(rows, claude, codex)
+    all_held = bool(holds) and all(h > 0 for h in holds)
+    if not requested:
+        # Nothing left the machine (a refresh thread claimed the key first),
+        # so there is no new reading and no reason for the forced geo check.
+        # The 'polling' sent above set the refresh button spinning, and only
+        # the next message stops it.
+        _ai_emit_wait(manual, rows)
+        return None, last_manual
+
+    # If the tunnel dropped mid-poll the readings are from the wrong exit, so
+    # they are discarded rather than displayed. The requests were still made
+    # and counted, and aipolicy has already recorded each one per key.
+    ai_cache_mark()
     ok2, _, _ = core.geo_verdict(force=True)
     if not ok2:
-        # The readings are discarded, but the requests were still made and
-        # still counted against us, so the attempt is recorded either way.
-        ai_cache_mark()
         emit("ai", off=True, reason="VPN required")
-        return 90, fails, last
+        return 90, last_manual
 
+    cached = _ai_cached()
     payload = dict(
-        claude=_ai_payload(claude, ("session_pct", "week_pct", "model_pct"),
-                           ("session_reset", "week_reset", "model_reset"),
-                           model_name=claude.get("model_name") or ""),
-        codex=_ai_payload(codex, ("sess_pct", "week_pct"),
-                          ("sess_reset_ts", "week_reset_ts"),
-                          limit_reached=bool(codex.get("limit_reached"))),
+        claude=_ai_side(claude, cached.get("claude"),
+                        ("session_pct", "week_pct", "model_pct"),
+                        ("session_reset", "week_reset", "model_reset"),
+                        model_name=claude.get("model_name") or ""),
+        codex=_ai_side(codex, cached.get("codex"),
+                       ("sess_pct", "week_pct"),
+                       ("sess_reset_ts", "week_reset_ts"),
+                       limit_reached=bool(codex.get("limit_reached"))),
         accounts=rows,
         polled_at=clock12(),
-        retry=max(claude.get("retry", 0), codex.get("retry", 0)))
+        retry=int(max([0.0] + holds)))
     emit("ai", stale=False, age=0, **payload)
     # Only a reading with something in it is worth remembering: caching a pair
     # of errors would replace a good answer from an hour ago with nothing.
-    if not claude.get("err") or not codex.get("err"):
+    if not payload["claude"]["err"] or not payload["codex"]["err"]:
         ai_cache_save(payload)
+    if all_held:
+        emit("ai", status="wait", seconds=max(1, int(min(holds))),
+             reason="rate limited")
+    return None, last_manual
 
-    if (claude.get("err") in core.NOT_CONFIGURED
-            and codex.get("err") in core.NOT_CONFIGURED):  # noqa: E129
-        return 900, 0, last
 
-    retry = max(claude.get("retry", 0), codex.get("retry", 0))
-    ai_cache_mark(retry)
-    if retry:
-        return retry, fails + 1, last
-    if claude.get("err") or codex.get("err"):
-        return min(core.AI_FAIL_BACKOFF * (fails + 1), 4 * 3600), fails + 1, last
+def _ai_emit_wait(manual, rows=None):
+    """Tell the UI how long until the next request, and why if held."""
+    keys = _ai_active_keys() or []
+    holds = [_ai_rl_hold(p) for _, p in keys]
+    wait = dict(status="wait", seconds=max(1, int(_ai_next_due(manual))))
+    if holds and all(h > 0 for h in holds):
+        wait.update(seconds=max(1, int(min(holds))), reason="rate limited")
+    emit("ai", **(dict(wait, accounts=rows) if rows else wait))
 
-    jitter = random.uniform(-core.AI_POLL_JITTER, core.AI_POLL_JITTER)
-    return core.AI_POLL_BASE * (1 + jitter), 0, last
+
+def _ai_vault_failed(why):
+    """Report a vault that exists but could not be used; send nothing."""
+    emit("error", where="ai_accounts", err=why)
+    emit("ai", status="wait", seconds=AI_VAULT_RETRY, reason="error")
+    return AI_VAULT_RETRY
+
+
+def _ai_side(raw, cached, pct_keys, reset_keys, **extra):
+    """One provider's card: this tick's reading, or the cached one if waiting.
+
+    A provider that is merely between polls has no reading of its own in the
+    first interval after a restart; showing its last cached card instead of a
+    "waiting" error is what keeps that card from blanking.
+    """
+    if raw.get("err") == getattr(core, "AI_WAITING", None) and cached:
+        return cached
+    return _ai_payload(raw, pct_keys, reset_keys, **extra)
 
 
 def _ai_payload(raw, pct_keys, reset_keys, **extra):
@@ -744,19 +984,56 @@ def ai_account_refresh(aid):
     if core.AI_LATCH["blocked"]:
         ai_accounts_emit(err=core.AI_LATCH["reason"] or "blocked")
         return
+    # The same per-account schedule the loop keeps: a press inside the manual
+    # floor, or during a rate-limit hold, sends nothing. Clicking through a
+    # hold is how a 429 is renewed, so the answer is how long is left.
+    pid = acct.get("provider") or ""
+    if not core._provider_is_live(pid):
+        # Nothing to ask, so nothing to schedule: a planned provider must not
+        # collect aipolicy strikes and holds from presses.
+        ai_accounts_emit(err="not supported yet")
+        return
+    key = aipolicy.key(pid, aid)
+    # The read-only check answers a press inside the floor or a hold without
+    # spending a geo lookup; the claim after the geo gate is what actually
+    # reserves the key, so the loop or a second press cannot also send.
+    due, left = aipolicy.due(key, pid, manual=True)
+    if not due:
+        _ai_refresh_refused(key, left)
+        return
     ok, cc, why = core.geo_verdict(_state.get("ip"), _state.get("code"),
                                    force=True)
     if not ok:
         ai_accounts_emit(err="VPN required" if cc == "IR"
                          else "VPN required (%s)" % why)
         return
+    claimed, left = aipolicy.claim(key, pid, manual=True)
+    if not claimed:
+        _ai_refresh_refused(key, left)
+        return
     try:
         row = core.ai_account_poll(acct)
     except Exception as exc:
-        ai_accounts_emit(err=str(exc) or "poll failed")
+        row = {"id": aid, "provider": pid, "status": "error",
+               "error": str(exc) or "poll failed"}
+        core._ai_record_outcome(key, pid, row)
+        ai_accounts_emit(err=row["error"])
         return
+    # Recorded like a loop poll, so a 429 here holds the loop too.
+    core._ai_record_outcome(key, pid, row)
+    core._AI_LAST_ROWS[key] = row
     emit("ai_accounts", accounts=[row], err=row.get("error") or "",
          note="single")
+
+
+def _ai_refresh_refused(key, left):
+    """Answer a per-account press that may not send: how long, and why."""
+    secs = max(1, int(left + 0.999))
+    held = _ai_rl_hold(key.split(":", 1)[0]) > 0
+    ai_accounts_emit(err=("rate limited, %ds left" if held
+                          else "polled recently, %ds left") % secs,
+                     status="wait", seconds=secs,
+                     reason="rate limited" if held else "")
 
 
 def ai_migrate():

@@ -48,3 +48,6 @@ desktop.ini
 Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
+
+# Local AI poll state
+.ipbar_*.json

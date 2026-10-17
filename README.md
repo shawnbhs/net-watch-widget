@@ -173,8 +173,11 @@ the edge cleanly.
 whenever your public IP changes. **Run** re-runs them on demand and **Clear**
 blanks them. The five pills below open that IP in an external lookup.
 
-**AI usage** polls every 15 minutes. The ↻ beside the heading forces a poll,
-subject to a five-minute floor.
+**AI usage** polls each provider on its own schedule: Codex every 60 seconds,
+Claude every 3 minutes, every other provider every 5 minutes. The ↻ beside the
+heading forces a poll, at most once every 30 seconds, and never while a
+provider has told the widget to back off. See
+[AI usage polling](#ai-usage-polling) for the settings.
 
 ### The network button
 
@@ -388,8 +391,8 @@ claude    # then follow the login prompt
 codex     # then follow the login prompt
 ```
 
-The widget picks the credentials up on its next cycle (within 15 minutes), or
-immediately if you hit **Refresh**.
+The widget picks the credentials up on its next poll (within 60 seconds for
+Codex, 3 minutes for Claude), or immediately if you hit **Refresh**.
 
 ### If you run the CLIs inside WSL
 
@@ -769,11 +772,44 @@ Two halves, and the split is along the seam that was always there.
 Data is gathered on background threads, so a slow lookup never freezes the UI;
 each panel updates as its own answer arrives.
 
-The AI usage panel refreshes every 15 minutes with jitter, backs off
-exponentially on failure, and stops entirely — no retries — when a provider
-signals a region block. The quick checks run on an IP change and on demand,
+The AI usage panel polls each provider on its own schedule with ±10% jitter,
+backs off exponentially on failure, and stops entirely — no retries — when a
+provider signals a region block. The quick checks run on an IP change and on demand,
 never on the network cycle: two of their three lookups are free-tier enrichment
 endpoints, and the cycle runs every three seconds.
+
+### AI usage polling
+
+| Provider | Default | Floor | Setting |
+|---|---|---|---|
+| Codex | 60 s | 60 s | `AI_POLL_SECONDS` |
+| Claude | 180 s | 120 s | `AI_POLL_SECONDS_CLAUDE` |
+| Everything else | 300 s | 120 s | `AI_POLL_SECONDS_OTHER` |
+
+Set these in `.env`. Values are clamped to the floor and to one hour. The ↻
+button's floor is the larger of 30 s and the provider floor, so in practice
+60 s for Codex and 120 s for Claude and everything else.
+
+When a provider answers 429, the widget holds that account for the
+`Retry-After` time or an exponential backoff, whichever is longer. A 403
+challenge page holds it for an hour. Holds are saved to `AI_RL_FILE`
+(`~/.ipbar_ai_ratelimit.json` by default), so they survive a restart. A new
+hold never shortens an existing one, and ↻ does not override a hold.
+
+- A 429 on any key holds every key of that provider for the same account,
+  both the legacy CLI credentials file and the vault.
+- Offline and transport failures are not rate limits. They add no backoff;
+  the poll is just rescheduled.
+- A dead login is retried once an hour and cleared on the next success.
+- The geo check runs against the current IP before every batch of requests.
+- A corrupt state file is kept as a `.corrupt` copy and never causes a burst
+  of requests.
+
+**Why not faster for Claude.** Claude's usage endpoint rate-limits per
+account and answers 429 with `Retry-After: 0`, then keeps refusing
+([anthropics/claude-code#30930](https://github.com/anthropics/claude-code/issues/30930),
+still open). Measured: about 7 reads per 10 minutes (one a minute) gets 29% of
+polls refused; 3–4 reads gets 1–2%. 180 s is about 3.3 reads per 10 minutes.
 
 [`app/README.md`](app/README.md) covers the parts of the UI that are not
 obvious — why the frost is a separate window per card, why the cards are 8px

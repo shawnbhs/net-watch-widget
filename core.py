@@ -26,6 +26,9 @@ import psutil
 # layouts and the link logic against injected states, so neither fix required
 # unplugging a real monitor or dropping a real connection to prove it works.
 import netfast
+# Per-provider poll schedule and rate-limit holds, persisted across restarts.
+# Pure logic with no network, for the same testability reason as netfast.
+import aipolicy
 # Same reasoning again: easing curves and colour blends are pure functions, so
 # the motion they drive is verifiable without opening a window. The same goes
 # for glass, whose icon geometry and rasteriser are arithmetic on numbers and
@@ -2629,11 +2632,39 @@ def ourl(url):
 #   ChatGPT: GET https://chatgpt.com/backend-api/wham/usage
 # HARD RULE: if the public IP is (or might be) Iranian, NOTHING is sent.
 
+# Env keys aipolicy reads for the per-provider intervals.
+_AI_INTERVAL_KEYS = ("AI_POLL_SECONDS", "AI_POLL_SECONDS_CLAUDE",
+                     "AI_POLL_SECONDS_OTHER")
+
+# aipolicy reschedules from the process environment (its record_* calls take
+# no env argument), and _load_env does not export .env. Values given in
+# .env are handed over here, with env_str's precedence: .env beats the
+# process environment.
+for _k in _AI_INTERVAL_KEYS + ("AI_RL_FILE",):
+    if ENV.get(_k, "").strip():
+        os.environ[_k] = ENV[_k].strip()
+del _k
+
+
+def ai_interval(provider):
+    """Scheduled poll interval in seconds for one provider.
+
+    _load_env keeps .env values in ENV rather than os.environ, so they are
+    passed to aipolicy explicitly, with the same precedence as env_str: .env
+    first, then the process environment. aipolicy owns the defaults and the
+    clamping, so a typo here can never hammer an endpoint.
+    """
+    env = {k: env_str(k, "") for k in _AI_INTERVAL_KEYS if env_str(k, "")}
+    return aipolicy.interval(provider, env=env)
+
+
 AI_ENABLED      = True
-AI_POLL_BASE    = 900      # seconds between polls (15 min)
-AI_POLL_JITTER  = 0.30     # +/- 30% random jitter
-AI_POLL_MIN     = 300      # never poll faster than this, ever
-AI_FAIL_BACKOFF = 1800     # after an error, wait at least this long
+# The schedule itself is per provider and per account (aipolicy); these
+# names stay for callers that still read them.
+AI_POLL_BASE    = ai_interval("codex")    # fastest scheduled interval
+AI_POLL_JITTER  = aipolicy.JITTER
+AI_POLL_MIN     = aipolicy.MANUAL_MIN     # manual-refresh floor
+AI_FAIL_BACKOFF = aipolicy.ERROR_CAP      # generic error backoff cap
 AI_GEO_TTL      = 120      # geo verdict cache (seconds)
 AI_HTTP_TIMEOUT = 20
 
@@ -2688,8 +2719,12 @@ AI_LOGIN_CMD = {
 }
 
 # ── geo gate ──────────────────────────────────────────────────────────────────
-_geo = {"ts": 0.0, "ok": False, "cc": "?", "why": "not checked"}
+# `ip` and `known_cc` are what the cached verdict was computed for: a verdict
+# is only reused for the same egress, never for whatever the IP is now.
+_geo = {"ts": 0.0, "ok": False, "cc": "?", "why": "not checked",
+        "ip": None, "known_cc": None}
 _geo_lock = threading.Lock()
+_GEO_NO_IP = ("?", "Error", "", "\u2026")
 AI_LATCH = {"blocked": False, "reason": ""}   # hard tripwire, never auto-clears
 
 
@@ -2707,25 +2742,70 @@ def _trace_cc(url, timeout=6):
     return None
 
 
+def geo_invalidate():
+    """Forget the cached verdict, so the next geo_verdict checks afresh.
+
+    Called when the public IP changes: a verdict belongs to the egress it was
+    computed for, and a dropped tunnel must never ride on the old one.
+    """
+    with _geo_lock:
+        _geo.update(ts=0.0, ip=None, known_cc=None)
+
+
+def _geo_local_block(known_ip, known_cc):
+    """(cc, why) when the already-resolved IP or country is Iranian, else None.
+
+    Free (no request), so it runs before every verdict, cached or not.
+    """
+    if known_ip and known_ip not in _GEO_NO_IP and is_iran(known_ip):
+        return "IR", "ip in Iranian range"
+    if known_cc and str(known_cc).upper() == "IR":
+        return "IR", "geoip says IR"
+    return None
+
+
+def _geo_cache_hit(known_ip, known_cc, now):
+    """The cached verdict if it was computed for this same egress, else None.
+
+    An unknown current IP never matches: with nothing to compare, the old
+    verdict is not evidence about the egress a request would leave from.
+    """
+    if not known_ip or known_ip in _GEO_NO_IP:
+        return None
+    with _geo_lock:
+        if now - _geo["ts"] >= AI_GEO_TTL or _geo["ip"] != known_ip:
+            return None
+        if (_geo["known_cc"] or "").upper() != (known_cc or "").upper():
+            return None
+        return _geo["ok"], _geo["cc"], _geo["why"]
+
+
 def geo_verdict(known_ip=None, known_cc=None, force=False):
     """FAIL CLOSED. Returns (ok, cc, why). ok=True only when we are confident
-    the egress is NOT Iran."""
+    the egress is NOT Iran.
+
+    The free local checks on the current IP and country run first, every
+    time; a cached verdict is reused only for the IP it was computed for.
+    """
     now = time.time()
-    with _geo_lock:
-        if not force and now - _geo["ts"] < AI_GEO_TTL:
-            return _geo["ok"], _geo["cc"], _geo["why"]
+    try:
+        local = _geo_local_block(known_ip, known_cc)
+    except Exception as e:
+        local = ("?", "geo error: %s" % type(e).__name__)
+    if local:
+        cc, why = local
+        with _geo_lock:
+            _geo.update(ts=now, ok=False, cc=cc, why=why, ip=known_ip,
+                        known_cc=known_cc)
+        return False, cc, why
+    if not force:
+        hit = _geo_cache_hit(known_ip, known_cc, now)
+        if hit:
+            return hit
 
     ok, cc, why = False, "?", "unknown"
     try:
-        # 1. IP the widget already resolved (free, no extra request)
-        if known_ip and known_ip not in ("?", "Error", "", "\u2026"):
-            if is_iran(known_ip):
-                ok, cc, why = False, "IR", "ip in Iranian range"
-                raise StopIteration
-        if known_cc and known_cc.upper() == "IR":
-            ok, cc, why = False, "IR", "geoip says IR"
-            raise StopIteration
-
+        # 1. (done above) the IP the widget already resolved is not Iranian.
         # 2. independent Cloudflare edge check (must agree)
         loc = _trace_cc("https://www.cloudflare.com/cdn-cgi/trace")
         if loc is None:
@@ -2741,13 +2821,12 @@ def geo_verdict(known_ip=None, known_cc=None, force=False):
             ok, cc, why = False, loc, "geo mismatch %s/%s" % (known_cc.upper(), loc)
         else:
             ok, cc, why = True, loc, "ok"
-    except StopIteration:
-        pass
     except Exception as e:
         ok, cc, why = False, "?", "geo error: %s" % type(e).__name__
 
     with _geo_lock:
-        _geo.update(ts=now, ok=ok, cc=cc, why=why)
+        _geo.update(ts=now, ok=ok, cc=cc, why=why, ip=known_ip,
+                    known_cc=known_cc)
     return ok, cc, why
 
 
@@ -2840,28 +2919,74 @@ def _pick_cred(paths, keyfn, expiry_ms=False):
     return None, None, ("credentials stale or unreadable" if stale else None)
 
 
-def _http_json(url, headers, data=None, timeout=AI_HTTP_TIMEOUT):
-    """Returns (status, parsed_json_or_None, raw_body). Never raises."""
+def _header_dict(msg):
+    """Response headers as a plain dict with lower-case names. Never raises."""
+    try:
+        return {str(k).lower(): str(v) for k, v in (msg or {}).items()}
+    except Exception:
+        return {}
+
+
+def _http_json_headers(url, headers, data=None, timeout=AI_HTTP_TIMEOUT):
+    """Returns (status, parsed_json_or_None, raw_body, response_headers).
+
+    The headers are what carries Retry-After on a 429. Never raises; a
+    transport failure is status 0 with empty headers.
+    """
     try:
         req = urllib.request.Request(
             url, data=data, method="POST" if data else "GET", headers=headers)
         with _urlopen(req, timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
+            hdrs = _header_dict(resp.headers)
             try:
-                return resp.status, json.loads(raw), raw
+                return resp.status, json.loads(raw), raw, hdrs
             except Exception:
-                return resp.status, None, raw
+                return resp.status, None, raw, hdrs
     except urllib.error.HTTPError as e:
         try:
             raw = e.read().decode("utf-8", "replace")
         except Exception:
             raw = ""
+        hdrs = _header_dict(e.headers)
         try:
-            return e.code, json.loads(raw), raw
+            return e.code, json.loads(raw), raw, hdrs
         except Exception:
-            return e.code, None, raw
+            return e.code, None, raw, hdrs
     except Exception as e:
-        return 0, None, "%s: %s" % (type(e).__name__, e)
+        return 0, None, "%s: %s" % (type(e).__name__, e), {}
+
+
+def _http_json(url, headers, data=None, timeout=AI_HTTP_TIMEOUT):
+    """Returns (status, parsed_json_or_None, raw_body). Never raises."""
+    return _http_json_headers(url, headers, data=data, timeout=timeout)[:3]
+
+
+def _is_html_challenge(raw):
+    """Whether a response body is an HTML page (a Cloudflare challenge, say)
+    rather than the JSON the usage endpoints answer with."""
+    head = (raw or "")[:2048].lower()
+    return (head.lstrip().startswith("<") or "<html" in head
+            or "cloudflare" in head or "cf-chl" in head
+            or "just a moment" in head)
+
+
+def _usage_failure(st, raw, hdrs):
+    """Result dict for a non-200 usage reply from a legacy fetcher, or None.
+
+    The err strings are the ones the cards and tests already know; the flags
+    are what aipolicy schedules on. `retry` stays for older readers of the
+    legacy pair, which treated it as a hard hold.
+    """
+    if st == 429:
+        return {"err": "rate limited", "retry": 3600, "rate_limited": True,
+                "retry_after": aipolicy.parse_retry_after(
+                    (hdrs or {}).get("retry-after"))}
+    if st == 0:
+        return {"err": "http 0", "offline": True}
+    if st == 403 and _is_html_challenge(raw):
+        return {"err": "http 403", "blocked_html": True}
+    return None
 
 
 # ── Claude ────────────────────────────────────────────────────────────────────
@@ -2905,19 +3030,35 @@ def _claude_token(lead=AI_REFRESH_LEAD):
     return None, "refresh failed (%s)" % st
 
 
+# What a token endpoint's 429 reads as, from core's refreshers and aiproviders'.
+_TOKEN_429 = "refresh failed (429)"
+
+
+def _token_failure(err):
+    """Result dict for a credential that could not be produced."""
+    out = {"err": err}
+    if (err or "").startswith("offline"):
+        out["offline"] = True
+    if err == _TOKEN_429:
+        # The token endpoint rate limited us: same hold as a usage 429.
+        out["rate_limited"] = True
+    return out
+
+
 def fetch_claude_usage():
     tok, err = _claude_token()
     if not tok:
-        return {"err": err}
-    st, p, raw = _http_json(CLAUDE_USAGE, {
+        return _token_failure(err)
+    st, p, raw, hdrs = _http_json_headers(CLAUDE_USAGE, {
         "Authorization": "Bearer " + tok,
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": CLAUDE_UA, "Accept": "application/json"})
     if _geo_blocked_body(st, raw):
         AI_LATCH.update(blocked=True, reason="Anthropic geo-block")
-        return {"err": "geo blocked"}
-    if st == 429:
-        return {"err": "rate limited", "retry": 3600}
+        return {"err": "geo blocked", "geo_blocked": True}
+    failed = _usage_failure(st, raw, hdrs)
+    if failed:
+        return failed
     if st != 200 or not p:
         return {"err": "http %s" % st}
     out = {"err": None}
@@ -2995,17 +3136,18 @@ def _codex_token(lead=AI_REFRESH_LEAD):
 def fetch_gpt_usage():
     tok, acct, err = _codex_token()
     if not tok:
-        return {"err": err}
+        return _token_failure(err)
     h = {"Authorization": "Bearer " + tok, "User-Agent": CODEX_UA,
          "Accept": "application/json"}
     if acct:
         h["chatgpt-account-id"] = acct
-    st, p, raw = _http_json(CODEX_USAGE, h)
+    st, p, raw, hdrs = _http_json_headers(CODEX_USAGE, h)
     if _geo_blocked_body(st, raw):
         AI_LATCH.update(blocked=True, reason="OpenAI geo-block")
-        return {"err": "geo blocked"}
-    if st == 429:
-        return {"err": "rate limited", "retry": 3600}
+        return {"err": "geo blocked", "geo_blocked": True}
+    failed = _usage_failure(st, raw, hdrs)
+    if failed:
+        return failed
     if st != 200 or not p:
         return {"err": "http %s" % st}
     rl = p.get("rate_limit") or {}
@@ -3839,8 +3981,13 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
             err = why
             still_valid = exp is not None and exp > now
             if not still_valid:
-                return _acct_row(acct, cred, "error", None, err,
-                                 _needs_login(pid, cred, err))
+                row = _acct_row(acct, cred, "error", None, err,
+                                _needs_login(pid, cred, err))
+                if err == _TOKEN_429:
+                    row["rate_limited"] = True
+                elif err == "offline":
+                    row["offline"] = True
+                return row
 
     try:
         usage = _prov.fetch_usage(pid, cred) or {}
@@ -3848,8 +3995,16 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
         usage = {"error": "fetch error (%s)" % type(exc).__name__}
     ferr = usage.get("error")
     if ferr:
-        return _acct_row(acct, cred, "error", None, ferr,
-                         _needs_login(pid, cred, ferr))
+        row = _acct_row(acct, cred, "error", None, ferr,
+                        _needs_login(pid, cred, ferr))
+        for flag in _AI_FETCH_FLAGS:
+            if usage.get(flag):
+                row[flag] = usage[flag]
+        if usage.get("geo_blocked"):
+            # Same hard tripwire as the legacy fetchers: never auto-clears.
+            AI_LATCH.update(blocked=True,
+                            reason="%s geo-block" % _GEO_VENDOR.get(pid, pid))
+        return row
     # A refresh that failed while the old token still worked is not worth
     # reporting as an error: the reading is good, and the next poll will try
     # the refresh again with more urgency.
@@ -3886,6 +4041,290 @@ def ai_poll_accounts(lead=AI_REFRESH_LEAD, spacing=AI_ACCT_SPACING):
             rows.append(_acct_row(a, a.get("cred"), "error", None,
                                   "poll error (%s)" % type(exc).__name__))
     return rows
+
+
+# Flags a usage fetch sets on failure (see aiproviders and the legacy
+# fetchers). They ride along on the row so the scheduler and the UI can tell
+# a rate limit from an ordinary error.
+_AI_FETCH_FLAGS = ("rate_limited", "retry_after", "blocked_html",
+                   "geo_blocked", "offline")
+_GEO_VENDOR = {"claude": "Anthropic", "codex": "OpenAI"}
+
+# The last result per aipolicy key, re-shown (with `held`) while that key is
+# not due, so a held account keeps its last reading instead of blanking.
+_AI_LAST_ROWS = {}
+
+# The last result per key that actually carried numbers. A failure or a hold
+# shows these (flagged `stale`) instead of dashes; a blank is never stored.
+_AI_LAST_GOOD = {}
+
+# Keys of the accounts polled by the last tick (None before the first one).
+# The sidecar wakes and says "polling" only for these.
+_AI_ACTIVE_KEYS = None
+
+# Credential digest per key whose login was refused, so a fresh login (a new
+# credential) lifts the hourly dead-login hold at once instead of an hour on.
+_AI_DEAD_FP = {}
+
+# Shown for a key that is not due yet and has no earlier reading to re-show,
+# which only happens in the first interval after a restart.
+AI_WAITING = "waiting for next poll"
+
+
+def _ai_err_text(result):
+    """A result's error as a string ('' for none). Never raises."""
+    try:
+        raw = result.get("error") or result.get("err")
+        return raw if isinstance(raw, str) else (str(raw) if raw else "")
+    except Exception:
+        return "unreadable error"
+
+
+def _ai_has_reading(result):
+    """Whether a result carries real numbers worth re-showing later."""
+    if not isinstance(result, dict) or _ai_err_text(result):
+        return False
+    if "usage" in result:                       # a vault row
+        return bool(result.get("usage"))
+    return any(k.endswith("_pct") and isinstance(v, (int, float))
+               and not isinstance(v, bool) for k, v in result.items())
+
+
+def _ai_record_outcome(key, pid, result):
+    """Feed one poll result to aipolicy so the key's next poll is scheduled.
+
+    `result` is a vault row (`error`) or a legacy dict (`err`). Total: it
+    never raises, because it runs after a request already left and an
+    unrecorded outcome means that key is asked again at once. Order matters:
+      429 (usage or token endpoint)  -> rate-limit hold, provider-wide
+      403 HTML / geo block           -> block hold
+      offline (status 0)             -> next interval, no strike, no hold:
+                                        the vendor never saw the request
+      dead login                     -> hourly retry until a new login
+      success / never configured     -> normal cadence
+      anything else                  -> error backoff
+    """
+    try:
+        if not isinstance(result, dict):
+            aipolicy.record_error(key, pid)
+            return
+        err = _ai_err_text(result)
+        if result.get("rate_limited") or err in ("rate limited", _TOKEN_429):
+            aipolicy.record_rate_limited(key, pid, result.get("retry_after"))
+        elif result.get("blocked_html") or result.get("geo_blocked"):
+            aipolicy.record_blocked(key, pid)
+        elif result.get("offline") or err.startswith("offline") \
+                or err == "http 0":
+            aipolicy.record_offline(key, pid)
+        elif result.get("needs_login") or err.startswith("LOGIN_EXPIRED") \
+                or err == "login expired":
+            aipolicy.record_login_dead(key, pid)
+        elif not err or err in NOT_CONFIGURED:
+            aipolicy.clear(key)
+            _AI_DEAD_FP.pop(key, None)
+            aipolicy.record_success(key, pid)
+            if _ai_has_reading(result):
+                _AI_LAST_GOOD[key] = dict(result)
+        else:
+            aipolicy.record_error(key, pid)
+    except Exception:
+        try:
+            aipolicy.record_error(key, pid)
+        except Exception:
+            pass
+
+
+def _ai_hold_secs(key, pid):
+    """Seconds of hold on key: its own, or its provider's 429/block hold."""
+    return max(float(aipolicy.hold_left(key) or 0),
+               float(aipolicy.provider_hold_left(pid) or 0))
+
+
+def _ai_shown(key, result, left=0.0):
+    """What to display for `result`: a failure carries the last good reading.
+
+    The failure's own error and status stay, so the UI still says why; the
+    numbers underneath are the last real ones, flagged `stale`, and `held`
+    says how long until the next attempt. A key with no good reading yet
+    shows the failure as it is -- a blank is never invented as a reading.
+    """
+    out = dict(result)
+    good = _AI_LAST_GOOD.get(key)
+    if _ai_err_text(out) and good:
+        for k, v in good.items():
+            if out.get(k) is None:
+                out[k] = v
+        out["stale"] = True
+    if left > 0:
+        out["held"] = max(1, int(left + 0.999))
+    return out
+
+
+def _ai_held(key, left, placeholder):
+    """The last result for `key` (or `placeholder`), marked as held.
+
+    Only shown with numbers when it has some; an earlier poll's reading is
+    never fresh, so it carries `stale`.
+    """
+    row = _ai_shown(key, _AI_LAST_ROWS.get(key) or placeholder)
+    row["held"] = max(1, int(left + 0.999))
+    if _ai_has_reading(row) or row.get("stale"):
+        row["stale"] = True
+    return row
+
+
+def _ai_note_dead(key, cred):
+    """Lift a dead-login hold once the credential behind `key` has changed.
+
+    The fingerprint taken while the login was dead is compared, never the
+    credential itself; a different one means the user logged in again.
+    """
+    try:
+        if aipolicy.snapshot()["keys"].get(key, {}).get("kind") != "login_dead":
+            _AI_DEAD_FP.pop(key, None)
+            return
+        fp = _cred_fingerprint(cred) if cred else ""
+        seen = _AI_DEAD_FP.setdefault(key, fp)
+        if fp and seen and fp != seen:
+            aipolicy.clear(key)
+            _AI_DEAD_FP.pop(key, None)
+    except Exception:
+        pass
+
+
+def _ai_set_active(keys):
+    """Remember this tick's pollable keys and drop policy state for the rest."""
+    global _AI_ACTIVE_KEYS
+    _AI_ACTIVE_KEYS = sorted(set(keys))
+    aipolicy.forget_except(_AI_ACTIVE_KEYS)
+
+
+def _ai_vault_keys(accts):
+    """Policy keys of the pollable (live-provider) accounts in `accts`."""
+    return [aipolicy.key(a.get("provider") or "", a.get("id")) for a in accts
+            if isinstance(a, dict) and _provider_is_live(a.get("provider") or "")]
+
+
+def ai_active_keys():
+    """Policy keys of the accounts that exist and are pollable right now.
+
+    The vault's live accounts when it holds any, else the two legacy keys --
+    the same choice the poll makes. Read from the accounts as they are now,
+    not from the last tick, so a removed account or a switch between the
+    vault and the legacy files counts at once. A vault that cannot be read
+    answers with what the last tick polled (None before the first tick).
+    """
+    try:
+        if not ai_vault_ready():
+            accts = []
+        else:
+            accts = [a for a in (_vault.list_accounts() or [])
+                     if isinstance(a, dict)]
+    except Exception:
+        keys = _AI_ACTIVE_KEYS
+        return None if keys is None else list(keys)
+    if accts:
+        return sorted(set(_ai_vault_keys(accts)))
+    return [aipolicy.key("claude", None), aipolicy.key("codex", None)]
+
+
+def ai_poll_accounts_due(manual=False, lead=AI_REFRESH_LEAD,
+                         spacing=AI_ACCT_SPACING):
+    """Poll only the accounts aipolicy says are due. Returns (rows, requested).
+
+    An account that is not due -- inside its interval, or under a rate-limit
+    hold, which even a manual refresh never overrides -- sends nothing; its
+    last row is re-shown with `held` set to the seconds left. `requested` is
+    True when at least one account was actually polled. Rows are empty when
+    there is no vault, exactly as for ai_poll_accounts.
+    """
+    if not ai_vault_ready():
+        return [], False
+    try:
+        accts = [a for a in (_vault.list_accounts() or [])
+                 if isinstance(a, dict)]
+    except Exception:
+        return [], False
+    # Only the accounts that exist and are pollable keep policy state; a
+    # removed account or the legacy keys left behind would otherwise stay
+    # overdue forever. A 429 on a dropped key survives as a provider hold.
+    _ai_set_active(_ai_vault_keys(accts))
+    rows = []
+    requested = 0
+    for a in accts:
+        pid = a.get("provider") or ""
+        if not _provider_is_live(pid):
+            rows.append(ai_account_poll(a, lead=lead))   # sends nothing
+            continue
+        key = aipolicy.key(pid, a.get("id"))
+        _ai_note_dead(key, a.get("cred"))
+        # claim() is the due check and the reservation in one step, so a
+        # per-account refresh racing this loop cannot also send. It refuses
+        # while any key of this provider is under a 429 or block hold.
+        claimed, left = aipolicy.claim(key, pid, manual=manual)
+        if not claimed:
+            placeholder = (_acct_row(a, a.get("cred"), "error", None,
+                                     "rate limited")
+                           if _ai_hold_secs(key, pid) > 0 else
+                           _acct_row(a, a.get("cred"), "wait", None,
+                                     AI_WAITING))
+            row = _ai_held(key, left, placeholder)
+            # A rename since the last poll still shows the current label.
+            row.update(id=a.get("id"), provider=pid,
+                       label=a.get("label") or pid)
+            rows.append(row)
+            continue
+        # Space out only the requests that actually leave the machine.
+        if requested and spacing:
+            time.sleep(spacing)
+        requested += 1
+        try:
+            row = ai_account_poll(a, lead=lead)
+        except Exception as exc:
+            row = _acct_row(a, a.get("cred"), "error", None,
+                            "poll error (%s)" % type(exc).__name__)
+        _ai_record_outcome(key, pid, row)
+        row = _ai_shown(key, row, _ai_hold_secs(key, pid))
+        _AI_LAST_ROWS[key] = row
+        rows.append(row)
+    return rows, bool(requested)
+
+
+def ai_poll_legacy(manual=False, spacing=AI_ACCT_SPACING):
+    """The no-vault two-credential poll, gated by aipolicy per provider.
+
+    Returns (claude, codex, requested). A provider that is not due sends
+    nothing and gets its last reading back with `held` set.
+    """
+    out = {}
+    requested = 0
+    pairs = (("claude", fetch_claude_usage), ("codex", fetch_gpt_usage))
+    # The vault keys are not polled on this path; dropping them keeps them
+    # from pinning the wake-up, and their 429s survive as provider holds.
+    _ai_set_active(aipolicy.key(pid, None) for pid, _ in pairs)
+    for pid, fetch in pairs:
+        key = aipolicy.key(pid, None)
+        if key in _AI_DEAD_FP or aipolicy.hold_left(key) > 0:
+            _ai_note_dead(key, _newest_cli_cred(pid)[1])
+        claimed, left = aipolicy.claim(key, pid, manual=manual)
+        if not claimed:
+            placeholder = ({"err": "rate limited", "rate_limited": True}
+                           if _ai_hold_secs(key, pid) > 0
+                           else {"err": AI_WAITING})
+            out[pid] = _ai_held(key, left, placeholder)
+            continue
+        if requested and spacing:
+            time.sleep(spacing)   # don't fire both at one instant
+        requested += 1
+        try:
+            result = fetch() or {"err": "no result"}
+        except Exception as exc:
+            result = {"err": "fetch error (%s)" % type(exc).__name__}
+        _ai_record_outcome(key, pid, result)
+        result = _ai_shown(key, result, _ai_hold_secs(key, pid))
+        _AI_LAST_ROWS[key] = result
+        out[pid] = result
+    return out["claude"], out["codex"], bool(requested)
 
 
 def ai_accounts_snapshot():
@@ -4006,10 +4445,19 @@ def ai_legacy_pair(rows):
             pick = mine[0]
         if pick is None:
             out[pid] = {"err": empty}
-        elif pick.get("status") == "ok" and pick.get("usage"):
+            continue
+        if pick.get("status") == "ok" and pick.get("usage"):
             out[pid] = _legacy_usage(pid, pick["usage"])
         else:
             out[pid] = {"err": pick.get("error") or "unknown error"}
+            if pick.get("stale") and pick.get("usage"):
+                # The last good reading behind a failure, kept dimmed.
+                for k, v in _legacy_usage(pid, pick["usage"]).items():
+                    if k != "err":
+                        out[pid][k] = v
+        for flag in ("rate_limited", "retry_after", "held", "stale"):
+            if flag in pick:
+                out[pid][flag] = pick[flag]
     return out["claude"], out["codex"]
 
 
@@ -4086,6 +4534,9 @@ def ai_login_capture(provider, label=None, account_id=None, wait=AI_LOGIN_WAIT):
                 return False, AI_UNSAVED_DEFAULT
             with _unsaved_lock:
                 AI_UNSAVED.pop(account_id, None)
+            # Only a dead-login hold is lifted; a 429 hold outlives a login.
+            aipolicy.clear(aipolicy.key(pid, account_id))
+            _AI_DEAD_FP.pop(aipolicy.key(pid, account_id), None)
             return True, "account re-authenticated"
         try:
             _vault.add_account(pid, label or _default_label(pid), cred,

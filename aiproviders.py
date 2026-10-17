@@ -34,9 +34,11 @@ and it stays that way.
 """
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -210,39 +212,173 @@ def is_live(pid):
 
 
 # ── transport ─────────────────────────────────────────────────────────────────
-def _http_json(url, headers, data=None, timeout=HTTP_TIMEOUT):
-    """Returns (status, parsed_or_None, raw_body). Never raises.
+def _http_json_h(url, headers, data=None, timeout=HTTP_TIMEOUT):
+    """Returns (status, parsed_or_None, raw_body, response_headers).
 
-    status 0 means the request never reached the server at all -- DNS, no
-    route, a dropped tunnel, TLS refusal. Keeping that distinct from a real
-    HTTP status is the whole basis of the failure classification below, so it
-    gets its own sentinel rather than being folded into an exception.
+    Never raises. status 0 means the request never reached the server at all
+    -- DNS, no route, a dropped tunnel, TLS refusal. Keeping that distinct
+    from a real HTTP status is the whole basis of the failure classification
+    below, so it gets its own sentinel rather than being folded into an
+    exception. response_headers is the server's header mapping, or {} when
+    there was no response; it exists so a 429's Retry-After can be honoured.
     """
     try:
         req = urllib.request.Request(
             url, data=data, method="POST" if data is not None else "GET",
             headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            hdrs = resp.headers or {}
             raw = resp.read().decode("utf-8", "replace")
             try:
-                return resp.status, json.loads(raw), raw
+                return resp.status, json.loads(raw), raw, hdrs
             except Exception:
-                return resp.status, None, raw
+                return resp.status, None, raw, hdrs
     except urllib.error.HTTPError as e:
+        hdrs = e.headers or {}
         try:
             raw = e.read().decode("utf-8", "replace")
         except Exception:
             raw = ""
         try:
-            return e.code, json.loads(raw), raw
+            return e.code, json.loads(raw), raw, hdrs
         except Exception:
-            return e.code, None, raw
+            return e.code, None, raw, hdrs
     except Exception as e:
         # Body carries the exception TYPE only. The URL and headers are in
         # scope here and headers hold a bearer token; str(e) on some socket
         # errors echoes request context, so nothing but the class name is
         # allowed out.
-        return 0, None, type(e).__name__
+        return 0, None, type(e).__name__, {}
+
+
+# Headers of the last _http_json response on THIS thread. _http_json keeps
+# its 3-tuple because callers and the regression harness (which replaces
+# _http_json wholesale) depend on that shape; the headers ride beside it
+# instead. Thread-local because the usage poll and the token-refresh thread
+# can be in flight at the same time.
+_LAST = threading.local()
+
+
+def _http_json(url, headers, data=None, timeout=HTTP_TIMEOUT):
+    """Returns (status, parsed_or_None, raw_body). Never raises.
+
+    Thin wrapper over _http_json_h; see there for what status 0 means. The
+    response headers are left in _LAST for _request() to pick up.
+    """
+    st, p, raw, hdrs = _http_json_h(url, headers, data=data, timeout=timeout)
+    _LAST.headers = hdrs
+    return st, p, raw
+
+
+def _request(url, headers, data=None):
+    """_http_json plus the response headers: (status, parsed, raw, headers).
+
+    The stale value is cleared first, so a replaced _http_json that never
+    records headers yields {} rather than a previous call's Retry-After.
+    """
+    _LAST.headers = None
+    st, p, raw = _http_json(url, headers, data=data)
+    return st, p, raw, getattr(_LAST, "headers", None) or {}
+
+
+def _header(hdrs, name):
+    """Case-insensitive header lookup over any mapping; None if absent."""
+    try:
+        want = name.lower()
+        for k, v in hdrs.items():
+            if str(k).lower() == want:
+                return v
+    except Exception:
+        pass
+    return None
+
+
+_RETRY_AFTER_MAX = 6 * 3600
+
+
+def _parse_retry_after_local(value):
+    """Fallback for aipolicy.parse_retry_after: seconds or HTTP-date.
+
+    <=0, garbage or None -> None. Claude sends `retry-after: 0` on a 429,
+    which is not a promise to be ready now, so it is treated as missing.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        secs = float(value)
+    except (TypeError, ValueError):
+        try:
+            when = email.utils.parsedate_to_datetime(str(value).strip())
+            secs = when.timestamp() - time.time()
+        except Exception:
+            return None
+    if secs != secs or secs <= 0:
+        return None
+    return min(secs, float(_RETRY_AFTER_MAX))
+
+
+def _retry_after(hdrs):
+    """Retry-After in seconds, or None. Never raises.
+
+    aipolicy owns the parsing rule; it is imported lazily so this module
+    still loads, and still reports 429s, when aipolicy is absent.
+    """
+    value = _header(hdrs, "Retry-After")
+    try:
+        from aipolicy import parse_retry_after
+    except Exception:
+        return _parse_retry_after_local(value)
+    try:
+        secs = parse_retry_after(value)
+        return None if secs is None else float(secs)
+    except Exception:
+        return _parse_retry_after_local(value)
+
+
+# Same keyword set as core's legacy _geo_blocked_body, copied rather than
+# imported (aiproviders must not import core). Broad on purpose: a false
+# match only latches polling off, which is the safe direction.
+_GEO_MARKERS = ("unsupported_country", "country", "region",
+                "not available in your", "unsupported region", "restricted")
+
+
+def _is_geo_block(st, raw):
+    b = (raw or "")[:2000].lower()
+    return st in (403, 451) and any(k in b for k in _GEO_MARKERS)
+
+
+def _is_html_block(st, raw):
+    """A 403 whose body is an HTML page or a Cloudflare challenge."""
+    b = (raw or "")[:2000].lower()
+    return st == 403 and (b.lstrip().startswith("<") or "cloudflare" in b
+                          or "cf-ray" in b or "cf-chl" in b)
+
+
+def _failure_flags(st, raw, hdrs):
+    """Scheduler-facing flags for a failed usage request (contract E2).
+
+    These ride beside the human 'error' string, which is unchanged, so the
+    poller can hold a rate-limited or WAF-challenged account instead of
+    asking again on its next tick.
+    """
+    if st == 0:
+        return {"offline": True}
+    flags = {}
+    if st == 429:
+        flags["rate_limited"] = True
+        flags["retry_after"] = _retry_after(hdrs)
+    if _is_geo_block(st, raw):
+        flags["geo_blocked"] = True
+    if _is_html_block(st, raw):
+        flags["blocked_html"] = True
+    return flags
+
+
+def _flagged(err, st, raw, hdrs):
+    """An adapter error dict with the failure flags merged in."""
+    out = dict(err)
+    out.update(_failure_flags(st, raw, hdrs))
+    return out
 
 
 _DEAD_MARKERS = ("expired", "invalid_grant", "revoked")
@@ -738,20 +874,20 @@ def _claude_usage(cred):
     o = _claude_oauth(cred)
     if not o or not o.get("accessToken"):
         return {"error": "no credential"}
-    st, p, raw = _http_json(CLAUDE_USAGE, {
+    st, p, raw, hdrs = _request(CLAUDE_USAGE, {
         "Authorization": "Bearer " + o["accessToken"],
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": CLAUDE_UA,
         "Accept": "application/json",
     })
     if st == 0:
-        return {"error": "offline"}
+        return _flagged({"error": "offline"}, st, raw, hdrs)
     if st == 401:
         return {"error": "token rejected"}
     if st == 429:
-        return {"error": "rate limited"}
+        return _flagged({"error": "rate limited"}, st, raw, hdrs)
     if st != 200 or not isinstance(p, dict):
-        return {"error": "http %s" % st}
+        return _flagged({"error": "http %s" % st}, st, raw, hdrs)
     fh = p.get("five_hour") or {}
     sd = p.get("seven_day") or {}
     out = {
@@ -833,15 +969,15 @@ def _codex_usage(cred):
     }
     if t.get("account_id"):
         h["chatgpt-account-id"] = t["account_id"]
-    st, p, raw = _http_json(CODEX_USAGE, h)
+    st, p, raw, hdrs = _request(CODEX_USAGE, h)
     if st == 0:
-        return {"error": "offline"}
+        return _flagged({"error": "offline"}, st, raw, hdrs)
     if st == 401:
         return {"error": "token rejected"}
     if st == 429:
-        return {"error": "rate limited"}
+        return _flagged({"error": "rate limited"}, st, raw, hdrs)
     if st != 200 or not isinstance(p, dict):
-        return {"error": "http %s" % st}
+        return _flagged({"error": "http %s" % st}, st, raw, hdrs)
     rl = p.get("rate_limit") or {}
     out = {"provider": "codex",
            "plan": (p.get("plan_type") or "").upper() or None,
@@ -1000,7 +1136,7 @@ def _pct_of(used, limit):
     return max(0.0, min(100.0, u / l * 100.0))
 
 
-def _usage_http_error(st, parsed):
+def _usage_http_error(st, parsed, raw="", hdrs=None):
     """The usage-side half of the three-way classification, or None on 200.
 
     Same discipline as _classify() applies and for the same reason: status 0
@@ -1009,16 +1145,22 @@ def _usage_http_error(st, parsed):
     so a wrong host (404) stays distinguishable from a vendor outage (500).
     Nothing here ever reports a dead login, because a usage endpoint refusing
     a request is not proof that the grant behind it is gone.
+
+    raw and hdrs feed _failure_flags: a 403 that is really a Cloudflare page
+    or a region block still reads "token rejected", but carries the flag that
+    tells the poller to hold off rather than retry.
     """
     if st == 0:
-        return {"error": "offline"}
-    if st in (401, 403):
-        return {"error": "token rejected"}
-    if st == 429:
-        return {"error": "rate limited"}
-    if st != 200 or not isinstance(parsed, dict):
-        return {"error": "http %s" % st}
-    return None
+        err = {"error": "offline"}
+    elif st in (401, 403):
+        err = {"error": "token rejected"}
+    elif st == 429:
+        err = {"error": "rate limited"}
+    elif st != 200 or not isinstance(parsed, dict):
+        err = {"error": "http %s" % st}
+    else:
+        return None
+    return _flagged(err, st, raw, hdrs or {})
 
 
 def _no_refresh(_cred, why):
@@ -1099,7 +1241,7 @@ def _cursor_usage(cred):
                  "accessToken", "access_token", "token")
     if not tok:
         return {"error": "no credential"}
-    st, p, raw = _http_json(CURSOR_RPC, {
+    st, p, raw, hdrs = _request(CURSOR_RPC, {
         "Authorization": "Bearer " + tok,
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
@@ -1115,15 +1257,22 @@ def _cursor_usage(cred):
         # The RPC never reached a server, so the REST host would not either,
         # and 'offline' is the honest answer. Retrying a second host here
         # would only turn one wrong diagnosis into two round trips.
-        return {"error": "offline"}
+        return _flagged({"error": "offline"}, st, raw, hdrs)
+    # A rate limit or a WAF/region block is about the account or the egress,
+    # not the endpoint version, so asking the REST host too would only double
+    # the requests that earned the block.
+    rpc_err = _usage_http_error(st, p, raw, hdrs)
+    if rpc_err and (rpc_err.get("rate_limited") or rpc_err.get("blocked_html")
+                    or rpc_err.get("geo_blocked")):
+        return rpc_err
     # RPC answered but not usefully. The REST form is the dashboard's own
     # older path and is worth one attempt before giving up, because the two
     # are versioned independently.
     uid = _cursor_user_id(tok)
     if not uid:
-        return _usage_http_error(st, p) or {"error": "unrecognised response"}
+        return rpc_err or {"error": "unrecognised response"}
     url = CURSOR_REST + "?" + urllib.parse.urlencode({"user": uid})
-    st2, p2, raw2 = _http_json(url, {
+    st2, p2, raw2, hdrs2 = _request(url, {
         # Session cookie form is "<user id>::<jwt>" with the separator
         # percent-encoded, which is why this is built by hand rather than
         # handed to a cookie jar.
@@ -1132,7 +1281,7 @@ def _cursor_usage(cred):
         "Accept": "application/json",
         "User-Agent": WIDGET_UA,
     })
-    err = _usage_http_error(st2, p2)
+    err = _usage_http_error(st2, p2, raw2, hdrs2)
     if err:
         return err
     out = _cursor_shape(p2)
@@ -1238,7 +1387,7 @@ def _copilot_usage(cred):
     tok = _token(o, "oauth_token", "token", "access_token", "accessToken")
     if not tok:
         return {"error": "no credential"}
-    st, p, raw = _http_json(COPILOT_USER, {
+    st, p, raw, hdrs = _request(COPILOT_USER, {
         # "token <oauth>", not "Bearer": this endpoint is on the classic
         # GitHub OAuth scheme and rejects the Bearer form.
         "Authorization": "token " + tok,
@@ -1246,7 +1395,7 @@ def _copilot_usage(cred):
         "Editor-Version": COPILOT_EDITOR,
         "User-Agent": WIDGET_UA,
     })
-    err = _usage_http_error(st, p)
+    err = _usage_http_error(st, p, raw, hdrs)
     if err:
         return err
     snaps = p.get("quota_snapshots")
@@ -1293,13 +1442,13 @@ def _cognition_usage(cred, pid, ide_name, wrappers):
         "ideName": ide_name,
         "ideVersion": "1.0.0",
     }}).encode()
-    st, p, raw = _http_json(COGNITION_STATUS, {
+    st, p, raw, hdrs = _request(COGNITION_STATUS, {
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
         "Accept": "application/json",
         "User-Agent": WIDGET_UA,
     }, data=body)
-    err = _usage_http_error(st, p)
+    err = _usage_http_error(st, p, raw, hdrs)
     if err:
         return err
     ps = p.get("planStatus")
@@ -1402,7 +1551,7 @@ def _kimi_usage(cred):
     tok = _token(k, "access_token", "accessToken", "token", "apiKey")
     if not tok:
         return {"error": "no credential"}
-    st, p, raw = _http_json(KIMI_USAGE, {
+    st, p, raw, hdrs = _request(KIMI_USAGE, {
         "Authorization": "Bearer " + tok,
         "Accept": "application/json",
         # The CLI also sends a device identifier. Its exact header name was
@@ -1412,7 +1561,7 @@ def _kimi_usage(cred):
         "x-msh-platform": "cli",
         "User-Agent": WIDGET_UA,
     })
-    err = _usage_http_error(st, p)
+    err = _usage_http_error(st, p, raw, hdrs)
     if err:
         return err
     usages = p.get("usages")
@@ -1456,12 +1605,12 @@ def _cline_usage(cred):
     tok = _token(o, "token", "access_token", "accessToken", "apiKey")
     if not tok:
         return {"error": "no credential"}
-    st, p, raw = _http_json(CLINE_USAGE, {
+    st, p, raw, hdrs = _request(CLINE_USAGE, {
         "Authorization": "Bearer " + tok,
         "Accept": "application/json",
         "User-Agent": WIDGET_UA,
     })
-    err = _usage_http_error(st, p)
+    err = _usage_http_error(st, p, raw, hdrs)
     if err:
         return err
     data = p.get("data")
@@ -1520,8 +1669,10 @@ _ADAPTERS = {
 def fetch_usage(provider_id, cred):
     """Always a dict, never an exception.
 
-    On failure the dict's ONLY key is 'error', so the UI can branch on
-    presence rather than sniffing for sentinel values in the data. A planned
+    On failure the dict carries 'error' and no quota data, so the UI can
+    branch on presence rather than sniffing for sentinel values. Beside it
+    may sit scheduler flags: offline, rate_limited + retry_after (seconds or
+    None), blocked_html (403 HTML/Cloudflare page), geo_blocked. A planned
     provider answers 'not supported yet' -- honest, and impossible to mistake
     for a quota reading.
     """

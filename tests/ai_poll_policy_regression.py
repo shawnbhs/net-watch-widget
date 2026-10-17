@@ -2344,7 +2344,8 @@ def w_login_dead_hold_offers_sign_in():
         n = sum(1 for q in r.requests if q.startswith("claude:"))
     err = str(row.get("error") or "")
     ok = (row.get("needs_login") is True and err.startswith("LOGIN_EXPIRED")
-          and any(str(e or "").startswith("LOGIN_EXPIRED") for e in errs)
+          and any("login expired" in str(e or "") for e in errs)
+          and not any("LOGIN_EXPIRED" in str(e or "") for e in errs)
           and n == 0)
     return ok, "row needs_login=%r error=%r; press emits %r; claude requests %d (want True, LOGIN_EXPIRED, 0)" % (
         row.get("needs_login"), err, errs, n)

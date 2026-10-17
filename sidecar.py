@@ -1030,12 +1030,19 @@ def ai_account_refresh(aid):
          note="single")
 
 
+_AI_NAMES = {"claude": "Claude", "codex": "ChatGPT"}
+
+
 def _ai_refresh_refused(key, left):
     """Answer a per-account press that may not send: how long, and why."""
     secs = max(1, int(left + 0.999))
     if core._ai_login_dead(key):
         # Refreshing cannot fix a dead login; say what does.
-        ai_accounts_emit(err="LOGIN_EXPIRED:%s" % key.split(":", 1)[0],
+        # This text is shown verbatim as the pane's notice, so it is a
+        # sentence, not the LOGIN_EXPIRED sentinel the cards parse.
+        pid = key.split(":", 1)[0]
+        ai_accounts_emit(err="%s login expired - sign in again"
+                         % _AI_NAMES.get(pid, pid),
                          status="wait", seconds=secs, reason="login expired")
         return
     held = _ai_rl_hold(key.split(":", 1)[0]) > 0

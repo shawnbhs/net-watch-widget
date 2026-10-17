@@ -525,6 +525,7 @@ def _ai_any_due(manual=False):
     keys = _ai_active_keys()
     if not keys:
         return True
+    core.ai_lift_relogged()
     return any(aipolicy.due(k, p, manual=manual)[0] for k, p in keys)
 
 
@@ -994,6 +995,9 @@ def ai_account_refresh(aid):
         ai_accounts_emit(err="not supported yet")
         return
     key = aipolicy.key(pid, aid)
+    # A dead-login hold whose credential is valid again (re-login) is lifted
+    # here, so the press after signing in polls instead of being refused.
+    core._ai_note_dead(key, acct.get("cred"))
     # The read-only check answers a press inside the floor or a hold without
     # spending a geo lookup; the claim after the geo gate is what actually
     # reserves the key, so the loop or a second press cannot also send.

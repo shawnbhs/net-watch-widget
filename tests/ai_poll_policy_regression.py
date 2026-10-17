@@ -2336,9 +2336,10 @@ def w_login_dead_hold_offers_sign_in():
     with Rig(vault="ok") as r:
         fresh()
         aipolicy.record_login_dead("claude:acct-claude-1", "claude")
-        rows, requested = core.ai_poll_accounts_due(manual=True)
+        rows, requested = _with_expiry(
+            -60, lambda: core.ai_poll_accounts_due(manual=True))
         row = next((x for x in rows if x.get("id") == "acct-claude-1"), {})
-        r.sc.ai_account_refresh("acct-claude-1")
+        _with_expiry(-60, lambda: r.sc.ai_account_refresh("acct-claude-1"))
         errs = [f.get("err") for k, f in r.ev if k == "ai_accounts"]
         n = sum(1 for q in r.requests if q.startswith("claude:"))
     err = str(row.get("error") or "")
@@ -2347,6 +2348,57 @@ def w_login_dead_hold_offers_sign_in():
           and n == 0)
     return ok, "row needs_login=%r error=%r; press emits %r; claude requests %d (want True, LOGIN_EXPIRED, 0)" % (
         row.get("needs_login"), err, errs, n)
+
+
+def _with_expiry(offset, fn):
+    import time as _t
+    orig = core._prov.cred_expiry
+    core._prov.cred_expiry = lambda pid, cred: _t.time() + offset
+    try:
+        return fn()
+    finally:
+        core._prov.cred_expiry = orig
+
+
+def w_login_dead_lifted_by_valid_cred():
+    """A valid credential lifts a dead-login hold on the next press, even
+    with no fingerprint baseline (fresh process)."""
+    require(aipolicy, "record_login_dead", "hold_left")
+    with Rig(vault="ok") as r:
+        fresh()
+        k = "claude:acct-claude-1"
+        import time as _t
+        aipolicy.record_login_dead(k, "claude", now=_t.time() - 600)
+        core._AI_DEAD_FP.clear()
+        _with_expiry(3600, lambda: r.sc.ai_account_refresh("acct-claude-1"))
+        n = sum(1 for q in r.requests if q == k)
+    return n == 1, "after re-login: claude requests %d (want 1)" % n
+
+
+def w_login_dead_lifted_by_loop():
+    """The loop lifts it too, without a press."""
+    require(aipolicy, "record_login_dead", "hold_left")
+    with Rig(vault="ok") as r:
+        fresh()
+        k = "claude:acct-claude-1"
+        aipolicy.record_login_dead(k, "claude")
+        core._AI_DEAD_FP.clear()
+        _with_expiry(3600, core.ai_lift_relogged)
+        left = aipolicy.hold_left(k)
+    return left == 0, "hold left after loop lift %r (want 0)" % left
+
+
+def w_login_dead_kept_for_expired_cred():
+    require(aipolicy, "record_login_dead", "hold_left")
+    with Rig(vault="ok") as r:
+        fresh()
+        k = "claude:acct-claude-1"
+        aipolicy.record_login_dead(k, "claude")
+        _with_expiry(-60, lambda: r.sc.ai_account_refresh("acct-claude-1"))
+        _with_expiry(-60, core.ai_lift_relogged)
+        n = sum(1 for q in r.requests if q == k)
+        left = aipolicy.hold_left(k)
+    return n == 0 and left > 3000, "still expired: requests %d, hold left %r (want 0, ~3600)" % (n, left)
 
 
 # ---------------------------------------------------------------------------
@@ -2563,6 +2615,12 @@ TESTS = [
      w_sc_refresh_respects_provider_hold),
     ("114 dead-login hold offers sign-in, not 'rate limited'",
      w_login_dead_hold_offers_sign_in),
+    ("115 re-login (valid cred) lifts the dead-login hold on press",
+     w_login_dead_lifted_by_valid_cred),
+    ("116 re-login lifts the dead-login hold from the loop",
+     w_login_dead_lifted_by_loop),
+    ("117 expired cred keeps the dead-login hold, zero requests",
+     w_login_dead_kept_for_expired_cred),
 
     ("69 safety: real per-user state file untouched",
      s98_real_state_file_untouched),

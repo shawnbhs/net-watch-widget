@@ -4191,11 +4191,43 @@ def _ai_note_dead(key, cred):
         if aipolicy.snapshot()["keys"].get(key, {}).get("kind") != "login_dead":
             _AI_DEAD_FP.pop(key, None)
             return
+        # A credential that is valid right now cannot be a dead login, however
+        # it got there (a sign-in, a CLI login, another process's refresh).
+        # This needs no fingerprint baseline, so it also works after a restart.
+        pid = key.split(":", 1)[0]
+        try:
+            exp = _prov.cred_expiry(pid, cred) if cred else None
+        except Exception:
+            exp = None
+        if exp is not None and exp > time.time():
+            aipolicy.clear(key)
+            _AI_DEAD_FP.pop(key, None)
+            return
         fp = _cred_fingerprint(cred) if cred else ""
         seen = _AI_DEAD_FP.setdefault(key, fp)
         if fp and seen and fp != seen:
             aipolicy.clear(key)
             _AI_DEAD_FP.pop(key, None)
+    except Exception:
+        pass
+
+
+def ai_lift_relogged():
+    """Lift every vault dead-login hold whose credential is valid again.
+
+    Local only (vault read, no request), and only when such a hold exists,
+    so the loop can call it every wake: without it a re-login made outside
+    the widget would wait out the rest of the hour.
+    """
+    try:
+        dead = [k for k, v in aipolicy.snapshot()["keys"].items()
+                if v.get("kind") == "login_dead"]
+        if not dead or _vault is None:
+            return
+        for a in _vault.list_accounts():
+            key = aipolicy.key(a.get("provider") or "", a.get("id") or "")
+            if key in dead:
+                _ai_note_dead(key, a.get("cred"))
     except Exception:
         pass
 

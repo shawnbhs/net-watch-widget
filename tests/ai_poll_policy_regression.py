@@ -2402,6 +2402,38 @@ def w_login_dead_kept_for_expired_cred():
     return n == 0 and left > 3000, "still expired: requests %d, hold left %r (want 0, ~3600)" % (n, left)
 
 
+def w_off_cleared_by_next_good_tick():
+    """A geo failure sets off; the next tick that passes geo clears it."""
+    with Rig(vault="ok") as r:
+        fresh()
+        r._p(core, geo_verdict=lambda *a, **k: (False, "IR", "cloudflare says IR"))
+        r.sc.ai_tick(0.0, False)
+        was_off = any(f.get("off") for f in r.ai_events())
+        r._p(core, geo_verdict=lambda *a, **k: (True, "DE", "ok"))
+        r.sc.ai_tick(0.0, False)
+        last = [f["off"] for f in r.ai_events() if "off" in f]
+    ok = was_off and bool(last) and last[-1] is False
+    return ok, "off after geo fail %s, last off flag %r (want True, False)" % (
+        was_off, last[-1] if last else None)
+
+
+def w_off_cleared_by_wait_between_polls():
+    """A wait (nothing due) lifts a stale off when the cached geo is fine,
+    and keeps it, with the real reason, when it is not."""
+    with Rig(vault="ok") as r:
+        fresh()
+        r.sc.emit("ai", off=True, reason="VPN required")
+        r.sc._ai_emit_wait(False)
+        good = [f for f in r.ai_events() if "off" in f][-1]
+        r._p(core, geo_verdict=lambda *a, **k: (False, "IR", "cloudflare says IR"))
+        r.sc._ai_emit_wait(False)
+        bad = [f for f in r.ai_events() if "off" in f][-1]
+    ok = good["off"] is False and bad["off"] is True \
+        and bad.get("reason") == "VPN required"
+    return ok, "geo ok -> off %r; geo IR -> off %r reason %r (want False, True, VPN required)" % (
+        good["off"], bad["off"], bad.get("reason"))
+
+
 # ---------------------------------------------------------------------------
 # final safety
 # ---------------------------------------------------------------------------
@@ -2622,6 +2654,10 @@ TESTS = [
      w_login_dead_lifted_by_loop),
     ("117 expired cred keeps the dead-login hold, zero requests",
      w_login_dead_kept_for_expired_cred),
+    ("118 a stale 'off' is cleared by the next tick that passes geo",
+     w_off_cleared_by_next_good_tick),
+    ("119 a wait between polls lifts a stale 'off' (or keeps it, honestly)",
+     w_off_cleared_by_wait_between_polls),
 
     ("69 safety: real per-user state file untouched",
      s98_real_state_file_untouched),

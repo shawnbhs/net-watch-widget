@@ -660,7 +660,12 @@ def ai_tick(last_manual, manual):
     vault = _ai_vault_state()
     if vault == "unreadable":
         return _ai_vault_failed("vault unreadable"), last_manual
-    emit("ai", status="polling")
+    # The geo check above passed, so any earlier off=True is over. The UI
+    # merges every 'ai' message into one state, so an off that is never
+    # sent back as False sticks for the session: the card kept showing a
+    # bare Status row (with whatever reason came last, e.g. "rate limited")
+    # and hid the account list, the + button and remove with it.
+    emit("ai", status="polling", off=False)
     if vault == "accounts":
         try:
             rows, requested = core.ai_poll_accounts_due(manual)
@@ -718,13 +723,37 @@ def ai_tick(last_manual, manual):
     return None, last_manual
 
 
+def _ai_off_fields():
+    """off/reason for a message sent without a fresh geo check.
+
+    Uses the cached verdict (no forced lookup), so a wait between polls can
+    still lift a stale off -- or keep it, with the real reason -- instead of
+    leaving it to the next due poll, which a dead-login hold puts an hour out.
+    """
+    if core.AI_LATCH.get("blocked"):
+        return dict(off=True, reason=core.AI_LATCH.get("reason") or "blocked")
+    try:
+        ok, cc, why = core.geo_verdict(_state.get("ip"), _state.get("code"))
+    except Exception:
+        return {}
+    if ok:
+        return dict(off=False)
+    return dict(off=True, reason="VPN required" if cc == "IR"
+                else "VPN required (%s)" % why)
+
+
 def _ai_emit_wait(manual, rows=None):
     """Tell the UI how long until the next request, and why if held."""
+    gate = _ai_off_fields()
+    if gate.get("off"):
+        emit("ai", status=None, **gate)
+        return
     keys = _ai_active_keys() or []
     holds = [_ai_rl_hold(p) for _, p in keys]
     wait = dict(status="wait", seconds=max(1, int(_ai_next_due(manual))))
     if holds and all(h > 0 for h in holds):
         wait.update(seconds=max(1, int(min(holds))), reason="rate limited")
+    wait.update(gate)
     emit("ai", **(dict(wait, accounts=rows) if rows else wait))
 
 

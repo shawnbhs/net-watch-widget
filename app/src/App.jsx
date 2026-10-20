@@ -632,6 +632,7 @@ function Widget() {
             edge={edge}
             locked={locked}
             onExpand={swapTab}
+            copy={copy}
             changed={ipChanged.on ? ipChanged : rfChanged}
             scale={scale}
             maxScale={maxScale}
@@ -1393,7 +1394,7 @@ const TAB_PAD = {
 const HORIZONTAL_EDGES = ['top', 'bottom']
 
 function MiniBar({
-  s, edge, locked, onExpand, changed,
+  s, edge, locked, onExpand, copy, changed,
   scale, maxScale, onScale, onScaleStart, onScaleEnd,
 }) {
   const net = s.net
@@ -1410,7 +1411,11 @@ function MiniBar({
 
   const onDown = (e) => {
     if (e.button !== 0) return
-    drag.current = { x: e.screenX, y: e.screenY, moved: false, held: true }
+    // Whether the press began on the address. The card captures the pointer
+    // below, so the click that follows is delivered to the card rather than
+    // to the address -- the press target is the only place this survives.
+    const onIp = !!e.target?.closest?.('[data-tab-ip]')
+    drag.current = { x: e.screenX, y: e.screenY, moved: false, held: true, onIp }
     e.currentTarget.setPointerCapture(e.pointerId)
   }
   const onMove = (e) => {
@@ -1447,8 +1452,23 @@ function MiniBar({
   // is cleared on the next press rather than here, because a drag released off
   // the element never produces a click to clear it. That outliving is why the
   // press is tracked by its own `held` flag rather than by the record existing.
+  const [copied, setCopied] = useState(false)
+  const copiedTimer = useRef(null)
+  useEffect(() => () => clearTimeout(copiedTimer.current), [])
   const onClick = () => {
-    if (!drag.current?.moved) onExpand()
+    const d = drag.current
+    if (d?.moved) return
+    // A click on the address copies it instead of opening the widget, so
+    // the exit IP can be taken straight off the strip. A drag that began
+    // there still drags: `moved` is checked first.
+    if (d?.onIp && copy && ipLive(net?.ip)) {
+      copy(net.ip)()
+      setCopied(true)
+      clearTimeout(copiedTimer.current)
+      copiedTimer.current = setTimeout(() => setCopied(false), 900)
+      return
+    }
+    onExpand()
   }
 
   return (
@@ -1495,7 +1515,10 @@ function MiniBar({
         >
           {ping.text}
         </span>
-        <TabAddress ip={net?.ip} column={column} />
+        <TabAddress ip={net?.ip} column={column} copied={copied} />
+        <span className={column ? 'mt-1.5' : 'ml-1.5'} title={net?.country || undefined}>
+          <CountryChip code={net?.code} small />
+        </span>
         <NetDot up={up} busy={busy} />
         <VpnChip vpn={net?.vpn} tab />
         <TabResizeGrip
@@ -1532,16 +1555,25 @@ function MiniBar({
  * disappearing off the end of it; the column form already wraps by
  * construction.
  */
-function TabAddress({ ip, column }) {
-  const live = ip && ip !== '?' && ip !== 'Error'
+function ipLive(ip) {
+  return !!ip && ip !== '?' && ip !== 'Error' && ip !== '…'
+}
+
+function TabAddress({ ip, column, copied }) {
+  const live = ipLive(ip)
   const text = live ? ip : '…'
+  // data-tab-ip marks the press target for MiniBar's click handler; the
+  // tint is the only feedback a copy gets on a strip this narrow.
+  const tip = copied ? 'Copied' : live ? 'Exit address · click to copy' : 'Exit address'
+  const tone = copied ? 'text-accent-2' : 'text-ink-2 hover:text-accent-2'
 
   if (!column) {
     return (
       <span
-        className="glass-text shrink-0 whitespace-nowrap text-center text-[11.5px]
-                   tabular-nums text-ink-2"
-        title="Exit address"
+        data-tab-ip=""
+        className={'glass-text shrink-0 whitespace-nowrap text-center text-[11.5px] '
+          + 'tabular-nums transition-colors ' + tone}
+        title={tip}
       >
         {text}
       </span>
@@ -1554,9 +1586,10 @@ function TabAddress({ ip, column }) {
   const parts = live ? text.split('.') : [text]
   return (
     <span
-      className="glass-text flex shrink-0 flex-col items-center text-center text-[11.5px]
-                 leading-[1.05] tabular-nums text-ink-2"
-      title="Exit address"
+      data-tab-ip=""
+      className={'glass-text flex shrink-0 flex-col items-center text-center text-[11.5px] '
+        + 'leading-[1.05] tabular-nums transition-colors ' + tone}
+      title={tip}
     >
       {parts.map((part, i) => (
         <span key={`${part}-${i}`} className="block w-full text-center">

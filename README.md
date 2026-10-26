@@ -614,9 +614,10 @@ Code and Codex.** The widget can sign them in, import them, and poll them.
 
 Six more have a usage reader in the code but no way in yet. The widget's
 sign-in only knows how to drive the Claude and Codex CLIs, and the startup
-import only reads those two. These six are selectable in the picker, but
-picking one ends with *"isolated login not available for …"* rather than a new
-account. The last four are greyed out, labelled, and never polled.
+import only reads those two. These six are greyed out in the picker and
+labelled *sign-in not available yet*, so they cannot be picked into a sign-in
+that would only fail. The last four are greyed out, labelled *not wired up
+yet*, and never polled.
 
 | Provider | Usage today |
 |---|---|
@@ -820,9 +821,7 @@ Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Net
 If it is missing or the path is wrong, re-run `install.ps1`.
 
 **Ping shows nothing.** Some networks block ICMP. Point `PING_HOST_1` at your
-own gateway instead. The latency card's labels still read `1.1.1.1` and
-`8.8.8.8` after you do. The labels are fixed text, but the figures under them
-come from the hosts you set.
+own gateway instead. The latency card names whichever hosts you set.
 
 ---
 

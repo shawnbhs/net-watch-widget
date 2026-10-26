@@ -224,6 +224,7 @@ def refresh_once():
          isp=isp, vpn=vpn, changed=changed,
          ping1=p1, ping2=p2, loss1=l1, loss2=l2,
          ping1_ms=core.pms(p1), ping2_ms=core.pms(p2),
+         host1=core.PING_HOST_1, host2=core.PING_HOST_2,
          clock=clock12(seconds=True))
 
     try:
@@ -874,6 +875,23 @@ def ai_accounts_emit(err=None, note=None, **extra):
     emit("ai_accounts", accounts=rows, err=err or "", note=note or "", **extra)
 
 
+def _login_capable(pid):
+    """Whether the add-account flow could actually sign this provider in.
+
+    "live" in the registry only means a usage reader exists. Adding an account
+    also needs an isolated sign-in for that provider, and asking now lets the
+    picker grey out a provider instead of letting the user click it and watch
+    it fail with "isolated login not available". Total: any doubt is False.
+    """
+    api, err = _login_api()
+    if err:
+        return False
+    try:
+        return bool(_call(api, "supported", pid))
+    except Exception:
+        return False
+
+
 def ai_providers_emit():
     """Send the provider registry so the picker names no vendor itself."""
     try:
@@ -881,6 +899,8 @@ def ai_providers_emit():
     except Exception as exc:
         emit("ai_providers", providers=[], err=str(exc))
         return
+    for p in provs:
+        p["login"] = p.get("status") == "live" and _login_capable(p.get("id"))
     emit("ai_providers", providers=provs, err="" if provs else "unavailable")
 
 

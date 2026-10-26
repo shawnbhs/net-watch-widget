@@ -39,14 +39,14 @@ import ProviderIcon, { providerAccent } from './ProviderIcons.jsx'
 const FALLBACK_PROVIDERS = [
   { id: 'claude', name: 'Claude Code', status: 'live' },
   { id: 'codex', name: 'OpenAI Codex / ChatGPT', status: 'live' },
-  { id: 'cursor', name: 'Cursor', status: 'live' },
-  { id: 'copilot', name: 'GitHub Copilot', status: 'live' },
-  { id: 'windsurf', name: 'Windsurf', status: 'live' },
-  { id: 'devin', name: 'Devin', status: 'live' },
+  { id: 'cursor', name: 'Cursor', status: 'live', login: false },
+  { id: 'copilot', name: 'GitHub Copilot', status: 'live', login: false },
+  { id: 'windsurf', name: 'Windsurf', status: 'live', login: false },
+  { id: 'devin', name: 'Devin', status: 'live', login: false },
   { id: 'replit', name: 'Replit', status: 'planned' },
-  { id: 'kimi', name: 'Kimi Code', status: 'live' },
+  { id: 'kimi', name: 'Kimi Code', status: 'live', login: false },
   { id: 'glm', name: 'GLM Coding Plan', status: 'planned' },
-  { id: 'cline', name: 'Cline', status: 'live' },
+  { id: 'cline', name: 'Cline', status: 'live', login: false },
   { id: 'antigravity', name: 'Google Antigravity', status: 'planned' },
   { id: 'railway', name: 'Railway', status: 'planned' },
 ]
@@ -967,7 +967,11 @@ function ProviderPicker({ providers, onPick, onClose, loading, busy }) {
           <EmptyNote onClear={() => setQ('')}>No provider matches “{q}”</EmptyNote>
         )}
         {shown.map((p) => {
-          const live = p.status === 'live'
+          // `live` = a usage reader exists; `login === false` = the widget
+          // still has no way to sign this provider in, so picking it could
+          // only end in "isolated login not available". Both grey it out.
+          const reader = p.status === 'live'
+          const live = reader && p.login !== false
           const blocked = busy || !live
           return (
             <button
@@ -976,10 +980,12 @@ function ProviderPicker({ providers, onPick, onClose, loading, busy }) {
               disabled={blocked}
               aria-disabled={blocked || undefined}
               onClick={() => { if (!blocked) onPick(p) }}
-              title={p.hint || (live
-                ? `Sign in to ${p.name}`
-                : `${p.name} is registered, but its usage endpoint is not wired up yet, `
-                  + 'so an account added for it could never show a number.')}
+              title={live
+                ? (p.hint || `Sign in to ${p.name}`)
+                : reader
+                  ? `${p.name} has a usage reader, but this widget cannot sign it in yet.`
+                  : `${p.name} is registered, but its usage endpoint is not wired up yet, `
+                    + 'so an account added for it could never show a number.'}
               className={'flex w-full items-start gap-1 rounded-[5px] px-1.5 py-[3px] text-left '
                 + 'transition ' + FOCUS_RING
                 + (live
@@ -1007,7 +1013,7 @@ function ProviderPicker({ providers, onPick, onClose, loading, busy }) {
                     className="glass-text shrink-0 rounded-full border border-edge-soft
                                bg-white/[0.06] px-1 text-[9px] leading-snug text-faint"
                   >
-                    not wired up yet
+                    {reader ? 'sign-in not available yet' : 'not wired up yet'}
                   </span>
                 )}
               </span>

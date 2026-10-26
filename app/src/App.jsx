@@ -945,9 +945,9 @@ function Full({ s, copy, ipChanged, rfChanged }) {
         </Card>
 
         <Card id="ping" {...rise('85ms', 'py-2.5')}>
-          <PingTarget host="1.1.1.1" ms={net?.ping1} loss={net?.loss1} onCopy={copy(net?.ping1)} />
+          <PingTarget host={net?.host1 || '1.1.1.1'} ms={net?.ping1} loss={net?.loss1} onCopy={copy(net?.ping1)} />
           <div className="mt-1.5" />
-          <PingTarget host="8.8.8.8" ms={net?.ping2} loss={net?.loss2} onCopy={copy(net?.ping2)} />
+          <PingTarget host={net?.host2 || '8.8.8.8'} ms={net?.ping2} loss={net?.loss2} onCopy={copy(net?.ping2)} />
         </Card>
       </Pair>
 

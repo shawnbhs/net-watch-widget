@@ -24,6 +24,7 @@ const path = require('node:path')
 const fs = require('node:fs')
 const pets = require('./pets')
 const { createDayLog } = require('./daylog')
+const fsgate = require('./fsgate')
 
 const ROOT = path.join(__dirname, '..', '..')
 const DEV = process.argv.includes('--dev')
@@ -1678,7 +1679,8 @@ const FS_HIDE = process.env.NET_WATCH_FULLSCREEN_HIDE !== '0'
 const FG_SILENCE_MS = 6000
 let fsHidden = false
 let fgLastAt = 0
-let fgLastHwnd = 0
+let gate = fsgate.initialGate()
+let gateTimer = null
 
 function widgetHwnd() {
   try {
@@ -1692,13 +1694,26 @@ function announceWidget() {
   if (win && !win.isDestroyed()) toSidecar({ cmd: 'fg_widget', hwnd: widgetHwnd() })
 }
 
+// Reports are debounced by fsgate.js (no flicker while a window resizes into
+// full screen, alt+tab's own surface ignored); this only carries out its verdict.
+let lastFg = null
+
 function onForeground(msg) {
   fgLastAt = Date.now()
+  if (msg && !msg.transient) lastFg = msg
+  runGate(msg)
+}
+
+function runGate(msg) {
+  clearTimeout(gateTimer)
+  gateTimer = null
   if (!win || win.isDestroyed()) return
-  if (FS_HIDE && msg.full && !fsHidden) hideForFullscreen(msg)
-  else if (!msg.full && fsHidden) showAfterFullscreen(`foreground is ${msg.cls || '?'}`)
-  else if (!msg.full && !fsHidden && msg.hwnd !== fgLastHwnd) raiseWidget()
-  fgLastHwnd = msg.hwnd
+  const r = fsgate.stepGate(gate, msg, Date.now(), FS_HIDE)
+  gate = r.gate
+  if (r.action === 'hide' && !fsHidden) hideForFullscreen(lastFg || msg || {})
+  else if (r.action === 'show' && fsHidden) showAfterFullscreen(`foreground is ${lastFg?.cls || '?'}`)
+  else if (r.action === 'raise' && !fsHidden) raiseWidget()
+  if (r.waitMs) gateTimer = setTimeout(() => runGate(null), r.waitMs)
 }
 
 function hideForFullscreen(msg) {
@@ -1711,6 +1726,7 @@ function hideForFullscreen(msg) {
 
 function showAfterFullscreen(why) {
   fsHidden = false
+  gate = { ...gate, hidden: false, wish: null }   // forced shows reset the gate too
   console.error('[fullscreen] shown again --', why)
   if (!win || win.isDestroyed()) return
   win.showInactive()

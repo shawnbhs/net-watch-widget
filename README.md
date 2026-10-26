@@ -249,7 +249,11 @@ The one exception is a full-screen app on the same monitor: a game, a
 full-screen video player, a browser in F11 or a YouTube video in full screen,
 a terminal in F11. While that window is in front the widget hides; alt+tab,
 Esc or F11 again brings it straight back. A maximised window with a title bar
-does not count. Full screen on another monitor does not hide it either. Set
+does not count. Full screen on another monitor does not hide it either, and
+neither does Windows' own alt+tab or Task View screen. To avoid flicker while a
+window resizes into full screen, it hides only after the full screen has held
+for 0.7 s, and comes back 0.25 s after you switch to another window (1.2 s
+when the same window just leaves full screen). Set
 `NET_WATCH_FULLSCREEN_HIDE=0` to keep it visible always.
 
 ### Diagnostic log

@@ -2411,6 +2411,14 @@ def stdin_loop():
 
 _FG = {"widget": 0}
 _SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+# Windows' own passing surfaces: alt+tab, Task View, Start/Search, the input
+# switcher. Several cover the whole monitor while they are up, and none of them
+# is somewhere the user is watching something. Reported as `transient` so the
+# shell neither hides nor shows nor re-raises for them.
+_TRANSIENT_CLASSES = {"XamlExplorerHostIslandWindow", "MultitaskingViewFrame",
+                      "TaskSwitcherWnd", "ForegroundStaging",
+                      "Windows.UI.Core.CoreWindow",
+                      "Shell_InputSwitchTopLevelWindow"}
 _QUNS_FULLSCREEN = {3, 4}   # QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
 
 
@@ -2513,7 +2521,8 @@ def fg_loop():
             full, hwnd, cls, why = False, 0, "", ""
         now = time.monotonic()
         if (full, hwnd) != last or now - sent >= 2:
-            emit("fg", full=full, hwnd=hwnd or 0, cls=cls, why=why)
+            emit("fg", full=full, hwnd=hwnd or 0, cls=cls, why=why,
+                 transient=cls in _TRANSIENT_CLASSES)
             last, sent = (full, hwnd), now
         _STOP.wait(0.5)
 

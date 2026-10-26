@@ -18,7 +18,7 @@
 // The renderer measures its own cards and reports their rectangles; `syncPanes`
 // keeps one acrylic window under each.
 
-const { app, BrowserWindow, ipcMain, screen, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, screen, shell, powerMonitor } = require('electron')
 const { spawn } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
@@ -59,6 +59,11 @@ function createWindow() {
   tabEdge = EDGES.includes(saved?.edge) ? saved.edge : 'top'
   tabAlong = ALONGS.includes(saved?.along) ? saved.along : 'end'
   freePos = saved ? clampToScreen(saved, FULL_SIZE) : defaultFree(FULL_SIZE)
+  home = validHome(saved?.home)
+  if (home) {
+    if (findDisplay(home)) freePos = clampToScreen({ x: home.x, y: home.y }, FULL_SIZE)
+    else displaced = true
+  }
   tabSize = saved?.tabW && saved?.tabH
     ? { width: saved.tabW, height: saved.tabH }
     : null
@@ -89,6 +94,9 @@ function createWindow() {
     hasShadow: false,
     resizable: false,
     maximizable: false,
+    // No taskbar button (skipTaskbar), so a minimised widget has no way back:
+    // it sits at -32000,-32000 until the process is killed.
+    minimizable: false,
     fullscreenable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
@@ -139,6 +147,10 @@ function createWindow() {
   })
 
   win.on('move', onWindowMove)
+  // Show-desktop (Win+D) and friends minimise it anyway; put it straight back.
+  win.on('minimize', () => setTimeout(() => {
+    if (win && !win.isDestroyed()) { win.restore(); win.showInactive() }
+  }, 300))
   // The first report, for a page that has not moved yet: without it the
   // renderer has nothing but `window.screen` until the widget is first dragged.
   win.webContents.on('did-finish-load', () => { checkDisplay(); replayToRenderer() })
@@ -1037,11 +1049,20 @@ function snapTab() {
 
 function savePosition() {
   if (!win || win.isDestroyed()) return
+  // A minimised window reports -32000,-32000; saving that would clamp the
+  // widget onto whichever screen happens to be nearest and forget home.
+  if (win.isMinimized()) return
   const [x, y] = win.getPosition()
   // While tabbed, the window's own position is the dock, which is derived from
   // the screen anyway. What has to survive is where the expanded widget was, so
   // that opening the tab puts it back rather than leaving it at the edge.
   const free = tabbed ? (freePos ?? { x, y }) : { x, y }
+  // While the home display is unplugged the widget is only visiting another
+  // screen; overwriting home with that would forget where it belongs.
+  if (!displaced) {
+    const d = screen.getDisplayNearestPoint(free)
+    home = { id: d.id, label: d.label || '', x: free.x, y: free.y }
+  }
   try {
     fs.mkdirSync(path.dirname(POS_FILE), { recursive: true })
     fs.writeFileSync(POS_FILE, JSON.stringify({
@@ -1050,6 +1071,7 @@ function savePosition() {
       edge: tabEdge,
       along: tabAlong,
       scale,
+      ...(home ? { home } : {}),
       // Remembered so the first frame after a tabbed launch is the right shape:
       // the window is positioned from this size, and a guess that is out by
       // fifty pixels puts the tab visibly off its corner until the page has
@@ -1536,6 +1558,86 @@ ipcMain.on('drag-end', () => {
   savePosition()
 })
 
+// ── display hand-off ──────────────────────────────────────────────────────────
+
+/**
+ * The display the widget was put on, and where on it. Kept apart from
+ * `freePos` because unplugging a monitor forces the widget onto another
+ * screen, and that forced spot must not become the remembered one: when the
+ * monitor comes back, the widget goes back to it. Matched by id first, then by
+ * the monitor's name, since Windows can hand a reconnected panel a new id.
+ */
+let home = null
+/** True while the home display is missing and the widget is parked elsewhere. */
+let displaced = false
+let relocateTimer = null
+
+function validHome(h) {
+  if (!h || !Number.isFinite(h.x) || !Number.isFinite(h.y)) return null
+  return { id: h.id, label: typeof h.label === 'string' ? h.label : '', x: h.x, y: h.y }
+}
+
+function findDisplay(h) {
+  if (!h) return null
+  const all = screen.getAllDisplays()
+  return all.find(d => d.id === h.id) ?? (h.label ? all.find(d => d.label === h.label) : null) ?? null
+}
+
+/** Is the window's centre on any attached display at all? */
+function onSomeDisplay(b) {
+  const cx = b.x + b.width / 2
+  const cy = b.y + b.height / 2
+  return screen.getAllDisplays().some(({ bounds: a }) =>
+    cx >= a.x && cx < a.x + a.width && cy >= a.y && cy < a.y + a.height)
+}
+
+/**
+ * Put the widget where it belongs after the set of displays changed: back on
+ * its home display if that just returned, onto the nearest attached one if its
+ * own display just went away, and inside a work area in every case.
+ */
+function relocate(reason) {
+  relocateTimer = null
+  if (!win || win.isDestroyed() || dragging) return
+  if (win.isMinimized()) { win.restore(); win.showInactive() }
+  const b = win.getBounds()
+  const back = findDisplay(home)
+  let target = null
+  if (displaced && back) {
+    displaced = false
+    target = { x: home.x, y: home.y }
+  } else if (!displaced && home && !back) {
+    displaced = true
+    target = tabbed ? (freePos ?? { x: b.x, y: b.y }) : { x: b.x, y: b.y }
+  } else if (!onSomeDisplay(b)) {
+    target = tabbed ? (freePos ?? { x: b.x, y: b.y }) : { x: b.x, y: b.y }
+  }
+  if (!target) return
+  trace('relocate', reason, JSON.stringify(target), displaced)
+  freePos = clampToScreen(target, FULL_SIZE)
+  if (tabbed) win.setBounds(tabBounds(b.width, b.height, freePos))
+  else win.setBounds({ ...clampToScreen(freePos, b), width: b.width, height: b.height })
+  checkDisplay()
+  repositionPanes()
+  savePosition()
+}
+
+/** Windows reshuffles displays in bursts; act once it has settled. */
+function scheduleRelocate(reason) {
+  clearTimeout(relocateTimer)
+  relocateTimer = setTimeout(() => relocate(reason), 800)
+}
+
+function watchDisplays() {
+  screen.on('display-added', () => scheduleRelocate('display-added'))
+  screen.on('display-removed', () => scheduleRelocate('display-removed'))
+  screen.on('display-metrics-changed', () => scheduleRelocate('display-metrics'))
+  // A lid closed on one desk and opened at another may deliver no display
+  // event at all, only a resume.
+  powerMonitor.on('resume', () => scheduleRelocate('resume'))
+  powerMonitor.on('unlock-screen', () => scheduleRelocate('unlock'))
+}
+
 // ── lifecycle ─────────────────────────────────────────────────────────────────
 
 if (!app.requestSingleInstanceLock()) {
@@ -1544,6 +1646,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => win?.show())
   app.whenReady().then(() => {
     createWindow()
+    watchDisplays()
     startSidecar()
   })
   app.on('window-all-closed', () => app.quit())

@@ -26,7 +26,9 @@ const providers = {
   },
   codex: {
     label: 'OpenAI Codex',
-    accent: '#10A37F',
+    // Blue rather than OpenAI green: next to Claude's orange on the tab the
+    // two must never be mistaken for each other.
+    accent: '#3B82F6',
     kind: 'stroke',
     // A shell prompt. Codex is a CLI first, and the knot in OpenAI's mark turns
     // to mush below 20px.

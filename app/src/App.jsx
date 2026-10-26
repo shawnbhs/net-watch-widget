@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { PaneProvider, usePaneSync, usePaneHold, usePaneSuspend } from './panes.jsx'
 import { useSidecar, send } from './useSidecar.js'
 import { Card, CardHead, Cell, Figure, Pair, Pill, PrimaryButton, Row } from './components/Glass.jsx'
@@ -9,6 +9,7 @@ import { SectionIcon } from './components/Icons.jsx'
 import { CountryChip } from './components/Country.jsx'
 import { PetsCard } from './components/Pets.jsx'
 import { AiAccounts } from './components/AiAccounts.jsx'
+import ProviderIcon, { providerAccent, providerLabel } from './components/ProviderIcons.jsx'
 import { PetsProvider, useOverlaySync } from './pets/store.jsx'
 import { PetLayer } from './pets/PetLayer.jsx'
 
@@ -1393,24 +1394,233 @@ const TAB_PAD = {
    up after the dock itself already works. */
 const HORIZONTAL_EDGES = ['top', 'bottom']
 
+/* ── AI dials on the tab, chosen by the user ──────────────────────────────────
+
+   The tab used to hard-wire Claude and Codex. Now it shows nothing until the
+   user adds an AI with the "+" button, and each added AI can also show its
+   weekly window as a second, thinner ring. The choice lives in localStorage so
+   it survives restarts; it is a view preference, not data, so the sidecar never
+   sees it. Each AI is drawn in its own brand colour (ProviderIcons is the one
+   source of those colours). */
+const MINI_AI_KEY = 'nw.miniAi.v1'
+
+function loadMiniAi() {
+  try {
+    const v = JSON.parse(localStorage.getItem(MINI_AI_KEY) ?? '[]')
+    if (!Array.isArray(v)) return []
+    const seen = new Set()
+    const out = []
+    for (const x of v) {
+      if (!x || typeof x.id !== 'string' || seen.has(x.id)) continue
+      seen.add(x.id)
+      out.push({ id: x.id, week: Boolean(x.week) })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+function useMiniAi() {
+  const [list, setList] = useState(loadMiniAi)
+  const update = useCallback((fn) => {
+    setList((cur) => {
+      const next = fn(cur)
+      try { localStorage.setItem(MINI_AI_KEY, JSON.stringify(next)) } catch { /* private mode */ }
+      return next
+    })
+  }, [])
+  return [list, update]
+}
+
+/** Which AIs can be added: every provider with a registered account or a legacy reading. */
+function miniAiOptions(ai, chosen) {
+  const ids = []
+  const add = (id) => { if (id && !ids.includes(id)) ids.push(id) }
+  // The sidecar always sends both legacy keys; `setup` means no login exists.
+  if (ai?.claude && !ai.claude.setup) add('claude')
+  if (ai?.codex && !ai.codex.setup) add('codex')
+  for (const r of Array.isArray(ai?.accounts) ? ai.accounts : []) add(r?.provider)
+  for (const c of chosen) add(c.id)
+  return ids
+}
+
+const LEGACY_WINDOWS = {
+  claude: [['session_pct', '5h'], ['week_pct', 'week']],
+  codex: [['sess_pct', '5h'], ['week_pct', 'week']],
+}
+
+/**
+ * The short-window and weekly readings for one provider.
+ *
+ * Claude and Codex keep reading the legacy pair, which carries the
+ * last-known-value hold the tab already relied on. Every other provider reads
+ * its first account in the accounts array that has numbers in it.
+ */
+function miniAiReading(ai, id) {
+  const legacy = LEGACY_WINDOWS[id] ? ai?.[id] : null
+  if (legacy) {
+    return {
+      session: aiDial(legacy, LEGACY_WINDOWS[id]),
+      week: aiDial(legacy, [['week_pct', 'week']]),
+      note: aiNote(legacy),
+    }
+  }
+  const rows = (Array.isArray(ai?.accounts) ? ai.accounts : []).filter((r) => r?.provider === id)
+  const row = rows.find((r) => r?.usage && (!r.error || r.held))
+    ?? rows.find((r) => r?.usage) ?? rows[0]
+  const u = row?.usage && typeof row.usage === 'object' ? row.usage : null
+  const held = Boolean(row?.error && row?.held)
+  const usable = u && (!row.error || held)
+  let session = { value: null, label: '5h', held: false }
+  if (usable) {
+    const key = ['session_pct', 'sess_pct'].find((k) => u[k] != null)
+      ?? Object.keys(u).find((k) => k.endsWith('_pct') && k !== 'week_pct' && typeof u[k] === 'number')
+      ?? (u.week_pct != null ? 'week_pct' : null)
+    if (key) {
+      const label = key === 'session_pct' || key === 'sess_pct' ? '5h' : key.slice(0, -4).replace(/_/g, ' ')
+      session = { value: u[key], label, held }
+    }
+  }
+  const week = usable && u.week_pct != null
+    ? { value: u.week_pct, label: 'week', held }
+    : { value: null, label: 'week', held: false }
+  let note = 'no reading yet'
+  if (!row) note = 'no account added'
+  else if (row.needs_login) note = 'login expired'
+  else if (row.error) note = String(row.error).startsWith('LOGIN_EXPIRED') ? 'login expired' : String(row.error)
+  return { session, week, note }
+}
+
+function MiniCheck({ on, color, disabled }) {
+  return (
+    <span
+      className={'grid h-[13px] w-[13px] shrink-0 place-items-center rounded-[4px] border '
+        + (disabled ? 'opacity-35 ' : '')}
+      style={{
+        borderColor: on ? color : 'rgba(255,255,255,0.4)',
+        background: on ? color : 'transparent',
+      }}
+    >
+      {on && (
+        <svg viewBox="0 0 12 12" className="h-[9px] w-[9px]" fill="none" stroke="white" strokeWidth="2">
+          <path d="M2.5 6.3l2.3 2.2 4.7-5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      )}
+    </span>
+  )
+}
+
+/**
+ * The editor that opens from the "+" on the tab: one line per AI, a tick to
+ * show it on the tab and a second tick for its weekly ring. `data-tab-ui`
+ * keeps the tab's drag/expand handling off these controls.
+ */
+function MiniAiPicker({ options, chosen, onSave, onCancel }) {
+  // The ticks edit a draft; nothing reaches the tab until Save, so a stray
+  // click while browsing the list never changes what is shown.
+  const [draft, setDraft] = useState(chosen)
+  const dirty = JSON.stringify(draft) !== JSON.stringify(chosen)
+  const toggle = (id) => setDraft((cur) => (cur.some((c) => c.id === id)
+    ? cur.filter((c) => c.id !== id)
+    : [...cur, { id, week: false }]))
+  const toggleWeek = (id) => setDraft((cur) => cur.map((c) => (c.id === id ? { ...c, week: !c.week } : c)))
+  return (
+    <div
+      data-tab-ui
+      className="flex shrink-0 cursor-default flex-col gap-1 rounded-[10px] border border-white/15 bg-black/30 p-1.5"
+    >
+      {options.length === 0 && (
+        <span className="glass-text whitespace-nowrap px-1 text-[11px] text-faint">
+          No AI accounts yet — add one in the full view
+        </span>
+      )}
+      {options.map((id) => {
+        const on = draft.find((c) => c.id === id)
+        const color = providerAccent(id)
+        return (
+          <div key={id} className="flex items-center gap-1 whitespace-nowrap text-[11px]">
+            <button
+              type="button"
+              onClick={() => toggle(id)}
+              aria-pressed={Boolean(on)}
+              title={on ? `Hide ${providerLabel(id)} from the tab` : `Show ${providerLabel(id)} on the tab`}
+              className="glass-text flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-white/10"
+            >
+              <MiniCheck on={Boolean(on)} color={color} />
+              <ProviderIcon id={id} size={14} />
+              <span className="text-ink-2">{providerLabel(id)}</span>
+            </button>
+            <button
+              type="button"
+              disabled={!on}
+              onClick={() => toggleWeek(id)}
+              aria-pressed={Boolean(on?.week)}
+              title="Also show the weekly usage ring"
+              className={'glass-text ml-auto flex items-center gap-1 rounded-md px-1 py-0.5 '
+                + (on ? 'hover:bg-white/10' : 'cursor-default')}
+            >
+              <MiniCheck on={Boolean(on?.week)} color={color} disabled={!on} />
+              <span className={on ? 'text-muted' : 'text-faint'}>week</span>
+            </button>
+          </div>
+        )
+      })}
+      <div className="mt-0.5 flex items-center gap-1.5 border-t border-white/10 pt-1.5">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="glass-text rounded-[7px] px-2 py-[4px] text-[11px] text-muted hover:bg-white/10 hover:text-ink"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={() => onSave(draft)}
+          title={dirty ? 'Save and show these on the tab' : 'Nothing changed'}
+          className={'ml-auto flex items-center gap-1 rounded-[7px] border border-white/35 '
+            + 'bg-gradient-to-b from-[#3d95ff] to-[#1f77f0] px-3 py-[4px] text-[11px] font-semibold '
+            + 'text-white shadow-[inset_0_1px_0_rgba(255,255,255,.35)] transition duration-150 '
+            + 'hover:brightness-110 active:scale-[0.96] '
+            + (dirty ? 'ring-2 ring-[#3d95ff]/45' : 'opacity-70')}
+        >
+          <svg viewBox="0 0 12 12" className="h-[9px] w-[9px]" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M2.5 6.3l2.3 2.2 4.7-5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          Save
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function MiniBar({
   s, edge, locked, onExpand, copy, changed,
   scale, maxScale, onScale, onScaleStart, onScaleEnd,
 }) {
   const net = s.net
   const hw = s.hw
-  const cl = s.ai?.claude
-  const gt = s.ai?.codex
   const { up, busy } = s.netstate ?? { up: true, busy: false }
   const ping = pickPing(net)
-  const claude = aiDial(cl, [['session_pct', '5h'], ['week_pct', 'week']])
-  const codex = aiDial(gt, [['sess_pct', '5h'], ['week_pct', 'week']])
+  const [chosen, setChosen] = useMiniAi()
+  const [picking, setPicking] = useState(false)
+  const options = miniAiOptions(s.ai, chosen)
+  const saveAi = (next) => { setChosen(() => next); setPicking(false) }
+  useEffect(() => {
+    if (!picking) return undefined
+    const onKey = (e) => { if (e.key === 'Escape') setPicking(false) }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [picking])
   const rise = useRise()
   const drag = useRef(null)
   const column = !HORIZONTAL_EDGES.includes(edge)
 
   const onDown = (e) => {
     if (e.button !== 0) return
+    // The AI picker and its "+" are ordinary controls: no drag, no capture,
+    // so their own clicks land on them instead of on the card.
+    if (e.target?.closest?.('[data-tab-ui]')) { drag.current = null; return }
     // Whether the press began on the address. The card captures the pointer
     // below, so the click that follows is delivered to the card rather than
     // to the address -- the press target is the only place this survives.
@@ -1455,7 +1665,8 @@ function MiniBar({
   const [copied, setCopied] = useState(false)
   const copiedTimer = useRef(null)
   useEffect(() => () => clearTimeout(copiedTimer.current), [])
-  const onClick = () => {
+  const onClick = (e) => {
+    if (e?.target?.closest?.('[data-tab-ui]')) return
     const d = drag.current
     if (d?.moved) return
     // A click on the address copies it instead of opening the widget, so
@@ -1492,20 +1703,58 @@ function MiniBar({
         <Ring label="CPU" value={hw?.cpu} />
         <Ring label="RAM" value={hw?.ram} />
         <Ring label="GPU" value={hw?.gpu} note={hw?.gpu_raw} />
-        <Ring
-          label={`Claude · ${claude.label}`}
-          hue="ai"
-          value={claude.value}
-          stale={claude.held}
-          note={aiNote(cl)}
-        />
-        <Ring
-          label={`Codex · ${codex.label}`}
-          hue="ai"
-          value={codex.value}
-          stale={codex.held}
-          note={aiNote(gt)}
-        />
+        {chosen.map(({ id, week }) => {
+          const r = miniAiReading(s.ai, id)
+          const name = providerLabel(id)
+          const color = providerAccent(id)
+          return (
+            <Fragment key={id}>
+              <Ring
+                label={`${name} · ${r.session.label}`}
+                color={color}
+                value={r.session.value}
+                stale={r.session.held}
+                note={r.note}
+              />
+              {week && r.session.label !== 'week' && (
+                <Ring
+                  label={`${name} · week`}
+                  color={color}
+                  thin
+                  value={r.week.value}
+                  stale={r.week.held}
+                  note={r.note}
+                />
+              )}
+            </Fragment>
+          )
+        })}
+        <button
+          type="button"
+          data-tab-ui
+          onClick={() => setPicking((p) => !p)}
+          aria-expanded={picking}
+          title={picking ? 'Close without saving' : 'Choose which AI usage to show here'}
+          className={'grid h-[22px] w-[22px] shrink-0 place-items-center rounded-full border '
+            + 'transition-colors duration-200 '
+            + (picking
+              ? 'border-white/60 bg-white/15 text-white'
+              : 'border-white/25 text-white/60 hover:border-white/55 hover:text-white')}
+        >
+          <svg viewBox="0 0 12 12" className="h-[10px] w-[10px]" fill="none" stroke="currentColor" strokeWidth="1.6">
+            {picking
+              ? <path d="M2.8 2.8l6.4 6.4M9.2 2.8l-6.4 6.4" strokeLinecap="round" />
+              : <path d="M6 1.8v8.4M1.8 6h8.4" strokeLinecap="round" />}
+          </svg>
+        </button>
+        {picking && (
+          <MiniAiPicker
+            options={options}
+            chosen={chosen}
+            onSave={saveAi}
+            onCancel={() => setPicking(false)}
+          />
+        )}
 
         <span className={'shrink-0 bg-white/15 ' + (column ? 'h-px w-[20px]' : 'h-[20px] w-px')} />
 
@@ -1657,8 +1906,6 @@ function TabResizeGrip({ column, scale, onScale, onStart, onEnd, max }) {
 function Compact({ s, copy, ipChanged, rfChanged }) {
   const net = s.net
   const hw = s.hw
-  const cl = s.ai?.claude
-  const gt = s.ai?.codex
   const rise = useRise()
   const ping = pickPing(net)
   return (
@@ -1714,37 +1961,107 @@ function Compact({ s, copy, ipChanged, rfChanged }) {
         </div>
       </Card>
 
-      {s.ai && (
-        <Card id="c-ai" {...rise('100ms', 'py-2')}>
-          <div className="flex gap-3 px-3">
-            <Meter
-              label="Claude"
-              value={cl && !cl.err ? cl.session_pct : null}
-              fallback={cl?.setup ? 'setup' : cl?.err ? 'err' : '—'}
-            />
-            <Meter
-              label="Codex"
-              value={gt && !gt.err ? gt.sess_pct : null}
-              fallback={gt?.setup ? 'setup' : gt?.err ? 'err' : '—'}
-            />
-          </div>
-        </Card>
-      )}
+      <Card id="c-ai" {...rise('100ms', 'py-2')}>
+        <CompactAi ai={s.ai} />
+      </Card>
     </>
   )
 }
 
-function Meter({ label, value, fallback }) {
+/** Short names for the compact meters, where a 9.5px caption has ~80px. */
+const SHORT_AI = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', antigravity: 'Antigravity' }
+function shortAi(id) {
+  return SHORT_AI[id] ?? providerLabel(id).split(' ')[0]
+}
+
+/**
+ * The compact view's AI meters: the same user-chosen list as the tab (same
+ * localStorage key), each in its brand colour, with an optional weekly meter
+ * and the same "+" picker with Save.
+ */
+function CompactAi({ ai }) {
+  const [chosen, setChosen] = useMiniAi()
+  const [picking, setPicking] = useState(false)
+  const options = miniAiOptions(ai, chosen)
+  const meters = []
+  for (const { id, week } of chosen) {
+    const r = miniAiReading(ai, id)
+    const color = providerAccent(id)
+    const fallback = r.note === 'login expired' ? 'login' : r.note === 'no reading yet' ? '—' : 'err'
+    meters.push(
+      <Meter
+        key={id}
+        label={`${shortAi(id)} · ${r.session.label}`}
+        value={r.session.value}
+        fallback={fallback}
+        tone={color}
+        title={r.session.value == null ? r.note : undefined}
+      />,
+    )
+    if (week && r.session.label !== 'week') {
+      meters.push(
+        <Meter
+          key={id + ':week'}
+          label={`${shortAi(id)} · week`}
+          value={r.week.value}
+          fallback={fallback}
+          tone={color + 'aa'}
+          title={r.week.value == null ? r.note : undefined}
+        />,
+      )
+    }
+  }
+  return (
+    <div className="flex flex-col gap-2 px-3">
+      <div className="flex items-center gap-3">
+        {meters.length ? (
+          <div className="flex min-w-0 flex-1 flex-wrap gap-x-3 gap-y-2">{meters}</div>
+        ) : (
+          <span className="glass-text min-w-0 flex-1 text-[10.5px] text-faint">
+            Press + to choose which AI usage to show
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => setPicking((v) => !v)}
+          aria-expanded={picking}
+          title={picking ? 'Close without saving' : 'Choose which AI usage to show here'}
+          className={'grid h-[22px] w-[22px] shrink-0 place-items-center rounded-full border '
+            + 'transition-colors duration-200 '
+            + (picking
+              ? 'border-white/60 bg-white/15 text-white'
+              : 'border-white/25 text-white/60 hover:border-white/55 hover:text-white')}
+        >
+          <svg viewBox="0 0 12 12" className="h-[10px] w-[10px]" fill="none" stroke="currentColor" strokeWidth="1.6">
+            {picking
+              ? <path d="M2.8 2.8l6.4 6.4M9.2 2.8l-6.4 6.4" strokeLinecap="round" />
+              : <path d="M6 1.8v8.4M1.8 6h8.4" strokeLinecap="round" />}
+          </svg>
+        </button>
+      </div>
+      {picking && (
+        <MiniAiPicker
+          options={options}
+          chosen={chosen}
+          onSave={(next) => { setChosen(() => next); setPicking(false) }}
+          onCancel={() => setPicking(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+function Meter({ label, value, fallback, tone, title }) {
   const has = value != null
   return (
-    <div className="min-w-0 flex-1">
-      <div className="flex items-baseline justify-between">
-        <span className="glass-text text-[9.5px] uppercase tracking-wide text-muted">{label}</span>
+    <div className="min-w-[72px] flex-1" title={title}>
+      <div className="flex items-baseline justify-between gap-1">
+        <span className="glass-text truncate text-[9.5px] uppercase tracking-wide text-muted">{label}</span>
         <span className={`glass-text text-[10.5px] font-semibold tabular-nums ${pctTone(value)}`}>
           {has ? `${Math.round(value)}%` : (fallback ?? '—')}
         </span>
       </div>
-      <div className="mt-1"><Bar value={value} /></div>
+      <div className="mt-1">{tone ? <Bar value={value} tone={tone} /> : <Bar value={value} />}</div>
     </div>
   )
 }

@@ -16,7 +16,10 @@ const CIRCUMFERENCE = 2 * Math.PI * R
  * matters more, which is that the number is high -- a red ring is a red ring
  * whatever it is measuring.
  */
-function ringColour(pct, hue) {
+function ringColour(pct, hue, color) {
+  // A brand-coloured ring keeps its brand at any level: on the tab the colour
+  // is what says *which* AI it is, so the number's own tone carries the alarm.
+  if (color) return color
   if (pct >= 90) return 'var(--color-bad)'
   if (pct >= 70) return 'var(--color-warn)'
   return hue === 'ai' ? 'var(--color-accent-ai)' : 'var(--color-accent)'
@@ -29,8 +32,11 @@ function ringColour(pct, hue) {
  * `note` explains an absent reading in the tooltip rather than in two
  * characters inside the ring, which is all the space there is.
  */
-export function Ring({ value, label, hue = 'sys', note, stale }) {
+export function Ring({ value, label, hue = 'sys', note, stale, color, thin }) {
   const has = value != null && Number.isFinite(Number(value))
+  // `thin` marks the secondary (weekly) window of an AI: same hue, lighter
+  // stroke, so a pair reads as one provider's two allowances side by side.
+  const width = thin ? 2 : STROKE
   const [pct, el] = useSeededValue(value)
 
   // A stale figure is the last real reading, kept through a failed poll rather
@@ -54,7 +60,7 @@ export function Ring({ value, label, hue = 'sys', note, stale }) {
           r={R}
           fill="none"
           stroke="rgba(255,255,255,0.14)"
-          strokeWidth={STROKE}
+          strokeWidth={width}
         />
         <circle
           ref={el}
@@ -62,8 +68,9 @@ export function Ring({ value, label, hue = 'sys', note, stale }) {
           cy={MID}
           r={R}
           fill="none"
-          stroke={ringColour(pct, hue)}
-          strokeWidth={STROKE}
+          stroke={ringColour(pct, hue, color)}
+          strokeOpacity={thin ? 0.8 : 1}
+          strokeWidth={width}
           strokeLinecap="round"
           strokeDasharray={CIRCUMFERENCE}
           strokeDashoffset={has ? CIRCUMFERENCE * (1 - pct / 100) : CIRCUMFERENCE}

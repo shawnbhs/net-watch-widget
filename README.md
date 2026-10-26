@@ -7,7 +7,22 @@ left?**
 Python gathers the data, React draws it. One PowerShell command to install.
 Starts automatically with Windows and stays out of the way.
 
-![The widget in compact mode](docs/compact.png)
+It has three views of the same data, and you move between them with a click:
+
+**Mini bar** — a tab docked to an edge of the screen:
+
+<img src="docs/mini-bar.png" alt="The mini bar docked to the top edge of the screen" width="640">
+
+<table>
+  <tr>
+    <th>Compact</th>
+    <th>Full</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/compact.png" alt="The widget in compact mode" width="320"></td>
+    <td valign="top"><img src="docs/full.png" alt="The widget in full mode" width="320"></td>
+  </tr>
+</table>
 
 ---
 
@@ -33,30 +48,40 @@ Starts automatically with Windows and stays out of the way.
 ## What it shows
 
 **Mini bar** — a tab docked to an edge of the screen, out of the way of
-everything: a dial each for CPU, RAM, GPU and the two AI allowances, the ping,
-and the adapter dot. It sits on the top, the left or the right edge — a row of
-dials on the top, a column of them down a side — at either end of that edge or
-in the middle of it. Click it to open the widget; drag it to move it, including
-onto a different edge. Nothing is labelled at this size — hover a dial for its
-name — because the point of it is to be glanceable, not readable.
+everything: a dial each for CPU, RAM and GPU, a dial for each AI you have chosen
+to show, the ping, your public IP with its exit country beside it, the adapter
+dot and the VPN chip. It sits on the top, bottom, left or right edge — a row on
+the top and bottom, a column down a side — at either end of that edge or in the
+middle of it. Click it to open the widget; drag it to move it, including onto a
+different edge. Nothing is labelled at this size — hover a dial for its name —
+because the point of it is to be glanceable, not readable.
 
-All five dials are always there, showing a dash until they have a reading, so
-the tab never changes size and never shifts under you. It is the mode the widget
-reopens in if it was the mode you left it in.
+The CPU, RAM and GPU dials are always there, showing a dash until they have a
+reading. The AI dials are your choice — none at first, added with the round
+**+** — so the tab is as long as what you asked it to show. See
+[Choosing which AI usage to show](#choosing-which-ai-usage-to-show). It is the
+mode the widget reopens in if it was the mode you left it in.
 
-**Compact mode** — a single strip: country flag and name, ping, VPN state,
-public IP, ISP, CPU / RAM / GPU, AI usage bars, clock.
+**Compact mode** — a short summary. A title row with the clock and the VPN
+chip; a card with the exit country, public IP, ping and ISP; the Runflare
+address and the local address / gateway side by side; CPU / RAM / GPU bars; and
+bars for the AIs you have chosen, the same choice as the mini bar.
 
 **Full mode** — everything above plus:
 
 | Section | Contents |
 |---|---|
-| Network | public IP, local IP, gateway, DNS, hostname |
+| Network | public IP and the Runflare address, each with its country; local IP and gateway |
 | Latency | round-trip time and packet loss to two hosts |
-| Hardware | CPU, RAM, disk, network throughput |
+| Hardware | CPU, RAM, GPU |
 | Timezone | system timezone against the timezone of your exit IP |
-| AI usage | Claude and Codex quota percentages with reset countdowns |
-| Quick checks | ISP, ASN, proxy/datacenter detection, DNS, a connection score |
+| AI usage | every AI account you have added, with quota percentages and reset countdowns — see [Multiple AI accounts](#multiple-ai-accounts) |
+| Quick checks | ASN, ISP, proxy/VPN and datacenter detection, hostname, DNS, a connection score |
+| Pets | the roster and settings for the optional pets |
+
+The title row in compact and full mode carries the local clock, a second clock
+on Tehran time (`THR`), and the VPN chip — `VPN`, `Direct`, or a dash until the
+first pair of IP lookups is in.
 
 The VPN indicator is not a guess from the IP alone: it cross-checks the
 country reported by a geo-IP lookup against Cloudflare's own edge report, and
@@ -100,12 +125,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 That single command:
 
 1. verifies Python and Node are present,
-2. installs `psutil` if it is missing,
-3. installs the UI's dependencies and builds it — the first run downloads
-   Electron, about 100 MB,
-4. creates `.env` from `.env.example` (all settings optional),
-5. registers the widget to start automatically at login,
-6. starts it.
+2. pins the Python it found in a user environment variable,
+   `NET_WATCH_PYTHON`, so the app starts its data process with that
+   interpreter and not whichever `pythonw.exe` happens to be first on `PATH`,
+3. installs `psutil` if it is missing,
+4. installs the UI's dependencies and builds it — the first run downloads
+   Electron, about 100 MB; if npm blocked Electron's own download script, the
+   installer runs it itself,
+5. creates `.env` from `.env.example` (all settings optional),
+6. registers the widget to start automatically at login,
+7. starts it.
 
 Re-running it is safe — it rebuilds the UI, updates the autostart entry and
 leaves an existing `.env` alone.
@@ -120,8 +149,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -NoAutostart
 
 Windows blocks unsigned scripts by default. The flag applies to this one
 invocation only and changes nothing system-wide. Read `install.ps1` first if
-you would rather not take that on faith — it is about 150 lines and does
-exactly what the list above says.
+you would rather not take that on faith — it is under 300 lines, most of them
+comments, and does exactly what the list above says.
 
 ---
 
@@ -130,14 +159,17 @@ exactly what the list above says.
 - **Drag the title bar** to move it. Position is remembered.
 - **Drag the bottom-right corner** to resize it — the whole widget scales, text
   and all. Double-click that corner to go back to normal size.
-- **Right-click anywhere** to switch between compact and full.
+- **Right-click anywhere** to switch between compact and full. On the mini
+  bar, right-click opens the widget.
 - **Click a readout** — either IP, the local address, the gateway, a latency
   figure — to copy it.
 
-The footer buttons, left to right: mini bar, compact/full, lock position,
-network toggle, refresh, quit. Hover any of them for a tooltip; the two stateful
-ones name the action they will perform, so the network button reads "Cut
-network" while you are connected and "Restore network" while you are not.
+The footer starts with the adapter dot and its state (*network up*,
+*network cut*, *working…*). The buttons after it, left to right: resize, mini
+bar, compact/full, lock position, network toggle, refresh, quit. Hover any of
+them for a tooltip; the stateful ones name the action they will perform, so the
+network button reads "Cut network" while you are connected and "Restore
+network" while you are not.
 
 ### Resizing it
 
@@ -147,11 +179,17 @@ fixed-width column of hand-picked type sizes and a wider one would only leave
 small text stranded in the middle of big panels. Double-click the grip to
 return to 100%. The size is remembered, and the mini bar inherits it.
 
-It grows to **twice** normal size, and shrinks only about 8%. The floor is a
-Windows limit rather than a preference: the frosted panel behind each card is a
-window, and Windows will not make a window shorter than 39 pixels, so below
-roughly 90% the frost behind the thinnest cards would stand slightly proud of
-them.
+The corner is a small target, so the **resize** button in the footer opens a
+full-width bar that does the same thing: drag anywhere along it, and it shows
+the current size and how large this screen allows. The mini bar has its own
+small grip at the end of the tab, with the same drag and the same double-click
+reset.
+
+It grows as large as the current screen can hold, and shrinks to 35%. Below
+92% the frosted panels are switched off and the cards are drawn without them:
+each frosted panel is a separate window, Windows will not make a window
+shorter than 39 pixels, and below that point the frost behind the thinnest
+cards would stand proud of them.
 
 ### The mini bar
 
@@ -159,15 +197,50 @@ The ↑ button collapses the widget to a tab on the edge of the screen.
 **Click the tab** to open it again — it returns to wherever you had dragged the
 widget, not to the edge. Locking the position stops the drag but not the click.
 
-**Drag the tab** to move it. Letting go parks it on the nearest of nine docks:
-the top, left or right edge, at the start, the middle or the end of it. It
-changes shape to suit — a row of dials along the top, a column down a side — and
-it can be carried to another monitor on the way.
+**Drag the tab** to move it. Letting go parks it on the nearest of twelve
+docks: the top, bottom, left or right edge, at the start, the middle or the end
+of it. It changes shape to suit — a row along the top or bottom, a column down a
+side — and it can be carried to another monitor on the way. On the bottom edge
+the tab sits on top of the taskbar, never over it.
+
+**Click the IP on the tab** to copy it; the digits change colour briefly to say
+it worked. A drag that starts on the IP still moves the tab, and a click
+anywhere else on the tab still opens the widget. If the exit address changes,
+the tab turns red the same way the IP card does.
 
 The tab deliberately overhangs its edge by a few pixels. Windows rounds the
 corners of the frosted panel behind it and gives no way to ask for square ones,
 so the overhang is what puts that rounding out of sight and lets the tab meet
 the edge cleanly.
+
+### Choosing which AI usage to show
+
+The mini bar and the compact view show no AI usage until you pick it, because
+which plans matter is yours to say, and an unused account's dial is only noise.
+Compact says so: *"Press + to choose which AI usage to show"*.
+
+The round **+** opens a list of every AI that has an account in the widget —
+see [Multiple AI accounts](#multiple-ai-accounts) for adding one. While it is
+open the tab grows to hold it, and the **+** turns into **×**.
+
+- Tick an AI to show its current usage window (the 5-hour one, for Claude and
+  Codex).
+- Tick **week** beside it to add that AI's weekly window as well. On the mini
+  bar it is a second, thinner ring; in compact it is a second, lighter bar.
+- Nothing changes until you press the blue **Save** in the box. **Cancel**, the
+  **×**, or Escape closes it and throws the ticks away, so browsing the list
+  never changes what is shown.
+
+The choice is shared: the mini bar and compact view always show the same AIs.
+It is kept in the UI's own local storage, so it survives a restart, and the
+data process never sees it.
+
+Each AI is drawn in its own brand colour — Claude orange, Codex blue, the
+others their own — and the ring or bar keeps that colour at any level, so you
+can always tell which AI it is. The warning goes on the number instead: it turns
+amber from 70% and red from 90%.
+
+### Quick checks and AI usage
 
 **Quick checks** fill themselves in a second or two after launch, and again
 whenever your public IP changes. **Run** re-runs them on demand and **Clear**
@@ -271,6 +344,7 @@ pet at once:
 | Control | Range | What it does |
 |---|---|---|
 | Size · all pets | 16–100 px | Drawn height before the widget's own scale; the default is 26 px |
+| Size · this screen | 0.5x–2x | Desktop pets on the monitor the widget is on, only — see below |
 | Speed | 0.2x–2.5x | How fast they move |
 | Liveliness | 0–100 | How much they move about versus lie down — *lazy*, *balanced*, *hyper* |
 | React to the cursor | on/off | Pets notice the pointer and sometimes chase it |
@@ -280,9 +354,17 @@ pet at once:
 
 Two things are per pet rather than global: the **Widget / Screen** switch, and
 what you get by clicking a pet's name in the roster — a **rename** field and a
-**size multiplier** from 0.5x to 4x that rides on top of the global size, so one
+**size multiplier** from 0.1x to 8x that rides on top of the global size, so one
 pet can be made big without dragging everyone else up with it. The slider shows
 both the multiplier and the pixel height it works out to.
+
+**Size · this screen** exists because "the same size" is not the same thing on
+every monitor. Desktop pets are already held at the same physical size on every
+screen, but a monitor at arm's length looks smaller than a laptop panel close
+to you, and the widget cannot measure how far away you sit. So each monitor
+keeps its own adjustment, remembered per monitor even if you unplug it; **Reset**
+forgets this screen's, and **Reset all screens** forgets every one. It does not
+touch pets living on the widget, which are not sized against a screen at all.
 
 Pets on the desktop are drawn about **1.7x** larger than the same figure in the
 widget, because a sprite sized to stand on a 43px-tall card is barely visible
@@ -527,25 +609,29 @@ very account you were trying to repair.
 
 ### Which providers work today
 
-Twelve vendors are registered. **Two of them actually report usage.** The other
-ten are in the picker so the account plumbing, naming and UI are ready for them
-— they are *not* working quota sources, and picking one gets you an account row
-that says **not wired up yet** instead of a number.
+Twelve vendors are registered. **Two of them work end to end today: Claude
+Code and Codex.** The widget can sign them in, import them, and poll them.
+
+Six more have a usage reader in the code but no way in yet. The widget's
+sign-in only knows how to drive the Claude and Codex CLIs, and the startup
+import only reads those two. These six are selectable in the picker, but
+picking one ends with *"isolated login not available for …"* rather than a new
+account. The last four are greyed out, labelled, and never polled.
 
 | Provider | Usage today |
 |---|---|
-| Claude Code | **Working** — quota and reset countdown |
-| OpenAI Codex / ChatGPT | **Working** — quota and reset countdown |
-| Cursor | Registered, no usage endpoint yet |
-| GitHub Copilot | Registered, no usage endpoint yet |
-| Windsurf | Registered, no usage endpoint yet |
-| Devin | Registered, no usage endpoint yet |
-| Replit | Registered, no usage endpoint yet |
-| Kimi Code | Registered, no usage endpoint yet |
-| GLM Coding Plan | Registered, no usage endpoint yet |
-| Cline | Registered, no usage endpoint yet |
-| Google Antigravity | Registered, no usage endpoint yet |
-| Railway | Registered, no usage endpoint yet |
+| Claude Code | **Working** — sign-in, import, quota and reset countdown |
+| OpenAI Codex / ChatGPT | **Working** — sign-in, import, quota and reset countdown |
+| Cursor | Usage reader written; the widget cannot add the account yet |
+| GitHub Copilot | Usage reader written; the widget cannot add the account yet |
+| Windsurf | Usage reader written; the widget cannot add the account yet |
+| Devin | Usage reader written; the widget cannot add the account yet |
+| Kimi Code | Usage reader written; the widget cannot add the account yet |
+| Cline | Usage reader written; the widget cannot add the account yet |
+| Replit | Planned — the usage API is Enterprise/admin-only |
+| GLM Coding Plan | Planned — response fields not verified |
+| Google Antigravity | Planned — response shape and Windows credential path unknown |
+| Railway | Planned — consumption billing, no quota window |
 
 If you only want numbers on the screen, register Claude Code and Codex accounts
 and ignore the rest of the list. A planned provider saying *not supported yet*
@@ -686,8 +772,8 @@ the cause.
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
 
-Removes the autostart entry and stops the widget. Delete the folder to remove
-the files, and `%USERPROFILE%\ip_bar_log.txt` for the log.
+Stops the widget and removes the autostart entry and the `NET_WATCH_PYTHON`
+setting. Delete the folder to remove the files, and `%USERPROFILE%\ip_bar_log.txt` for the log.
 
 The log keeps its old name so an existing history is not orphaned; `LOG_FILE`
 in `.env` moves it.
@@ -715,6 +801,11 @@ Claude or Codex CLI. See [AI usage tracking](#ai-usage-tracking).
 The usual cause is an expired refresh token — logging in to the CLI again
 fixes it.
 
+**The mini bar or compact view shows no AI usage.** Nothing is shown until you
+choose it. Press the round **+**, tick the AIs you want, then **Save**. An AI
+appears in that list only once it has an account. See
+[Choosing which AI usage to show](#choosing-which-ai-usage-to-show).
+
 **AI rows say `VPN required`.** The AI providers block some regions, so the
 widget refuses to send a request when it cannot confirm the exit IP is
 outside a blocked one. Connect your VPN and hit Refresh.
@@ -729,7 +820,9 @@ Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Net
 If it is missing or the path is wrong, re-run `install.ps1`.
 
 **Ping shows nothing.** Some networks block ICMP. Point `PING_HOST_1` at your
-own gateway instead.
+own gateway instead. The latency card's labels still read `1.1.1.1` and
+`8.8.8.8` after you do. The labels are fixed text, but the figures under them
+come from the hosts you set.
 
 ---
 
@@ -800,8 +893,14 @@ hold never shortens an existing one, and ↻ does not override a hold.
   both the legacy CLI credentials file and the vault.
 - Offline and transport failures are not rate limits. They add no backoff;
   the poll is just rescheduled.
-- A dead login is retried once an hour and cleared on the next success.
+- A dead login is held for an hour, and nothing at all is sent for it in that
+  time. The card keeps saying the login expired and keeps its sign-in button.
+  It does not say "rate limited", because a fresh sign-in is the one thing that
+  fixes it. Signing in again lifts the hold at once; you do not wait out the
+  hour.
 - The geo check runs against the current IP before every batch of requests.
+  One that fails switches the AI section off with its reason; the next one
+  that passes switches it back on, without waiting for the next poll.
 - A corrupt state file is kept as a `.corrupt` copy and never causes a burst
   of requests.
 

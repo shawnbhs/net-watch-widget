@@ -23,6 +23,7 @@ const { spawn } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
 const pets = require('./pets')
+const { createDayLog } = require('./daylog')
 
 const ROOT = path.join(__dirname, '..', '..')
 const DEV = process.argv.includes('--dev')
@@ -36,6 +37,13 @@ const TRACE = process.argv.includes('--trace')
 const fakeIpAfter = Number(process.argv.find((a) => a.startsWith('--fake-ip='))?.slice(10) || 0)
 let netSeen = 0
 const trace = (...a) => { if (TRACE) console.error(`[t+${Date.now() - T0}ms]`, ...a) }
+
+// One day of diagnostics on disk, cut every morning (see daylog.js). Every
+// console.error in this process already names what went wrong, so the log is
+// fed by mirroring it rather than by a second set of calls that could drift.
+const dayLog = createDayLog({ dir: path.join(app.getPath('userData'), 'logs') })
+const consoleError = console.error.bind(console)
+console.error = (...a) => { consoleError(...a); dayLog.write(...a) }
 
 let win = null
 let sidecar = null
@@ -149,11 +157,16 @@ function createWindow() {
   win.on('move', onWindowMove)
   // Show-desktop (Win+D) and friends minimise it anyway; put it straight back.
   win.on('minimize', () => setTimeout(() => {
-    if (win && !win.isDestroyed()) { win.restore(); win.showInactive() }
+    if (!win || win.isDestroyed()) return
+    console.error('[window] minimised (Show desktop?) -- restored')
+    win.restore()
+    if (!fsHidden) win.showInactive()
   }, 300))
   // The first report, for a page that has not moved yet: without it the
   // renderer has nothing but `window.screen` until the widget is first dragged.
-  win.webContents.on('did-finish-load', () => { checkDisplay(); replayToRenderer() })
+  win.webContents.on('did-finish-load', () => { checkDisplay(); replayToRenderer(); announceWidget() })
+  win.webContents.on('render-process-gone', (_e, d) =>
+    console.error('[renderer] gone', d?.reason, d?.exitCode))
 
   win.webContents.on('did-fail-load', (_e, code, desc, url) =>
     console.error('[load failed]', code, desc, url))
@@ -516,6 +529,7 @@ function syncPanes(rects) {
   // rAF measured before it, or a resize settling afterwards -- and it must not
   // quietly bring them back.
   if (panesSuspended) { lastRects = []; return }
+  if (fsHidden) { lastRects = rects.filter(Boolean); return }
   const origin = win.getBounds()
   const sf = screen.getDisplayMatching(origin).scaleFactor || 1
   // Filtered once, here, so that pane N is always rectangle N: `repositionPanes`
@@ -1105,7 +1119,8 @@ function startSidecar() {
       if (!line) continue
       try {
         const msg = JSON.parse(line)
-        if (msg.t === 'hello') flushStyleQueue()
+        if (msg.t === 'hello') { flushStyleQueue(); announceWidget() }
+        if (msg.t === 'fg') { onForeground(msg); continue }
         // Diagnostic: move the exit address after this many real readings, so
         // the changed-address warning can be seen without waiting for a tunnel
         // to drop. Every later reading carries the same fake value, so it is
@@ -1135,7 +1150,12 @@ function startSidecar() {
 
   sidecar.stderr.setEncoding('utf8')
   sidecar.stderr.on('data', (d) => console.error('[sidecar]', d.trim()))
-  sidecar.on('exit', (code) => console.error('[sidecar] exited', code))
+  sidecar.on('exit', (code) => {
+    console.error('[sidecar] exited', code)
+    // Nobody reports full-screen apps any more; a widget hidden for one must
+    // not stay hidden for good.
+    if (fsHidden) showAfterFullscreen('sidecar exited')
+  })
   sidecar.on('error', (err) => console.error('[sidecar] spawn failed', err.message))
 }
 
@@ -1599,7 +1619,8 @@ function onSomeDisplay(b) {
 function relocate(reason) {
   relocateTimer = null
   if (!win || win.isDestroyed() || dragging) return
-  if (win.isMinimized()) { win.restore(); win.showInactive() }
+  console.error('[relocate]', reason, JSON.stringify(win.getBounds()))
+  if (win.isMinimized()) { win.restore(); if (!fsHidden) win.showInactive() }
   const b = win.getBounds()
   const back = findDisplay(home)
   let target = null
@@ -1638,6 +1659,93 @@ function watchDisplays() {
   powerMonitor.on('unlock-screen', () => scheduleRelocate('unlock'))
 }
 
+// ── full-screen apps ──────────────────────────────────────────────────────────
+//
+// The widget sits at the 'screen-saver' level so a maximised window cannot
+// cover it. That is right while working and wrong over a game, a full-screen
+// film or a YouTube video in F11: there it is a sticker on the picture. The
+// sidecar watches the foreground window and reports whether it covers the whole
+// monitor the widget is on (see fg_loop in sidecar.py); only then is the widget
+// hidden, and it comes back the moment that stops being true -- alt+tab, Esc,
+// F11 again. Off with NET_WATCH_FULLSCREEN_HIDE=0.
+//
+// The same report fixes the opposite complaint. Another always-on-top window
+// opened later lands above this one, and it stays there; so whenever the
+// foreground changes to something that is not full screen, the widget is put
+// back on top.
+
+const FS_HIDE = process.env.NET_WATCH_FULLSCREEN_HIDE !== '0'
+const FG_SILENCE_MS = 6000
+let fsHidden = false
+let fgLastAt = 0
+let fgLastHwnd = 0
+
+function widgetHwnd() {
+  try {
+    const b = win.getNativeWindowHandle()
+    return b.length >= 8 ? Number(b.readBigUInt64LE(0)) : b.readUInt32LE(0)
+  } catch { return 0 }
+}
+
+/** Tell the sidecar which window is ours, so it measures the right monitor. */
+function announceWidget() {
+  if (win && !win.isDestroyed()) toSidecar({ cmd: 'fg_widget', hwnd: widgetHwnd() })
+}
+
+function onForeground(msg) {
+  fgLastAt = Date.now()
+  if (!win || win.isDestroyed()) return
+  if (FS_HIDE && msg.full && !fsHidden) hideForFullscreen(msg)
+  else if (!msg.full && fsHidden) showAfterFullscreen(`foreground is ${msg.cls || '?'}`)
+  else if (!msg.full && !fsHidden && msg.hwnd !== fgLastHwnd) raiseWidget()
+  fgLastHwnd = msg.hwnd
+}
+
+function hideForFullscreen(msg) {
+  fsHidden = true
+  console.error('[fullscreen] hidden --', msg.cls || '?', msg.why || '', 'covers the screen')
+  hidePanes()
+  pets.overlayWindow()?.hide()
+  win.hide()
+}
+
+function showAfterFullscreen(why) {
+  fsHidden = false
+  console.error('[fullscreen] shown again --', why)
+  if (!win || win.isDestroyed()) return
+  win.showInactive()
+  win.setAlwaysOnTop(true, 'screen-saver')
+  pets.overlayWindow()?.showInactive()
+  syncPanes(lastRects)
+}
+
+/** Back above whatever opened since. Never takes focus. */
+function raiseWidget() {
+  if (!win.isVisible()) return
+  for (const pane of pool) {
+    if (pane && !pane.isDestroyed() && pane.isVisible()) pane.moveTop()
+  }
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.moveTop()
+}
+
+function watchLife() {
+  for (const ev of ['suspend', 'resume', 'lock-screen', 'unlock-screen', 'shutdown']) {
+    powerMonitor.on(ev, () => { dayLog.check(); console.error('[power]', ev) })
+  }
+  screen.on('display-added', (_e, d) => console.error('[display] added', d?.label || d?.id))
+  screen.on('display-removed', (_e, d) => console.error('[display] removed', d?.label || d?.id))
+  app.on('child-process-gone', (_e, d) =>
+    console.error('[process] gone', d?.type, d?.reason, d?.exitCode))
+  process.on('uncaughtException', (err) => console.error('[main] uncaught', err))
+  process.on('unhandledRejection', (err) => console.error('[main] unhandled rejection', err))
+  // The cut happens on the clock even on a quiet day with nothing to write.
+  setInterval(() => {
+    dayLog.check()
+    if (fsHidden && Date.now() - fgLastAt > FG_SILENCE_MS) showAfterFullscreen('no foreground report')
+  }, 3000)
+}
+
 // ── lifecycle ─────────────────────────────────────────────────────────────────
 
 if (!app.requestSingleInstanceLock()) {
@@ -1645,12 +1753,16 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', () => win?.show())
   app.whenReady().then(() => {
+    console.error('[start] pid', process.pid, 'electron', process.versions.electron,
+      '-- log cut daily at', dayLog.rotateAt)
+    watchLife()
     createWindow()
     watchDisplays()
     startSidecar()
   })
   app.on('window-all-closed', () => app.quit())
   app.on('before-quit', () => {
+    console.error('[quit]')
     savePosition()
     destroyPanes()
     pets.closeOverlay()

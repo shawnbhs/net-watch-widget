@@ -2310,6 +2310,11 @@ def handle(cmd):
         _ai_now.set()
     elif name == "style_pane":
         style_pane(cmd.get("hwnd"))
+    elif name == "fg_widget":
+        try:
+            _FG["widget"] = int(cmd.get("hwnd") or 0)
+        except (TypeError, ValueError):
+            _FG["widget"] = 0
     elif name == "net_toggle":
         threading.Thread(target=net_toggle, daemon=True).start()
     elif name == "copy":
@@ -2389,10 +2394,134 @@ def stdin_loop():
     _STOP.set()
 
 
+# ── full-screen apps ──────────────────────────────────────────────────────────
+#
+# Electron cannot ask Windows which window is in front, so this loop does and
+# says whether that window fills the whole monitor the widget is on: a game, a
+# full-screen player, a browser in F11 or a YouTube video in full screen. The
+# shell hides the widget while that is true (main.js, "full-screen apps").
+#
+# "Fills the monitor" is judged by rectangle, not by asking the app, because a
+# borderless game and a browser in F11 announce nothing. A maximised window is
+# excluded by IsZoomed: with an auto-hiding taskbar it covers the monitor too,
+# and hiding the widget over every maximised editor would defeat its purpose --
+# unless it has also lost its title bar, which is what F11 does.
+# Exclusive D3D full screen is caught by the shell's own notification state as
+# a second opinion.
+
+_FG = {"widget": 0}
+_SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+_QUNS_FULLSCREEN = {3, 4}   # QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE
+
+
+def fullscreen_covers(win_rect, mon_rect, zoomed, caption=False):
+    """Whether a window is full screen on its monitor.
+
+    It must cover the whole monitor. A maximised window with a title bar is
+    not full screen (an auto-hiding taskbar lets it cover the monitor too);
+    but a window that was maximised before F11 stays "zoomed" while losing its
+    title bar -- Windows Terminal, Chrome -- and that one is full screen.
+    """
+    if zoomed and caption:
+        return False
+    left, top, right, bottom = win_rect
+    m_left, m_top, m_right, m_bottom = mon_rect
+    return (right - left) > 0 and left <= m_left and top <= m_top \
+        and right >= m_right and bottom >= m_bottom
+
+
+def _fg_api():
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),
+                    ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+    u = ctypes.windll.user32
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    u.MonitorFromWindow.restype = ctypes.c_void_p
+    u.MonitorFromWindow.argtypes = [ctypes.c_void_p, wt.DWORD]
+    u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    u.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.RECT)]
+    u.IsZoomed.argtypes = [ctypes.c_void_p]
+    u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    u.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+    try:
+        # Thread-scoped, so nothing else in the sidecar changes: rectangles in
+        # real pixels, the same space for the window and its monitor.
+        u.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        u.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+    return ctypes, wt, u, ctypes.windll.shell32, MONITORINFO
+
+
+def _fg_probe(api, parent):
+    ctypes, wt, u, sh, MONITORINFO = api
+    fg = u.GetForegroundWindow()
+    if not fg:
+        return False, 0, "", ""
+    buf = ctypes.create_unicode_buffer(128)
+    u.GetClassNameW(fg, buf, 128)
+    cls = buf.value
+    pid = wt.DWORD()
+    u.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    if pid.value == parent or cls in _SHELL_CLASSES or not u.IsWindowVisible(fg):
+        return False, fg, cls, ""
+    mon = u.MonitorFromWindow(fg, 2)              # MONITOR_DEFAULTTONEAREST
+    widget = _FG["widget"]
+    if widget and u.MonitorFromWindow(widget, 2) != mon:
+        return False, fg, cls, ""                 # full screen elsewhere is fine
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(MONITORINFO)
+    r = wt.RECT()
+    if not u.GetMonitorInfoW(mon, ctypes.byref(mi)) or not u.GetWindowRect(fg, ctypes.byref(r)):
+        return False, fg, cls, ""
+    m = mi.rcMonitor
+    if fullscreen_covers((r.left, r.top, r.right, r.bottom),
+                         (m.left, m.top, m.right, m.bottom), bool(u.IsZoomed(fg)),
+                         bool(u.GetWindowLongW(fg, -16) & 0x00C00000)):   # WS_CAPTION
+        return True, fg, cls, "rect"
+    q = ctypes.c_int(0)
+    try:
+        if sh.SHQueryUserNotificationState(ctypes.byref(q)) == 0 and q.value in _QUNS_FULLSCREEN:
+            return True, fg, cls, "quns%d" % q.value
+    except Exception:
+        pass
+    return False, fg, cls, ""
+
+
+def fg_loop():
+    """Report the foreground window on change, plus a heartbeat every 2s."""
+    if os.name != "nt":
+        return
+    try:
+        api = _fg_api()
+    except Exception as exc:
+        emit("error", where="fg", err=str(exc))
+        return
+    parent = os.getppid()
+    last, sent = None, 0.0
+    while not _STOP.is_set():
+        try:
+            full, hwnd, cls, why = _fg_probe(api, parent)
+        except Exception:
+            full, hwnd, cls, why = False, 0, "", ""
+        now = time.monotonic()
+        if (full, hwnd) != last or now - sent >= 2:
+            emit("fg", full=full, hwnd=hwnd or 0, cls=cls, why=why)
+            last, sent = (full, hwnd), now
+        _STOP.wait(0.5)
+
+
 def main():
     emit("hello", pid=os.getpid(), refresh=core.REFRESH)
     ai_cache_emit()
-    for target in (net_loop, hw_loop, ai_loop, tz_once, net_adopt, ai_migrate):
+    for target in (net_loop, hw_loop, ai_loop, tz_once, net_adopt, ai_migrate, fg_loop):
         threading.Thread(target=target, daemon=True).start()
     threading.Thread(target=stdin_loop, daemon=True).start()
     emit("ready")

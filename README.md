@@ -240,6 +240,33 @@ others their own — and the ring or bar keeps that colour at any level, so you
 can always tell which AI it is. The warning goes on the number instead: it turns
 amber from 70% and red from 90%.
 
+### Full-screen apps
+
+The widget stays above every normal window, and is put back on top whenever
+another window takes the foreground, so a window opened later cannot bury it.
+
+The one exception is a full-screen app on the same monitor: a game, a
+full-screen video player, a browser in F11 or a YouTube video in full screen,
+a terminal in F11. While that window is in front the widget hides; alt+tab,
+Esc or F11 again brings it straight back. A maximised window with a title bar
+does not count. Full screen on another monitor does not hide it either. Set
+`NET_WATCH_FULLSCREEN_HIDE=0` to keep it visible always.
+
+### Diagnostic log
+
+The shell keeps one day of events in
+`%APPDATA%\net-watch-ui\logs\net-watch.log`: start and quit, errors, sleep,
+wake, lock, monitors added or removed, the widget being moved back on screen,
+Show desktop, and every full-screen hide and show. Read it when the widget
+went missing.
+
+The day starts at 05:30. At that time the file becomes
+`net-watch.yesterday.log`, replacing the previous one, and a new file starts,
+so there are never more than two days on disk. If the laptop was off or
+asleep at 05:30, the cut happens the first moment the widget runs again:
+start-up, wake, unlock, or the next write. A day is capped at 8 MB.
+`NET_WATCH_LOG_ROTATE=HH:MM` moves the cut.
+
 ### Quick checks and AI usage
 
 **Quick checks** fill themselves in a second or two after launch, and again

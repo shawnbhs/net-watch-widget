@@ -67,6 +67,12 @@ contextBridge.exposeInMainWorld('nw', {
     ipcRenderer.on('moving', handler)
     return () => ipcRenderer.off('moving', handler)
   },
+  /**
+   * Let clicks fall through the window (true) or take them again (false).
+   * Called by the page as the pointer crosses between a card and the empty,
+   * transparent space around the cards.
+   */
+  passThrough(on) { ipcRenderer.send('pass-through', on === true) },
   /** Send a command to the Python sidecar (refresh, net_toggle, copy, …). */
   send(cmd) { ipcRenderer.send('cmd', cmd) },
   /** Report measured card rectangles so the acrylic panes can follow them. */

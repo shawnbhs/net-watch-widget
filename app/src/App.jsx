@@ -5,6 +5,7 @@ import { Card, CardHead, Cell, Figure, Pair, Pill, PrimaryButton, Row } from './
 import { Bar, pctTone } from './components/Bar.jsx'
 import { Ring } from './components/Ring.jsx'
 import { resetOf, resetLabel, usageTip } from './resetText.js'
+import { overNothing } from './passThrough.js'
 import { IconButton, NetDot } from './components/Footer.jsx'
 import { SectionIcon } from './components/Icons.jsx'
 import { CountryChip } from './components/Country.jsx'
@@ -276,6 +277,29 @@ function useScaleLimit(shell, scale, mode) {
   }, [shell, mode])
 
   return max
+}
+
+/** Clicks fall through the empty part of the window. See main.js. */
+function usePassThrough() {
+  useEffect(() => {
+    let last = false
+    const set = (v) => {
+      if (v === last) return
+      last = v
+      window.nw?.passThrough?.(v)
+    }
+    // A button held down is a drag or a resize in progress; changing who owns
+    // the mouse in the middle of one would drop it.
+    const onMove = (e) => { if (!e.buttons) set(overNothing(e.target)) }
+    const onLeave = () => set(false)
+    window.addEventListener('mousemove', onMove)
+    document.documentElement.addEventListener('mouseleave', onLeave)
+    return () => {
+      window.removeEventListener('mousemove', onMove)
+      document.documentElement.removeEventListener('mouseleave', onLeave)
+      set(false)
+    }
+  }, [])
 }
 
 function resizeTo(node, tab, delta = 0) {
@@ -597,6 +621,8 @@ function Widget() {
   useLayoutEffect(() => {
     resizeTo(shell.current, miniRef.current)
   }, [scale])
+
+  usePassThrough()
 
   const refresh = useCallback(() => {
     setSpinning(true)

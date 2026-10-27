@@ -1497,6 +1497,17 @@ ipcMain.on('resize', (_e, msg) => {
     return
   }
   trace('resize', `${win.getBounds().height} -> ${h}${tab ? ' (tab)' : ''}`)
+  // A window that ends up bigger than its content leaves a dead, transparent
+  // band around the cards. Say so in the log, so the next report of one comes
+  // with numbers instead of a guess.
+  setTimeout(() => {
+    if (!win || win.isDestroyed() || dragging) return
+    const b = win.getBounds()
+    // DIP rounding at 165% scale alone is a few px; a dead band is tens.
+    if (Math.abs(b.width - w) > 8 || Math.abs(b.height - h) > 8) {
+      console.error(`[resize] asked ${w}x${h}${tab ? ' (tab)' : ''}, window is ${b.width}x${b.height}`)
+    }
+  }, 400)
 
   if (tab) {
     // Written down as soon as it settles, not at quit: this is what lets the
@@ -1564,6 +1575,25 @@ ipcMain.on('drag', (_e, msg) => {
   const [x, y] = win.getPosition()
   win.setPosition(x + dx, y + dy)
 })
+// ── click-through on the empty part of the window ─────────────────────────────
+//
+// The window is a transparent rectangle, and Windows hands every click inside
+// it to the widget -- including clicks on the empty space between and beside
+// the cards, where nothing is drawn. Whenever the window ends up wider or
+// taller than its cards (measured: 671 DIP wide around 372 DIP of cards after
+// a scale change), that space is an invisible wall over whatever is behind it.
+// The page reports whether the pointer is over a card; over nothing, the
+// window ignores the mouse. `forward: true` keeps mousemove arriving, which is
+// how the page notices the pointer coming back onto a card.
+let passing = false
+ipcMain.on('pass-through', (_e, on) => {
+  if (!win || win.isDestroyed()) return
+  const v = on === true
+  if (v === passing) return
+  passing = v
+  win.setIgnoreMouseEvents(v, { forward: true })
+})
+
 ipcMain.on('scale', (_e, value) => {
   const n = Number(value)
   if (!Number.isFinite(n)) return

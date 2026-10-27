@@ -1,4 +1,5 @@
 import { pctTone, useSeededValue } from './Bar.jsx'
+import { resetPhrase } from '../resetText.js'
 
 /* Geometry of the ring, in the SVG's own box, which is also its pixel size.
    A 3.5-unit stroke on a 12.25 radius leaves a 21px hole, enough for three
@@ -32,7 +33,7 @@ function ringColour(pct, hue, color) {
  * `note` explains an absent reading in the tooltip rather than in two
  * characters inside the ring, which is all the space there is.
  */
-export function Ring({ value, label, hue = 'sys', note, stale, color, thin }) {
+export function Ring({ value, label, hue = 'sys', note, stale, color, thin, reset }) {
   const has = value != null && Number.isFinite(Number(value))
   // `thin` marks the secondary (weekly) window of an AI: same hue, lighter
   // stroke, so a pair reads as one provider's two allowances side by side.
@@ -47,7 +48,8 @@ export function Ring({ value, label, hue = 'sys', note, stale, color, thin }) {
       className="relative grid shrink-0 place-items-center"
       style={{ width: SIZE, height: SIZE }}
       title={has
-        ? `${label} · ${Math.round(pct)}%${stale ? ` · last known (${note})` : ''}`
+        ? `${label} · ${Math.round(pct)}%${reset ? ` · ${resetPhrase(reset)}` : ''}`
+          + `${stale ? ` · last known (${note})` : ''}`
         : `${label} · ${note ?? 'no reading yet'}`}
     >
       <svg

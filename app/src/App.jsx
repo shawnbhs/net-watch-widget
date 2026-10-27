@@ -4,6 +4,7 @@ import { useSidecar, send } from './useSidecar.js'
 import { Card, CardHead, Cell, Figure, Pair, Pill, PrimaryButton, Row } from './components/Glass.jsx'
 import { Bar, pctTone } from './components/Bar.jsx'
 import { Ring } from './components/Ring.jsx'
+import { resetOf, resetLabel, usageTip } from './resetText.js'
 import { IconButton, NetDot } from './components/Footer.jsx'
 import { SectionIcon } from './components/Icons.jsx'
 import { CountryChip } from './components/Country.jsx'
@@ -1106,7 +1107,10 @@ function AiCard({ ai, providers, rise }) {
 /** Name, percent, bar and countdown, as one line. */
 function UsageRow({ label, pct, reset, held }) {
   return (
-    <div className={'flex items-center gap-2 px-3 py-[1.5px] ' + (held ? 'opacity-55' : '')}>
+    <div
+      className={'flex items-center gap-2 px-3 py-[1.5px] ' + (held ? 'opacity-55' : '')}
+      title={usageTip(label, pct, resetLabel(reset))}
+    >
       <span className="glass-text w-[84px] shrink-0 truncate text-[10px] text-ink-2">
         {label}
       </span>
@@ -1325,10 +1329,10 @@ function aiDial(a, windows) {
   const held = Boolean(a?.err && a.held)
   if (a && (!a.err || held)) {
     for (const [key, label] of windows) {
-      if (a[key] != null) return { value: a[key], label, held }
+      if (a[key] != null) return { value: a[key], label, held, reset: resetOf(a, key) }
     }
   }
-  return { value: null, label: windows[0][1], held: false }
+  return { value: null, label: windows[0][1], held: false, reset: '' }
 }
 
 /** How far a press may wander before it counts as a drag rather than a click. */
@@ -1458,33 +1462,36 @@ const LEGACY_WINDOWS = {
  * its first account in the accounts array that has numbers in it.
  */
 function miniAiReading(ai, id) {
-  const legacy = LEGACY_WINDOWS[id] ? ai?.[id] : null
-  if (legacy) {
-    return {
-      session: aiDial(legacy, LEGACY_WINDOWS[id]),
-      week: aiDial(legacy, [['week_pct', 'week']]),
-      note: aiNote(legacy),
-    }
-  }
   const rows = (Array.isArray(ai?.accounts) ? ai.accounts : []).filter((r) => r?.provider === id)
   const row = rows.find((r) => r?.usage && (!r.error || r.held))
     ?? rows.find((r) => r?.usage) ?? rows[0]
   const u = row?.usage && typeof row.usage === 'object' ? row.usage : null
+  const legacy = LEGACY_WINDOWS[id] ? ai?.[id] : null
+  if (legacy) {
+    // The legacy block can carry the percent without its countdown (a cached
+    // reading drops the relative time); the account row has it, so borrow it.
+    const session = aiDial(legacy, LEGACY_WINDOWS[id])
+    const week = aiDial(legacy, [['week_pct', 'week']])
+    if (!session.reset) session.reset = resetOf(u, session.label === 'week' ? 'week_pct'
+      : ['session_pct', 'sess_pct'].find((k) => u?.[k] != null))
+    if (!week.reset) week.reset = resetOf(u, 'week_pct')
+    return { session, week, note: aiNote(legacy) }
+  }
   const held = Boolean(row?.error && row?.held)
   const usable = u && (!row.error || held)
-  let session = { value: null, label: '5h', held: false }
+  let session = { value: null, label: '5h', held: false, reset: '' }
   if (usable) {
     const key = ['session_pct', 'sess_pct'].find((k) => u[k] != null)
       ?? Object.keys(u).find((k) => k.endsWith('_pct') && k !== 'week_pct' && typeof u[k] === 'number')
       ?? (u.week_pct != null ? 'week_pct' : null)
     if (key) {
       const label = key === 'session_pct' || key === 'sess_pct' ? '5h' : key.slice(0, -4).replace(/_/g, ' ')
-      session = { value: u[key], label, held }
+      session = { value: u[key], label, held, reset: resetOf(u, key) }
     }
   }
   const week = usable && u.week_pct != null
-    ? { value: u.week_pct, label: 'week', held }
-    : { value: null, label: 'week', held: false }
+    ? { value: u.week_pct, label: 'week', held, reset: resetOf(u, 'week_pct') }
+    : { value: null, label: 'week', held: false, reset: '' }
   let note = 'no reading yet'
   if (!row) note = 'no account added'
   else if (row.needs_login) note = 'login expired'
@@ -1715,6 +1722,7 @@ function MiniBar({
                 value={r.session.value}
                 stale={r.session.held}
                 note={r.note}
+                reset={r.session.reset}
               />
               {week && r.session.label !== 'week' && (
                 <Ring
@@ -1724,6 +1732,7 @@ function MiniBar({
                   value={r.week.value}
                   stale={r.week.held}
                   note={r.note}
+                  reset={r.week.reset}
                 />
               )}
             </Fragment>
@@ -1995,7 +2004,8 @@ function CompactAi({ ai }) {
         value={r.session.value}
         fallback={fallback}
         tone={color}
-        title={r.session.value == null ? r.note : undefined}
+        title={r.session.value == null ? r.note
+          : usageTip(`${providerLabel(id)} · ${r.session.label}`, r.session.value, r.session.reset)}
       />,
     )
     if (week && r.session.label !== 'week') {
@@ -2006,7 +2016,8 @@ function CompactAi({ ai }) {
           value={r.week.value}
           fallback={fallback}
           tone={color + 'aa'}
-          title={r.week.value == null ? r.note : undefined}
+          title={r.week.value == null ? r.note
+            : usageTip(`${providerLabel(id)} · week`, r.week.value, r.week.reset)}
         />,
       )
     }

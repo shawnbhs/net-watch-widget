@@ -277,6 +277,10 @@ start-up, wake, unlock, or the next write. A day is capped at 8 MB.
 whenever your public IP changes. **Run** re-runs them on demand and **Clear**
 blanks them. The five pills below open that IP in an external lookup.
 
+Hover any usage figure -- a ring on the tab, a meter in the compact view or a
+row in the full view -- for the same line: provider, window, percent used and
+how long until it refills, e.g. `Claude Code · week · 32% · resets in 4d 12h`.
+
 **AI usage** polls each provider on its own schedule: Codex every 60 seconds,
 Claude every 3 minutes, every other provider every 5 minutes. The ↻ beside the
 heading forces a poll, at most once every 30 seconds, and never while a

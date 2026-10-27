@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { resetLabel, usageTip } from '../resetText.js'
 import { Bar, pctTone } from './Bar.jsx'
 import ProviderIcon, { providerAccent } from './ProviderIcons.jsx'
 
@@ -554,24 +555,7 @@ function classify(account, planned) {
  * Anything that is neither epoch seconds nor an ISO instant is left alone;
  * some adapters answer with a phrase, and mangling one would lose it.
  */
-function resetLabel(v) {
-  if (v == null || v === '') return ''
-  const s = String(v)
-  let ms = null
-  if (typeof v === 'number' || /^\d{9,}$/.test(s)) ms = Number(v) * 1000
-  else if (!Number.isNaN(Date.parse(s))) ms = Date.parse(s)
-  if (ms == null || Number.isNaN(ms)) return s
-
-  const left = ms - Date.now()
-  if (left <= 0) return 'now'
-  const mins = Math.floor(left / 60000)
-  const d = Math.floor(mins / 1440)
-  const h = Math.floor((mins % 1440) / 60)
-  const m = mins % 60
-  if (d) return `${d}d ${h}h`
-  if (h) return `${h}h ${m}m`
-  return `${m}m`
-}
+// resetLabel lives in ../resetText.js, shared with the tab and compact views.
 
 /** How long this account's stored credential has left, when that is known. */
 function expiryLabel(seconds) {
@@ -1026,10 +1010,13 @@ function ProviderPicker({ providers, onPick, onClose, loading, busy }) {
 }
 
 /** One quota line in the detail pane. Only ever drawn for a real number. */
-function QuotaRow({ label, pct, reset, dim }) {
+function QuotaRow({ label, pct, reset, dim, who }) {
   return (
-    <div className={'flex items-center gap-1.5 py-[1.5px] ' + (dim ? 'opacity-55' : '')}>
-      <span className="glass-text w-[44px] shrink-0 truncate text-[10px] text-ink-2" title={label}>
+    <div
+      className={'flex items-center gap-1.5 py-[1.5px] ' + (dim ? 'opacity-55' : '')}
+      title={usageTip(who ? `${who} · ${label}` : label, pct, reset)}
+    >
+      <span className="glass-text w-[44px] shrink-0 truncate text-[10px] text-ink-2">
         {label}
       </span>
       <span className={'glass-text w-[28px] shrink-0 text-right text-[10.5px] font-medium '
@@ -1037,7 +1024,7 @@ function QuotaRow({ label, pct, reset, dim }) {
         {`${Math.round(pct)}%`}
       </span>
       <span className="w-[44px] shrink-0"><Bar value={pct} /></span>
-      <span className="glass-text min-w-0 flex-1 truncate text-[9.5px] text-faint" title={reset || undefined}>
+      <span className="glass-text min-w-0 flex-1 truncate text-[9.5px] text-faint">
         {reset ? `resets ${reset}` : ''}
       </span>
     </div>
@@ -1219,7 +1206,7 @@ function AccountDetail({ account, providers, busy, onCommand }) {
           </div>
         ) : rows.length ? (
           rows.map((r) => (
-            <QuotaRow key={r.key} label={r.label} pct={r.pct} reset={r.reset} dim={Boolean(account.held)} />
+            <QuotaRow key={r.key} label={r.label} pct={r.pct} reset={r.reset} dim={Boolean(account.held)} who={name} />
           ))
         ) : (
           <div className="glass-text break-words text-[10px] leading-snug text-faint">

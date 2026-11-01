@@ -1031,6 +1031,25 @@ function QuotaRow({ label, pct, reset, dim, who }) {
   )
 }
 
+/** A pencil drawn in the same 2px round stroke as the section icons. */
+function PencilGlyph() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="9"
+      height="9"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16zM13.5 6.5l4 4" />
+    </svg>
+  )
+}
+
 /**
  * The selected account: what it is, what it has left, and what is wrong.
  *
@@ -1045,9 +1064,17 @@ function AccountDetail({ account, providers, busy, onCommand }) {
   const [draft, setDraft] = useState('')
   const [confirmingRemove, setConfirmingRemove] = useState(false)
   const input = useRef(null)
+  // True once the open rename has been saved or abandoned. Enter and Escape
+  // both unmount the input, and the blur that can follow must not send the
+  // rename a second time, or send one Escape meant to throw away.
+  const renameSettled = useRef(true)
 
   useEffect(() => { setRenaming(false); setConfirmingRemove(false) }, [account?.id])
-  useEffect(() => { if (renaming) input.current?.focus() }, [renaming])
+  useEffect(() => {
+    if (!renaming) return
+    input.current?.focus()
+    input.current?.select()
+  }, [renaming])
   // A command in flight is exactly the moment a stale confirm prompt must not
   // survive: the click that follows it would resend a remove for whatever
   // account is selected by then, not the one the user meant.
@@ -1069,7 +1096,21 @@ function AccountDetail({ account, providers, busy, onCommand }) {
   const name = providerName(providers, account.provider)
   const expiry = expiryLabel(account.expires_at)
 
+  const startRename = () => {
+    setConfirmingRemove(false)
+    setDraft(account.label || '')
+    renameSettled.current = false
+    setRenaming(true)
+  }
+
+  const cancelRename = () => {
+    renameSettled.current = true
+    setRenaming(false)
+  }
+
   const commit = () => {
+    if (renameSettled.current) return
+    renameSettled.current = true
     const next = draft.trim()
     setRenaming(false)
     if (next && next !== account.label) {
@@ -1091,7 +1132,7 @@ function AccountDetail({ account, providers, busy, onCommand }) {
             onBlur={commit}
             onKeyDown={(e) => {
               if (e.key === 'Enter') commit()
-              if (e.key === 'Escape') setRenaming(false)
+              if (e.key === 'Escape') cancelRename()
             }}
             className="glass-text min-w-0 flex-1 rounded-[6px] border border-edge-soft bg-white/[0.06]
                        px-1.5 py-[1px] text-[10.5px] text-ink outline-none focus:border-white/35"
@@ -1101,7 +1142,7 @@ function AccountDetail({ account, providers, busy, onCommand }) {
             type="button"
             disabled={busy}
             title={busy ? 'Waiting for the last command' : 'Click to rename this account'}
-            onClick={() => { setDraft(account.label || ''); setRenaming(true) }}
+            onClick={startRename}
             className={'glass-text min-w-0 flex-1 break-words text-left text-[10.5px] font-semibold '
               + 'leading-snug text-ink transition '
               + (busy ? 'cursor-default opacity-60' : 'hover:text-accent-2')}
@@ -1121,6 +1162,21 @@ function AccountDetail({ account, providers, busy, onCommand }) {
             + (busy ? 'cursor-default text-faint' : 'text-muted hover:text-accent')}
         >
           &#8635;
+        </button>
+        {/* Clicking the name also renames, but nothing on screen says so; two
+            accounts with the same default label stayed indistinguishable
+            because nobody found it. This is the visible way in. */}
+        <button
+          type="button"
+          disabled={busy || renaming}
+          aria-label="Rename"
+          title={busy ? 'Waiting for the last command' : 'Rename this account'}
+          onClick={startRename}
+          className={'flex shrink-0 items-center gap-[2px] rounded-[4px] px-1 text-[9px] leading-none transition '
+            + (busy || renaming ? 'cursor-default text-faint' : 'text-muted hover:bg-white/10 hover:text-accent')}
+        >
+          <PencilGlyph />
+          Rename
         </button>
         {/* This used to be a bare "×" glyph the same size and colour as the
             refresh "↻" beside it, one pixel apart, with no confirmation --

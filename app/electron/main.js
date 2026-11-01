@@ -900,32 +900,59 @@ function alongStop(origin, extent, size) {
  * is the one place that cannot be trusted -- see `workAreaAt`.
  *
  * Each edge pins one coordinate and lets `alongStop` choose the other. The
- * pinned one is pushed TAB_BLEED px past the work area, outwards: negative at
- * the top and left, past the far corner at the bottom and right, so the tab
- * hangs off the screen by the same amount whichever edge it is on.
+ * pinned one is pushed past the work area, outwards, by `bleedFor`: negative
+ * at the top and left, past the far corner at the bottom and right, so the tab
+ * hangs off the screen by the same amount whichever edge it is on -- unless
+ * that edge is a seam with another monitor, where it sits flush instead.
  */
 function tabBounds(width, height, at) {
   const area = workAreaAt(at)
+  const displays = screen.getAllDisplays().map((d) => d.bounds)
   switch (tabEdge) {
-    case 'top':
-      return { x: alongStop(area.x, area.width, width), y: area.y - TAB_BLEED, width, height }
-    case 'bottom':
-      return {
-        x: alongStop(area.x, area.width, width),
-        y: area.y + area.height + TAB_BLEED - height,
-        width,
-        height,
-      }
-    case 'left':
-      return { x: area.x - TAB_BLEED, y: alongStop(area.y, area.height, height), width, height }
-    default:
-      return {
-        x: area.x + area.width + TAB_BLEED - width,
-        y: alongStop(area.y, area.height, height),
-        width,
-        height,
-      }
+    case 'top': {
+      const r = { x: alongStop(area.x, area.width, width), y: area.y, width, height }
+      return { ...r, y: r.y - bleedFor('top', r, displays) }
+    }
+    case 'bottom': {
+      const r = { x: alongStop(area.x, area.width, width), y: area.y + area.height - height, width, height }
+      return { ...r, y: r.y + bleedFor('bottom', r, displays) }
+    }
+    case 'left': {
+      const r = { x: area.x, y: alongStop(area.y, area.height, height), width, height }
+      return { ...r, x: r.x - bleedFor('left', r, displays) }
+    }
+    default: {
+      const r = { x: area.x + area.width - width, y: alongStop(area.y, area.height, height), width, height }
+      return { ...r, x: r.x + bleedFor('right', r, displays) }
+    }
   }
+}
+
+/**
+ * How far the tab may hang past `edge`: TAB_BLEED, or 0 on a monitor seam.
+ *
+ * `rect` is the tab placed flush against its work-area edge; `displays` is
+ * every display's `bounds`. The bleed is the TAB_BLEED-wide strip just beyond
+ * that edge, along the tab's own span. On a bare screen edge those pixels are
+ * off every display, and behind the taskbar they are on the tab's *own*
+ * display -- both fine, both the intended effect. But on a seam they belong to
+ * the neighbouring monitor, where the overhang is not cut off at all and shows
+ * as a thin strip of the card's border on the wrong screen. So: any display
+ * that does not hold the tab itself and overlaps that strip means no bleed.
+ * Pure, so the tests can feed it a desktop.
+ */
+function bleedFor(edge, rect, displays) {
+  const strip = {
+    top: { x: rect.x, y: rect.y - TAB_BLEED, width: rect.width, height: TAB_BLEED },
+    bottom: { x: rect.x, y: rect.y + rect.height, width: rect.width, height: TAB_BLEED },
+    left: { x: rect.x - TAB_BLEED, y: rect.y, width: TAB_BLEED, height: rect.height },
+    right: { x: rect.x + rect.width, y: rect.y, width: TAB_BLEED, height: rect.height },
+  }[edge]
+  if (!strip) return TAB_BLEED
+  const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width
+    && a.y < b.y + b.height && b.y < a.y + a.height
+  const neighbour = (displays ?? []).some((d) => d && !overlaps(d, rect) && overlaps(d, strip))
+  return neighbour ? 0 : TAB_BLEED
 }
 
 /**
@@ -1007,7 +1034,7 @@ let dropPoint = null
  * again, once per drop.
  *
  * On the top and left edges that is invisible, because the coordinate those
- * docks pin -- `area.y - TAB_BLEED`, `area.x - TAB_BLEED` -- does not mention
+ * docks pin -- `area.y - bleed`, `area.x - bleed` -- does not mention
  * the size at all. The bottom and right docks pin the *far* edge instead, by
  * subtracting the size from it, so every phantom pixel of height comes straight
  * back out as position: each drop on the bottom edge placed the tab another

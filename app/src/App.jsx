@@ -1451,7 +1451,7 @@ function loadMiniAi() {
   }
 }
 
-function useMiniAi() {
+function useMiniAi(ai) {
   const [list, setList] = useState(loadMiniAi)
   const update = useCallback((fn) => {
     setList((cur) => {
@@ -1460,19 +1460,13 @@ function useMiniAi() {
       return next
     })
   }, [])
+  // Picks saved by an older build name providers rather than accounts. They are
+  // rewritten (and saved) as soon as there is a roster to rewrite them against.
+  useEffect(() => {
+    const next = migrateMiniAi(list, ai)
+    if (JSON.stringify(next) !== JSON.stringify(list)) update(() => next)
+  }, [ai, list, update])
   return [list, update]
-}
-
-/** Which AIs can be added: every provider with a registered account or a legacy reading. */
-function miniAiOptions(ai, chosen) {
-  const ids = []
-  const add = (id) => { if (id && !ids.includes(id)) ids.push(id) }
-  // The sidecar always sends both legacy keys; `setup` means no login exists.
-  if (ai?.claude && !ai.claude.setup) add('claude')
-  if (ai?.codex && !ai.codex.setup) add('codex')
-  for (const r of Array.isArray(ai?.accounts) ? ai.accounts : []) add(r?.provider)
-  for (const c of chosen) add(c.id)
-  return ids
 }
 
 const LEGACY_WINDOWS = {
@@ -1480,28 +1474,133 @@ const LEGACY_WINDOWS = {
   codex: [['sess_pct', '5h'], ['week_pct', 'week']],
 }
 
+/** The sidecar's account rows, minus any without an id a pick could be pinned to. */
+function aiAccounts(ai) {
+  return (Array.isArray(ai?.accounts) ? ai.accounts : [])
+    .filter((r) => r && typeof r.id === 'string' && r.id)
+}
+
+/* Whether the older single-account `ai.claude` / `ai.codex` block has a login
+   behind it. The sidecar always sends both keys; `setup` means it does not. */
+function legacyLive(ai, provider) {
+  return Boolean(LEGACY_WINDOWS[provider] && ai?.[provider] && !ai[provider].setup)
+}
+
+/* An id from the provider registry, as opposed to an account id. */
+function isProviderId(id) {
+  return providerLabel(id) !== providerLabel(undefined)
+}
+
 /**
- * The short-window and weekly readings for one provider.
+ * What each account is called on the tab, by account id.
  *
- * Claude and Codex keep reading the legacy pair, which carries the
- * last-known-value hold the tab already relied on. Every other provider reads
- * its first account in the accounts array that has numbers in it.
+ * The account's own label, or the provider's name while it has none (the
+ * sidecar falls back to the bare provider id). Two accounts can carry the same
+ * label -- two logins both called "Claude Code" -- and two rings with the same
+ * tooltip cannot be told apart, so repeats are numbered in roster order.
  */
-function miniAiReading(ai, id) {
-  const rows = (Array.isArray(ai?.accounts) ? ai.accounts : []).filter((r) => r?.provider === id)
-  const row = rows.find((r) => r?.usage && (!r.error || r.held))
-    ?? rows.find((r) => r?.usage) ?? rows[0]
+function accountNames(accounts) {
+  const names = new Map()
+  const count = new Map()
+  for (const r of accounts) {
+    const own = typeof r.label === 'string' ? r.label.trim() : ''
+    const base = own && own !== r.provider ? own : providerLabel(r.provider)
+    const n = (count.get(base) ?? 0) + 1
+    count.set(base, n)
+    names.set(r.id, n > 1 ? `${base} (${n})` : base)
+  }
+  return names
+}
+
+/**
+ * The saved picks, pinned to account ids.
+ *
+ * Picks used to name a provider ('claude'). Such a pick moves onto that
+ * provider's first account and keeps its week tick. A pick that matches
+ * nothing is dropped -- but only once the roster has arrived: the first render
+ * has no accounts at all, and dropping then would wipe every pick on every
+ * start. A provider pick with no account but a live legacy block still draws,
+ * so it is kept.
+ */
+function migrateMiniAi(chosen, ai) {
+  const accounts = aiAccounts(ai)
+  if (!accounts.length) return chosen
+  const out = []
+  const add = (id, week) => { if (!out.some((c) => c.id === id)) out.push({ id, week }) }
+  for (const c of chosen) {
+    if (accounts.some((r) => r.id === c.id)) add(c.id, c.week)
+    else {
+      const first = accounts.find((r) => r.provider === c.id)
+      if (first) add(first.id, c.week)
+      else if (legacyLive(ai, c.id)) add(c.id, c.week)
+    }
+  }
+  return out
+}
+
+/**
+ * What one pick stands for: its account row (if any), provider, display name
+ * and how many accounts that provider has. A provider id still resolves, to
+ * the provider's first account, so the render before the migration above has
+ * run draws the same ring the migrated pick will.
+ */
+function miniAiTarget(ai, id) {
+  const accounts = aiAccounts(ai)
+  const row = accounts.find((r) => r.id === id) ?? accounts.find((r) => r.provider === id)
+  if (row) {
+    return {
+      row,
+      provider: row.provider,
+      name: accountNames(accounts).get(row.id),
+      siblings: accounts.filter((r) => r.provider === row.provider).length,
+    }
+  }
+  const known = isProviderId(id)
+  return { row: null, provider: known ? id : '', name: known ? providerLabel(id) : 'Removed account', siblings: 0 }
+}
+
+/**
+ * What the picker lists: one line per account, in roster order -- no limit.
+ * A live legacy block with no account behind it keeps a provider line, and a
+ * pick the roster does not contain stays listed so it can still be unticked.
+ */
+function miniAiOptions(ai, chosen) {
+  const accounts = aiAccounts(ai)
+  const names = accountNames(accounts)
+  const out = accounts.map((r) => ({ id: r.id, provider: r.provider, name: names.get(r.id) }))
+  const add = (id) => {
+    if (out.some((o) => o.id === id)) return
+    const t = miniAiTarget(ai, id)
+    out.push({ id, provider: t.provider, name: t.name })
+  }
+  for (const p of Object.keys(LEGACY_WINDOWS)) {
+    if (legacyLive(ai, p) && !accounts.some((r) => r.provider === p)) add(p)
+  }
+  for (const c of chosen) {
+    if (!accounts.some((r) => r.provider === c.id)) add(c.id)
+  }
+  return out
+}
+
+/**
+ * The short-window and weekly readings for one account (a `miniAiTarget`).
+ *
+ * The account's own row is the source. The legacy `ai.claude` / `ai.codex`
+ * block is read only while that row has no usage yet and is its provider's
+ * only account: then the block is the same login's reading, already carrying
+ * the last-known-value hold, and a single-account setup draws what it always
+ * did. With two accounts the block is one of them, and nobody can say which.
+ */
+function miniAiReading(ai, target) {
+  const { row, provider, siblings } = target
   const u = row?.usage && typeof row.usage === 'object' ? row.usage : null
-  const legacy = LEGACY_WINDOWS[id] ? ai?.[id] : null
-  if (legacy) {
-    // The legacy block can carry the percent without its countdown (a cached
-    // reading drops the relative time); the account row has it, so borrow it.
-    const session = aiDial(legacy, LEGACY_WINDOWS[id])
-    const week = aiDial(legacy, [['week_pct', 'week']])
-    if (!session.reset) session.reset = resetOf(u, session.label === 'week' ? 'week_pct'
-      : ['session_pct', 'sess_pct'].find((k) => u?.[k] != null))
-    if (!week.reset) week.reset = resetOf(u, 'week_pct')
-    return { session, week, note: aiNote(legacy) }
+  if (!u && siblings <= 1 && legacyLive(ai, provider)) {
+    const legacy = ai[provider]
+    return {
+      session: aiDial(legacy, LEGACY_WINDOWS[provider]),
+      week: aiDial(legacy, [['week_pct', 'week']]),
+      note: aiNote(legacy),
+    }
   }
   const held = Boolean(row?.error && row?.held)
   const usable = u && (!row.error || held)
@@ -1545,9 +1644,10 @@ function MiniCheck({ on, color, disabled }) {
 }
 
 /**
- * The editor that opens from the "+" on the tab: one line per AI, a tick to
- * show it on the tab and a second tick for its weekly ring. `data-tab-ui`
- * keeps the tab's drag/expand handling off these controls.
+ * The editor that opens from the "+" on the tab: one line per AI account, a
+ * tick to show it on the tab and a second tick for its weekly ring. `options`
+ * come from `miniAiOptions`. `data-tab-ui` keeps the tab's drag/expand
+ * handling off these controls.
  */
 function MiniAiPicker({ options, chosen, onSave, onCancel }) {
   // The ticks edit a draft; nothing reaches the tab until Save, so a stray
@@ -1568,28 +1668,28 @@ function MiniAiPicker({ options, chosen, onSave, onCancel }) {
           No AI accounts yet — add one in the full view
         </span>
       )}
-      {options.map((id) => {
+      {options.map(({ id, provider, name }) => {
         const on = draft.find((c) => c.id === id)
-        const color = providerAccent(id)
+        const color = providerAccent(provider)
         return (
           <div key={id} className="flex items-center gap-1 whitespace-nowrap text-[11px]">
             <button
               type="button"
               onClick={() => toggle(id)}
               aria-pressed={Boolean(on)}
-              title={on ? `Hide ${providerLabel(id)} from the tab` : `Show ${providerLabel(id)} on the tab`}
+              title={on ? `Hide ${name} from the tab` : `Show ${name} on the tab`}
               className="glass-text flex items-center gap-1.5 rounded-md px-1 py-0.5 hover:bg-white/10"
             >
               <MiniCheck on={Boolean(on)} color={color} />
-              <ProviderIcon id={id} size={14} />
-              <span className="text-ink-2">{providerLabel(id)}</span>
+              <ProviderIcon id={provider} size={14} />
+              <span className="text-ink-2">{name}</span>
             </button>
             <button
               type="button"
               disabled={!on}
               onClick={() => toggleWeek(id)}
               aria-pressed={Boolean(on?.week)}
-              title="Also show the weekly usage ring"
+              title={`Also show the weekly usage ring for ${name}`}
               className={'glass-text ml-auto flex items-center gap-1 rounded-md px-1 py-0.5 '
                 + (on ? 'hover:bg-white/10' : 'cursor-default')}
             >
@@ -1635,10 +1735,16 @@ function MiniBar({
   const hw = s.hw
   const { up, busy } = s.netstate ?? { up: true, busy: false }
   const ping = pickPing(net)
-  const [chosen, setChosen] = useMiniAi()
+  const [chosen, setChosen] = useMiniAi(s.ai)
   const [picking, setPicking] = useState(false)
   const options = miniAiOptions(s.ai, chosen)
   const saveAi = (next) => { setChosen(() => next); setPicking(false) }
+  // Whether the card carries its native "click to open" tooltip. Chromium
+  // draws that tooltip as a window of its own and takes it down only on a later
+  // mouse move over the page, so one that came up before a drag rode along with
+  // the moving tab and stayed after it. It is withdrawn on every press and on
+  // leaving, and offered again only on a fresh entry with no button held.
+  const [hint, setHint] = useState(true)
   useEffect(() => {
     if (!picking) return undefined
     const onKey = (e) => { if (e.key === 'Escape') setPicking(false) }
@@ -1650,6 +1756,7 @@ function MiniBar({
   const column = !HORIZONTAL_EDGES.includes(edge)
 
   const onDown = (e) => {
+    setHint(false)
     if (e.button !== 0) return
     // The AI picker and its "+" are ordinary controls: no drag, no capture,
     // so their own clicks land on them instead of on the card.
@@ -1725,9 +1832,11 @@ function MiniBar({
       onPointerMove={onMove}
       onPointerUp={onUp}
       onPointerCancel={onUp}
+      onPointerEnter={() => { if (!drag.current?.held) setHint(true) }}
+      onPointerLeave={() => setHint(false)}
       onClick={onClick}
       aria-label="Open the full widget"
-      title={locked
+      title={!hint ? undefined : locked
         ? 'Click to open the full widget'
         : `Click to open the full widget · drag to move it, or to another edge`}
     >
@@ -1737,9 +1846,10 @@ function MiniBar({
         <Ring label="RAM" value={hw?.ram} />
         <Ring label="GPU" value={hw?.gpu} note={hw?.gpu_raw} />
         {chosen.map(({ id, week }) => {
-          const r = miniAiReading(s.ai, id)
-          const name = providerLabel(id)
-          const color = providerAccent(id)
+          const target = miniAiTarget(s.ai, id)
+          const r = miniAiReading(s.ai, target)
+          const name = target.name
+          const color = providerAccent(target.provider)
           return (
             <Fragment key={id}>
               <Ring
@@ -2003,56 +2113,58 @@ function Compact({ s, copy, ipChanged, rfChanged }) {
   )
 }
 
-/** Short names for the compact meters, where a 9.5px caption has ~80px. */
-const SHORT_AI = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', antigravity: 'Antigravity' }
-function shortAi(id) {
-  return SHORT_AI[id] ?? providerLabel(id).split(' ')[0]
-}
-
 /**
- * The compact view's AI meters: the same user-chosen list as the tab (same
- * localStorage key), each in its brand colour, with an optional weekly meter
- * and the same "+" picker with Save.
+ * The compact view's AI meters: the same user-chosen list of accounts as the
+ * tab (same localStorage key), each in its brand colour, with an optional
+ * weekly meter and the same "+" picker with Save. The 9.5px caption truncates
+ * a long account label; the hover carries it whole.
  */
 function CompactAi({ ai }) {
-  const [chosen, setChosen] = useMiniAi()
+  const [chosen, setChosen] = useMiniAi(ai)
   const [picking, setPicking] = useState(false)
   const options = miniAiOptions(ai, chosen)
+  // One row per account: its short-window meter, and its weekly meter beside
+  // it only when that account's week tick is on. Rows keep each pair together
+  // -- a flat wrap split one account's two meters across lines.
   const meters = []
   for (const { id, week } of chosen) {
-    const r = miniAiReading(ai, id)
-    const color = providerAccent(id)
+    const target = miniAiTarget(ai, id)
+    const r = miniAiReading(ai, target)
+    const name = target.name
+    const color = providerAccent(target.provider)
     const fallback = r.note === 'login expired' ? 'login' : r.note === 'no reading yet' ? '—' : 'err'
-    meters.push(
+    const row = []
+    row.push(
       <Meter
         key={id}
-        label={`${shortAi(id)} · ${r.session.label}`}
+        label={`${name} · ${r.session.label}`}
         value={r.session.value}
         fallback={fallback}
         tone={color}
-        title={r.session.value == null ? r.note
-          : usageTip(`${providerLabel(id)} · ${r.session.label}`, r.session.value, r.session.reset)}
+        title={r.session.value == null ? `${name} · ${r.session.label} · ${r.note}`
+          : usageTip(`${name} · ${r.session.label}`, r.session.value, r.session.reset)}
       />,
     )
     if (week && r.session.label !== 'week') {
-      meters.push(
+      row.push(
         <Meter
           key={id + ':week'}
-          label={`${shortAi(id)} · week`}
+          label={`${name} · week`}
           value={r.week.value}
           fallback={fallback}
           tone={color + 'aa'}
-          title={r.week.value == null ? r.note
-            : usageTip(`${providerLabel(id)} · week`, r.week.value, r.week.reset)}
+          title={r.week.value == null ? `${name} · week · ${r.note}`
+            : usageTip(`${name} · week`, r.week.value, r.week.reset)}
         />,
       )
     }
+    meters.push(<div key={id} className="flex min-w-0 gap-3">{row}</div>)
   }
   return (
     <div className="flex flex-col gap-2 px-3">
       <div className="flex items-center gap-3">
         {meters.length ? (
-          <div className="flex min-w-0 flex-1 flex-wrap gap-x-3 gap-y-2">{meters}</div>
+          <div className="flex min-w-0 flex-1 flex-col gap-y-2">{meters}</div>
         ) : (
           <span className="glass-text min-w-0 flex-1 text-[10.5px] text-faint">
             Press + to choose which AI usage to show

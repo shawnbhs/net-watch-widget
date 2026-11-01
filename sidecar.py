@@ -1012,7 +1012,31 @@ def ai_account_rename(aid, label):
     if not renamed:
         ai_accounts_emit(err="rename failed: the stored label is unchanged")
         return
+    ai_cache_relabel(aid, label)
     ai_accounts_emit(note="renamed")
+
+
+def ai_cache_relabel(aid, label):
+    """Carry a rename into the cached payload.
+
+    The cache is replayed at start-up before the first poll, and its rows keep
+    the label they were read under: without this, a widget restarted between a
+    rename and the next poll of that account greets the user with the old name.
+    """
+    try:
+        doc = core._read_json(AI_CACHE) or {}
+        rows = (doc.get("ai") or {}).get("accounts")
+        if not isinstance(rows, list):
+            return
+        hit = False
+        for r in rows:
+            if isinstance(r, dict) and r.get("id") == aid and r.get("label") != label:
+                r["label"] = label
+                hit = True
+        if hit:
+            core._write_json_atomic(AI_CACHE, doc)
+    except Exception:
+        pass
 
 
 def ai_account_refresh(aid):

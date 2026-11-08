@@ -16,6 +16,13 @@ import { useEffect, useRef, useState } from 'react'
  * the message here as well would keep a second copy of one fact that nothing
  * reads. If a future consumer wants it from here, add the case together with
  * the reader -- not before.
+ *
+ * One exception, and only for labels: the roster every view draws is
+ * `ai.accounts`, which only a poll rewrites. A rename answered with a fresh
+ * `ai_accounts` snapshot would otherwise stay invisible until the next poll --
+ * minutes away, longer under a hold -- so the new name is copied onto the
+ * matching rows here. Nothing else is taken from the snapshot: its `usage` is
+ * null by definition and would blank every reading.
  */
 const EMPTY = {
   hello: null,
@@ -117,6 +124,8 @@ function reduce(s, msg) {
         },
       }
     }
+    case 'ai_accounts':
+      return relabel(s, rest.accounts)
     case 'checks':
       if (rest.loading) return { ...s, checks: { ...(s.checks ?? {}), loading: true } }
       return { ...s, checks: { ...rest, loading: false } }
@@ -137,6 +146,24 @@ function reduce(s, msg) {
     default:
       return s
   }
+}
+
+/** Copy each snapshot row's label onto the `ai.accounts` row with its id. */
+export function relabel(s, snapshot) {
+  const rows = s.ai?.accounts
+  if (!Array.isArray(rows) || !Array.isArray(snapshot)) return s
+  const names = new Map()
+  for (const r of snapshot) {
+    if (r && typeof r.id === 'string' && typeof r.label === 'string') names.set(r.id, r.label)
+  }
+  let changed = false
+  const next = rows.map((r) => {
+    const label = names.get(r?.id)
+    if (label === undefined || label === r.label) return r
+    changed = true
+    return { ...r, label }
+  })
+  return changed ? { ...s, ai: { ...s.ai, accounts: next } } : s
 }
 
 export const send = (cmd) => window.nw?.send(cmd)

@@ -3219,6 +3219,7 @@ def _vault_keepalive(lead=AI_REFRESH_LEAD):
         pid = a.get("provider") or ""
         if not _provider_is_live(pid):
             continue
+        a = _adopt_cli_cred(a)
         cred = a.get("cred")
         try:
             if _prov.is_unrecoverable(pid, cred):
@@ -3243,6 +3244,8 @@ def _vault_keepalive(lead=AI_REFRESH_LEAD):
             # anything, so _vault_store_cred's latch carries the failure over
             # to the next poll, which reports it as an error row.
             continue
+        if new:
+            _cli_write_back(a, cred, new)
     return True
 
 
@@ -3845,6 +3848,146 @@ def _vault_store_cred(aid, cred):
     return ok
 
 
+# ── staying in step with the CLI's own file ──────────────────────────────────
+# An imported account and the CLI it came from start out holding the SAME
+# login, and both renew it. Each renewal rotates the refresh token, so
+# whichever side renews second is holding a dead one. Before these two
+# helpers, the vault never looked at the CLI file again: the CLI renewed every
+# few hours, and the vault copy died within a day of import while the CLI kept
+# working, so the card said "login expired" over a login that was fine.
+#
+# The subtree of each CLI file that is the login itself. Everything else in
+# the file (Claude's mcpOAuth, Codex's OPENAI_API_KEY) belongs to the CLI.
+_CLI_LOGIN_KEY = {"claude": "claudeAiOauth", "codex": "tokens"}
+
+
+def _cli_refresh_token(pid, cred):
+    """The refresh token inside a Claude or Codex credential, or None."""
+    sub = (cred or {}).get(_CLI_LOGIN_KEY.get(pid, "")) \
+        if isinstance(cred, dict) else None
+    if not isinstance(sub, dict):
+        return None
+    return sub.get("refreshToken" if pid == "claude" else "refresh_token")
+
+
+def _same_path(a, b):
+    try:
+        return os.path.normcase(os.path.normpath(a)) == \
+            os.path.normcase(os.path.normpath(b))
+    except Exception:
+        return False
+
+
+def _cli_file_is_mine(acct, pid, cli, path):
+    """Whether the login in the CLI file at `path` is `acct`'s own account.
+
+    The CLI holds one login at a time, so the file can belong to a different
+    account than the row that was imported from it -- the user signed the CLI
+    into a second account. Adopting it then would overwrite the first account
+    with the second, so a durable identity decides when one is on record:
+
+      * the row has a durable fingerprint stamped: the file must match it;
+      * another row has the file's durable fingerprint stamped: it is theirs;
+      * otherwise (a row from before durable identity): only when no other
+        account of this provider was imported from the same file, since then
+        there is nobody else it could be.
+    """
+    fp_of = getattr(_vault, "cred_fingerprint", None)
+    durable = getattr(_vault, "is_durable_fingerprint", None)
+    if fp_of is None or durable is None:
+        return False
+    try:
+        fp = fp_of(pid, cli, path)
+        others = [a for a in (_vault.list_accounts() or [])
+                  if isinstance(a, dict) and a.get("id") != acct.get("id")
+                  and a.get("provider") == pid]
+    except Exception:
+        return False
+
+    def stamped(a):
+        out = [f for f in (a.get("fps") or []) if isinstance(f, str)]
+        if isinstance(a.get("cred_fp"), str):
+            out.append(a["cred_fp"])
+        return [f for f in out if durable(f)]
+
+    if fp and durable(fp):
+        mine = stamped(acct)
+        if mine:
+            return fp in mine
+        if any(fp in stamped(o) for o in others):
+            return False
+    return not any(_same_path(o.get("cred_path") or "", path) for o in others)
+
+
+def _adopt_cli_cred(acct):
+    """Take the CLI file's login when it is newer than the vault's copy.
+
+    Returns the account dict to use from here on: `acct` itself when nothing
+    changed, a copy carrying the adopted credential when it did. Local only --
+    a file read and a vault write, no request -- so it is safe on every poll
+    and every keepalive pass, held or not. Never raises.
+    """
+    try:
+        pid = acct.get("provider") or ""
+        path = acct.get("cred_path")
+        sub = _CLI_LOGIN_KEY.get(pid)
+        if not sub or not path or _vault is None or _prov is None:
+            return acct
+        cli = _read_json(path)
+        if not isinstance(cli, dict) or not isinstance(cli.get(sub), dict):
+            return acct
+        if _prov.is_unrecoverable(pid, cli):
+            return acct
+        theirs = _prov.cred_expiry(pid, cli)
+        ours = _prov.cred_expiry(pid, acct.get("cred"))
+        if theirs is None or (ours is not None and theirs <= ours):
+            return acct
+        if not _cli_file_is_mine(acct, pid, cli, path):
+            return acct
+        cands = None
+        fn = getattr(_vault, "cred_fingerprint_candidates", None)
+        if fn is not None:
+            cands = fn(pid, cli, path)
+        if not _vault.update_cred(acct.get("id"), cli, fps=cands):
+            return acct
+        with _unsaved_lock:
+            AI_UNSAVED.pop(acct.get("id"), None)
+        out = dict(acct)
+        out["cred"] = cli
+        return out
+    except Exception:
+        return acct
+
+
+def _cli_write_back(acct, old, new):
+    """Hand a renewal the widget made to the CLI file it shares a login with.
+
+    The other half of _adopt_cli_cred: when the widget renews first, the
+    CLI's refresh token is the dead one, and Claude Code or Codex would log
+    out at its own next renewal. Written only while the file still holds the
+    exact refresh token this renewal spent -- anything else means the CLI has
+    moved on (renewed itself, or signed into another account) and the file is
+    not ours to touch. Only the login subtree is replaced. Returns True when
+    the file was written. Never raises.
+    """
+    try:
+        pid = acct.get("provider") or ""
+        path = acct.get("cred_path")
+        sub = _CLI_LOGIN_KEY.get(pid)
+        if not sub or not path or not isinstance(new, dict) \
+                or not isinstance(new.get(sub), dict):
+            return False
+        spent = _cli_refresh_token(pid, old)
+        cli = _read_json(path)
+        if not spent or not isinstance(cli, dict) \
+                or _cli_refresh_token(pid, cli) != spent:
+            return False
+        cli[sub] = new[sub]
+        return bool(_write_json_atomic(path, cli))
+    except Exception:
+        return False
+
+
 def _usage_relative(usage):
     """Turn every reset marker in a usage block into a compact duration.
 
@@ -3924,6 +4067,8 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
     cred = acct.get("cred")
     if not ai_vault_ready():
         return _acct_row(acct, cred, "error", None, "vault unavailable")
+    acct = _adopt_cli_cred(acct)
+    cred = acct.get("cred")
     with _unsaved_lock:
         unsaved = AI_UNSAVED.get(acct.get("id"))
     if unsaved:
@@ -3971,6 +4116,7 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
                 return _acct_row(acct, cred, "error", None,
                                  why_unsaved if isinstance(why_unsaved, str)
                                  else AI_UNSAVED_DEFAULT)
+            _cli_write_back(acct, cred, new)
             cred = new
             exp = None
             try:
@@ -4215,9 +4361,11 @@ def _ai_note_dead(key, cred):
 def ai_lift_relogged():
     """Lift every vault dead-login hold whose credential is valid again.
 
-    Local only (vault read, no request), and only when such a hold exists,
-    so the loop can call it every wake: without it a re-login made outside
-    the widget would wait out the rest of the hour.
+    Local only (vault read, a CLI file read, no request), and only when such
+    a hold exists, so the loop can call it every wake: without it a re-login
+    made outside the widget would wait out the rest of the hour. The CLI file
+    is read here too, not only at poll time, because a held account is never
+    polled -- the newer login the CLI already holds would wait out the hour.
     """
     try:
         dead = [k for k, v in aipolicy.snapshot()["keys"].items()
@@ -4227,6 +4375,7 @@ def ai_lift_relogged():
         for a in _vault.list_accounts():
             key = aipolicy.key(a.get("provider") or "", a.get("id") or "")
             if key in dead:
+                a = _adopt_cli_cred(a)
                 _ai_note_dead(key, a.get("cred"))
     except Exception:
         pass
@@ -4297,6 +4446,9 @@ def ai_poll_accounts_due(manual=False, lead=AI_REFRESH_LEAD,
             rows.append(ai_account_poll(a, lead=lead))   # sends nothing
             continue
         key = aipolicy.key(pid, a.get("id"))
+        # Before the dead-login check, so a login the CLI renewed lifts the
+        # hold on this very tick instead of after the hour runs out.
+        a = _adopt_cli_cred(a)
         _ai_note_dead(key, a.get("cred"))
         # claim() is the due check and the reservation in one step, so a
         # per-account refresh racing this loop cannot also send. It refuses

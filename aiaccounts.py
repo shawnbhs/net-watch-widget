@@ -528,8 +528,13 @@ def remove_account(account_id):
     return forget_account(account_id)
 
 
-def update_cred(account_id, cred):
+def update_cred(account_id, cred, fps=None):
     """Write a refreshed credential back.
+
+    `fps`, when given, re-stamps the row's identity (see _stamp_fingerprints).
+    Only core's adoption of a CLI file passes it: a row imported by a build
+    that predates durable identity carries no stamp, and the first adoption is
+    the moment one can be recorded, so the next adoption can check it.
 
     This is the hot path after a token rotation, and the reason save() has to
     be atomic: both providers invalidate the old refresh token the moment they
@@ -549,6 +554,8 @@ def update_cred(account_id, cred):
             if a.get("id") == account_id:
                 a["cred"] = cred
                 a["cred_updated_at"] = _now_iso()
+                if fps:
+                    _stamp_fingerprints(a, list(fps))
                 return save(doc)
         return False
 

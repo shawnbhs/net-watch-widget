@@ -460,7 +460,14 @@ AI_WAKE_MAX = 60      # the loop re-checks the schedule at least this often
 def ai_loop():
     # Pick the schedule back up rather than starting a new one. Without this
     # the first act of every launch is a request, and the holds a previous
-    # launch was told to observe are lost with it.
+    # launch was told to observe are lost with it. A dead-login hold whose
+    # login has since come back (a CLI renewal, a sign-in while the widget
+    # was closed) is the one hold not worth sitting out, and the first wait
+    # is not capped, so it is lifted before the wait is worked out.
+    try:
+        core.ai_lift_relogged()
+    except Exception:
+        pass
     first, _ = ai_cache_due()
     manual = bool(first > 0 and _ai_now.wait(first))
     if manual:

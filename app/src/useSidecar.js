@@ -75,7 +75,7 @@ export function useSidecar() {
   return state
 }
 
-function reduce(s, msg) {
+export function reduce(s, msg) {
   const { t, ...rest } = msg
   switch (t) {
     case 'hello':
@@ -106,13 +106,18 @@ function reduce(s, msg) {
       const keep = (prev, next) => {
         if (!next) return prev
         if (!next.err) return next
-        return { ...(prev ?? {}), ...next, held: Boolean(prev && !prev.err) }
+        // Held stays held through repeated failures: only a success (above)
+        // makes the numbers fresh again.
+        return { ...(prev ?? {}), ...next, held: Boolean(prev && (!prev.err || prev.held)) }
       }
+      // A reading (fresh poll, or a roster from a tick that ran) ends a crash.
+      const fresh = rest.stale === false || Array.isArray(rest.accounts)
       return {
         ...s,
         ai: {
           ...(s.ai ?? {}),
           ...rest,
+          ...(fresh ? { fault: null } : {}),
           // `status` is momentary -- polling, waiting -- and must not outlive
           // the message that reports the result. Merged like everything else it
           // sticks: the reading that follows a poll carries no status, so the
@@ -141,8 +146,17 @@ function reduce(s, msg) {
       // before the registry is loaded), and the pane distinguishes the two by
       // length, so it must not be back-filled from a previous message.
       return { ...s, aiProviders: rest.providers ?? [] }
-    case 'error':
-      return { ...s, errors: [...s.errors.slice(-9), rest] }
+    case 'error': {
+      const errors = [...s.errors.slice(-9), rest]
+      if (rest.where !== 'ai') return { ...s, errors }
+      // The AI loop itself raised: no row was refreshed, so every reading on
+      // screen is now last-known. Never a login verdict -- just the crash text.
+      const ai = s.ai ?? {}
+      const accounts = Array.isArray(ai.accounts)
+        ? ai.accounts.map((r) => (r ? { ...r, stale: true } : r))
+        : ai.accounts
+      return { ...s, errors, ai: { ...ai, accounts, stale: true, fault: String(rest.err ?? 'unknown error') } }
+    }
     default:
       return s
   }

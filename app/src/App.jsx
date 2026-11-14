@@ -1118,6 +1118,9 @@ function AiCard({ ai, providers, rise }) {
               in play each account carries its own reason text in the detail
               pane, so a second global summary would only repeat -- or worse,
               contradict -- what the selected account already says. */}
+          {ai?.fault && (
+            <div className="glass-text mt-1 px-3 text-[10px] text-warn">{aiFaultNote(ai)}</div>
+          )}
           {!multi && (
             <AiNote
               cl={cl}
@@ -1325,6 +1328,11 @@ function ChecksCard({ checks, ip, rise }) {
 }
 
 /* ── the tab ───────────────────────────────────────────────────────────────── */
+
+/** The AI loop's own crash, if the last tick raised; null once a reading lands. */
+function aiFaultNote(ai) {
+  return ai?.fault ? `AI poll failed — ${ai.fault}` : null
+}
 
 /**
  * What an absent AI reading means, for the dial's tooltip.
@@ -1581,7 +1589,8 @@ function miniAiReading(ai, target) {
     const usable = legacy && (!legacy.err || held)
     return { windows: usable ? usageWindows(legacy) : [], held, note: aiNote(legacy) }
   }
-  const held = Boolean(row?.error && row?.held)
+  // `stale` is the backend's freshness flag; `held` only says a hold is on.
+  const held = Boolean(row?.stale || (row?.error && row?.held))
   const usable = u && (!row.error || held)
   let note = 'no reading yet'
   if (!row) note = 'no account added'

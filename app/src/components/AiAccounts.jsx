@@ -519,7 +519,9 @@ function classify(account, planned) {
   if (planned) {
     return { kind: 'planned', short: 'not wired up yet', full: 'No usage endpoint for this provider yet' }
   }
-  if (account?.needs_login || /login[_\s-]?expired|unauthori[sz]ed|not logged in|no credential/i.test(raw)) {
+  // Only the backend's typed verdict or its sentinel means a dead login; a bare
+  // `unauthorized` can be a scope or endpoint refusal (audit D16 F4).
+  if (account?.needs_login || /login[_\s-]?expired/i.test(raw)) {
     return {
       kind: 'expired',
       short: 'login expired',
@@ -584,11 +586,14 @@ const KNOWN_ROWS = {
     ['week', 'week_pct', 'week_reset'],
     ['model', 'model_pct', 'model_reset'],
   ],
+  // Vault accounts use session_* / *_reset; the legacy pair uses sess_* / *_reset_ts.
   codex: [
-    ['5h', 'sess_pct', 'sess_reset_ts'],
-    ['week', 'week_pct', 'week_reset_ts'],
+    ['5h', ['session_pct', 'sess_pct'], ['session_reset', 'sess_reset_ts']],
+    ['week', 'week_pct', ['week_reset', 'week_reset_ts']],
   ],
 }
+
+const firstKey = (u, keys) => [].concat(keys).find((k) => u[k] != null)
 
 function usageRows(account) {
   const u = account?.usage
@@ -596,8 +601,10 @@ function usageRows(account) {
   const known = KNOWN_ROWS[account.provider]
   const rows = []
   if (known) {
-    for (const [name, pctKey, resetKey] of known) {
-      if (u[pctKey] == null) continue
+    for (const [name, pctKeys, resetKeys] of known) {
+      const pctKey = firstKey(u, pctKeys)
+      if (pctKey == null) continue
+      const resetKey = firstKey(u, resetKeys)
       const label = pctKey === 'model_pct' && u.model_name ? u.model_name : name
       rows.push({ key: pctKey, label, pct: u[pctKey], reset: resetLabel(u[resetKey]) })
     }
@@ -630,7 +637,7 @@ function statusChip(account, planned, fault) {
   // reason belongs in the title and in the detail pane, both of which carry
   // `fault.full`; the roster only has to say that something is wrong.
   if (fault) return { text: 'failed', tone: 'text-bad' }
-  if (account?.held) return { text: 'stale', tone: 'text-muted' }
+  if (account?.stale || account?.held) return { text: 'stale', tone: 'text-muted' }
   return { text: 'ok', tone: 'text-good' }
 }
 
@@ -1262,7 +1269,7 @@ function AccountDetail({ account, providers, busy, onCommand }) {
           </div>
         ) : rows.length ? (
           rows.map((r) => (
-            <QuotaRow key={r.key} label={r.label} pct={r.pct} reset={r.reset} dim={Boolean(account.held)} who={name} />
+            <QuotaRow key={r.key} label={r.label} pct={r.pct} reset={r.reset} dim={Boolean(account.stale || account.held)} who={name} />
           ))
         ) : (
           <div className="glass-text break-words text-[10px] leading-snug text-faint">

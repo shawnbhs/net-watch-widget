@@ -268,8 +268,17 @@ def _guarded_open(file, *a, **k):
     return _real_open(file, *a, **k)
 
 
+def _resolve(path, dir_fd):
+    # ponytail: fd-based rmtree (Linux) passes bare names + dir_fd; resolve via /proc.
+    # Windows rmtree passes absolute paths, so dir_fd is None there.
+    if dir_fd is not None and not os.path.isabs(os.fsdecode(path)):
+        return os.path.join(os.readlink("/proc/self/fd/%d" % dir_fd),
+                            os.fsdecode(path))
+    return path
+
+
 def _guarded_os_open(path, *a, **k):
-    _guard_path("os.open", path)
+    _guard_path("os.open", _resolve(path, k.get("dir_fd")))
     return _real_os_open(path, *a, **k)
 
 
@@ -289,17 +298,17 @@ def _guarded_rmtree(path, *a, **k):
 
 
 def _guarded_remove(path, *a, **k):
-    _guard_delete("remove", path)
+    _guard_delete("remove", _resolve(path, k.get("dir_fd")))
     return _real_remove(path, *a, **k)
 
 
 def _guarded_unlink(path, *a, **k):
-    _guard_delete("unlink", path)
+    _guard_delete("unlink", _resolve(path, k.get("dir_fd")))
     return _real_unlink(path, *a, **k)
 
 
 def _guarded_rmdir(path, *a, **k):
-    _guard_delete("rmdir", path)
+    _guard_delete("rmdir", _resolve(path, k.get("dir_fd")))
     return _real_rmdir(path, *a, **k)
 
 

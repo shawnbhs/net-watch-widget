@@ -3095,21 +3095,37 @@ def fetch_claude_usage():
 
 # ── ChatGPT ───────────────────────────────────────────────────────────────────
 def _codex_token(lead=AI_REFRESH_LEAD):
-    path, doc, why = _pick_cred(CODEX_CRED_PATHS,
-                                lambda d: len(json.dumps(d.get("tokens", {}))))
+    # Rank copies by access-token expiry, as _newest_cli_cred does; a bigger
+    # file is not a fresher login.
+    path, doc, why = _pick_cred(
+        CODEX_CRED_PATHS,
+        lambda d: (_prov.cred_expiry("codex", d) or 0) if _prov is not None
+        else len(json.dumps(d.get("tokens", {}))))
     if not doc or not doc.get("tokens"):
         return None, None, why or NOT_CONFIGURED_CODEX
     t = doc["tokens"]
     acct = t.get("account_id") or ""
     exp = 0
-    try:  # id_token exp claim
-        seg = t.get("id_token", "").split(".")[1]
+    try:  # Only the access token authorizes usage.
+        seg = t.get("access_token", "").split(".")[1]
         seg += "=" * (-len(seg) % 4)
         exp = json.loads(base64.urlsafe_b64decode(seg)).get("exp", 0)
     except Exception:
         pass
     if exp and exp - lead > time.time():
         return t.get("access_token"), acct, None
+    if _prov is not None:
+        new, why = _prov.refresh_cred("codex", doc)
+        if new:
+            new["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            if not _write_json_atomic(path, new):
+                return None, None, "refreshed credential not saved"
+            return new["tokens"]["access_token"], acct, None
+        if exp and exp > time.time():
+            return t.get("access_token"), acct, None
+        if why == "login expired":  # UI keys sign-in prompt off this prefix
+            why = "LOGIN_EXPIRED:codex"
+        return None, None, why
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": t.get("refresh_token"),
                        "client_id": CODEX_CLIENT,
@@ -3124,11 +3140,15 @@ def _codex_token(lead=AI_REFRESH_LEAD):
         if p.get("id_token"):
             t["id_token"] = p["id_token"]
         doc["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        _write_json_atomic(path, doc)
+        if not _write_json_atomic(path, doc):
+            return None, None, "refreshed credential not saved"
         return t["access_token"], acct, None
+    if exp and exp > time.time():
+        return t.get("access_token"), acct, None
     if st == 0:
         return None, None, "offline (%s)" % (raw or "")[:40]
-    if st in (400, 401):
+    if st in (400, 401) and any(k in (raw or "").lower()
+                                for k in ("expired", "invalid_grant", "revoked")):
         return None, None, "LOGIN_EXPIRED:codex"
     return None, None, "refresh failed (%s)" % st
 
@@ -4051,7 +4071,7 @@ def _needs_login(pid, cred, error):
         except Exception:
             pass
     e = error or ""
-    return e.startswith("LOGIN_EXPIRED") or e in NOT_CONFIGURED
+    return e.startswith("LOGIN_EXPIRED") or e.lower() == "login expired" or e in NOT_CONFIGURED
 
 
 def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
@@ -4126,7 +4146,13 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
         elif why:
             err = why
             still_valid = exp is not None and exp > now
-            if not still_valid:
+            # Unknown expiry is not dead access. Still stop on transport/rate/
+            # block failures rather than sending another request into a hold.
+            unsafe = (err == "offline" or err == _TOKEN_429
+                      or err in ("refresh failed (403)", "refresh failed (451)")
+                      or "blocked" in err.lower()
+                      or _needs_login(pid, cred, err))
+            if not still_valid and (exp is not None or unsafe):
                 row = _acct_row(acct, cred, "error", None, err,
                                 _needs_login(pid, cred, err))
                 if err == _TOKEN_429:
@@ -4286,6 +4312,44 @@ def _ai_login_dead(key):
         return aipolicy.snapshot()["keys"].get(key, {}).get("kind") == "login_dead"
     except Exception:
         return False
+
+
+def _ai_hold_kind(key, pid):
+    """Why `key` is held: 'rate_limited', 'blocked' or 'error' (the default).
+
+    A provider-wide 429/block hold (from any key of pid, or a migrated legacy
+    retry_until) outranks the key's own generic error hold.
+    """
+    try:
+        snap = aipolicy.snapshot()
+        own = snap["keys"].get(key, {})
+        if own.get("hold_left", 0) > 0 and own.get("kind") in (
+                "rate_limited", "blocked"):
+            return own["kind"]
+        wide = {v.get("kind") for v in snap["keys"].values()
+                if v.get("provider") == pid and v.get("hold_left", 0) > 0}
+        for kind in ("blocked", "rate_limited"):
+            if kind in wide:
+                return kind
+        if snap["providers"].get(pid, 0) > 0:
+            return "rate_limited"
+    except Exception:
+        pass
+    return "error"
+
+
+# What a held row says for each hold kind (login_dead is handled apart).
+_AI_HOLD_TEXT = {"rate_limited": "rate limited", "blocked": "blocked",
+                 "error": "retrying after error"}
+
+
+def _ai_hold_placeholder(key, pid):
+    """Legacy held result: the hold's own text; rate_limited only for a 429."""
+    kind = _ai_hold_kind(key, pid)
+    out = {"err": _AI_HOLD_TEXT[kind]}
+    if kind == "rate_limited":
+        out["rate_limited"] = True
+    return out
 
 
 def _ai_hold_secs(key, pid):
@@ -4455,13 +4519,13 @@ def ai_poll_accounts_due(manual=False, lead=AI_REFRESH_LEAD,
         # while any key of this provider is under a 429 or block hold.
         claimed, left = aipolicy.claim(key, pid, manual=manual)
         if not claimed:
-            # A dead-login hold must still offer the sign-in button; calling
-            # it "rate limited" hides the only fix (a fresh login).
+            # A dead-login hold must still offer the sign-in button; any other
+            # hold says what it is (429, block or error backoff).
             placeholder = (_acct_row(a, a.get("cred"), "error", None,
                                      "LOGIN_EXPIRED:%s" % pid, True)
                            if _ai_login_dead(key) else
                            _acct_row(a, a.get("cred"), "error", None,
-                                     "rate limited")
+                                     _AI_HOLD_TEXT[_ai_hold_kind(key, pid)])
                            if _ai_hold_secs(key, pid) > 0 else
                            _acct_row(a, a.get("cred"), "wait", None,
                                      AI_WAITING))
@@ -4507,7 +4571,7 @@ def ai_poll_legacy(manual=False, spacing=AI_ACCT_SPACING):
         if not claimed:
             placeholder = ({"err": "LOGIN_EXPIRED:%s" % pid}
                            if _ai_login_dead(key) else
-                           {"err": "rate limited", "rate_limited": True}
+                           _ai_hold_placeholder(key, pid)
                            if _ai_hold_secs(key, pid) > 0
                            else {"err": AI_WAITING})
             out[pid] = _ai_held(key, left, placeholder)

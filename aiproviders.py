@@ -476,14 +476,15 @@ def cred_expiry(provider_id, cred):
         t = _codex_tokens(cred)
         if not t:
             return None
-        return _jwt_exp(t.get("id_token")) or _jwt_exp(t.get("access_token"))
+        # The usage request sends the access token; id_token expiry is unrelated.
+        return _jwt_exp(t.get("access_token"))
     if provider_id == "cursor":
         # Cursor's session token is a JWT, so the expiry is in the token
         # itself and nowhere else in the credential.
         return _jwt_exp(_token(_vendor_cred(cred, "cursor", "cursorAuth"),
                                "accessToken", "access_token", "token"))
     if provider_id == "kimi":
-        k = _vendor_cred(cred, "kimi", "kimiAuth")
+        k = _kimi_cred(cred)
         for key in ("expires_at", "expiresAt", "expiry"):
             v = _num((k or {}).get(key))
             if v:
@@ -507,7 +508,7 @@ def is_unrecoverable(provider_id, cred):
     Two ways to be unrecoverable, and both show up on real machines:
       * the expiry is further in the past than the refresh token's own
         lifetime (CRED_MAX_STALE), or
-      * there is no refresh token in the file at all. A logged-out Claude
+      * there is no refresh token and no known-live access token. A logged-out Claude
         credential is not deleted, it is gutted: expiresAt drops to 0 and
         refreshToken disappears. Ranking such a file by expiry puts it last,
         but attempting to refresh from it still yields a confusing error.
@@ -526,13 +527,17 @@ def is_unrecoverable(provider_id, cred):
         if not o:
             return False
         if not o.get("refreshToken"):
-            return True
+            exp = cred_expiry(provider_id, cred)
+            return not (_token(o, "accessToken") and exp is not None
+                        and exp > time.time())
     elif provider_id == "codex":
         t = _codex_tokens(cred)
         if not t:
             return False
         if not t.get("refresh_token"):
-            return True
+            exp = cred_expiry(provider_id, cred)
+            return not (_token(t, "access_token") and exp is not None
+                        and exp > time.time())
     exp = cred_expiry(provider_id, cred)
     if exp is None:
         return False
@@ -1089,6 +1094,13 @@ def _vendor_cred(cred, *wrappers):
     return cred
 
 
+def _kimi_cred(cred):
+    """Kimi imports wrap the token document beside device metadata."""
+    k = _vendor_cred(cred, "kimi", "kimiAuth")
+    nested = _dict(k).get("credentials")
+    return nested if isinstance(nested, dict) else k
+
+
 def _token(obj, *names):
     """First non-empty string among the named keys, else None."""
     if not isinstance(obj, dict):
@@ -1383,7 +1395,7 @@ def _copilot_pools_free(p):
 
 
 def _copilot_usage(cred):
-    o = _vendor_cred(cred, "copilot", "github")
+    o = _vendor_cred(cred, "copilotAuth", "copilot", "github")
     tok = _token(o, "oauth_token", "token", "access_token", "accessToken")
     if not tok:
         return {"error": "no credential"}
@@ -1547,7 +1559,7 @@ def _kimi_window_rows(usages):
 
 
 def _kimi_usage(cred):
-    k = _vendor_cred(cred, "kimi", "kimiAuth")
+    k = _kimi_cred(cred)
     tok = _token(k, "access_token", "accessToken", "token", "apiKey")
     if not tok:
         return {"error": "no credential"}

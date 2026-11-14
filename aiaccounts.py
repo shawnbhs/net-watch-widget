@@ -93,6 +93,15 @@ if _secrets is not None:
 VAULT_REFUSALS = (VaultUnreadableError, VaultVerificationError)
 
 
+class VaultNotSavedError(OSError):
+    """save() returned False while adding rows: nothing was stored.
+
+    Raised rather than returned so every existing caller, which already
+    treats an exception as "not added", stops reporting a lost account as
+    added. Not a refusal: a retry may well succeed.
+    """
+
+
 def refusal_reason(exc):
     """A short, displayable reason for a vault refusal, or None.
 
@@ -445,7 +454,8 @@ def add_account(provider, label, cred, source="manual", cred_path=None):
     with _lock:
         doc = load()
         doc["accounts"].append(acct)
-        save(doc)
+        if not save(doc):
+            raise VaultNotSavedError("credential not saved")
     return acct
 
 
@@ -1007,8 +1017,8 @@ def import_from_cli(report=False):
                 _stamp_fingerprints(acct, cands)
                 doc["accounts"].append(acct)
                 new.append(acct)
-        if new:
-            save(doc)
+        if new and not save(doc):
+            raise VaultNotSavedError("credential not saved")
     return (new, skipped) if report else new
 
 

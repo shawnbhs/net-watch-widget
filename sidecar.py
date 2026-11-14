@@ -1126,10 +1126,15 @@ def _ai_refresh_refused(key, left):
                          status="wait", seconds=secs, reason="login expired")
         return
     held = _ai_rl_hold(key.split(":", 1)[0]) > 0
-    ai_accounts_emit(err=("rate limited, %ds left" if held
-                          else "polled recently, %ds left") % secs,
-                     status="wait", seconds=secs,
-                     reason="rate limited" if held else "")
+    try:
+        kind = (aipolicy.snapshot()["keys"].get(key, {}).get("kind")
+                if aipolicy.hold_left(key) > 0 else "")
+    except Exception:
+        kind = ""
+    reason = "rate limited" if held else {"error": "error backoff",
+                                         "offline": "offline"}.get(kind, "")
+    ai_accounts_emit(err="%s, %ds left" % (reason or "polled recently", secs),
+                     status="wait", seconds=secs, reason=reason)
 
 
 def ai_migrate():
@@ -2083,6 +2088,7 @@ def isolated_login(provider, label="", account_id=None):
 
     handle = None
     api = None
+    keep_box = False
     try:
         why = _login_gate(what)
         if why:
@@ -2250,6 +2256,15 @@ def isolated_login(provider, label="", account_id=None):
                 core._vault.add_account(pid, shown, cred, source="login")
                 note = "account added"
         except Exception as exc:
+            if isinstance(exc, getattr(core._vault, "VaultNotSavedError", ())):
+                # The sandbox holds the only copy of this credential; deleting
+                # it now would lose the login. ailogin's atexit still removes
+                # it when the widget exits. Path only, never token material.
+                keep_box = True
+                ai_accounts_emit(err="%s; sign-in kept at %s until the widget "
+                                     "exits" % (core.AI_UNSAVED_DEFAULT,
+                                                 _sandbox_dir(handle)))
+                return
             # A refusal is named, because the vault was left intact on purpose
             # and only the user can clear that state; its reason string is
             # built from the exception TYPE and contains nothing from the
@@ -2268,7 +2283,7 @@ def isolated_login(provider, label="", account_id=None):
         # The sandbox holds a real credential until it is gone, so teardown is
         # unconditional: success, failure, cancellation, timeout and the
         # exception nobody predicted all arrive here.
-        if handle is not None and api is not None:
+        if handle is not None and api is not None and not keep_box:
             try:
                 _call(api, "teardown", handle)
             except Exception as exc:

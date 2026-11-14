@@ -2247,8 +2247,10 @@ def isolated_login(provider, label="", account_id=None):
                 # the user the login they just completed was kept when the
                 # only live copy is the one about to go out of scope -- the
                 # provider has already killed the token in the vault.
+                shown = None
                 if not core._vault.update_cred(account_id, cred):
-                    ai_accounts_emit(err=core.AI_UNSAVED_DEFAULT)
+                    keep_box = True
+                    _start_save_retry(pid, None, account_id, cred, api, handle)
                     return
                 note = "account re-authenticated"
             else:
@@ -2258,12 +2260,12 @@ def isolated_login(provider, label="", account_id=None):
         except Exception as exc:
             if isinstance(exc, getattr(core._vault, "VaultNotSavedError", ())):
                 # The sandbox holds the only copy of this credential; deleting
-                # it now would lose the login. ailogin's atexit still removes
-                # it when the widget exits. Path only, never token material.
+                # it now would lose the login, so it is kept and the save is
+                # retried in the background (nothing was persisted, so a
+                # repeated add cannot duplicate a row). Path only, never token
+                # material.
                 keep_box = True
-                ai_accounts_emit(err="%s; sign-in kept at %s until the widget "
-                                     "exits" % (core.AI_UNSAVED_DEFAULT,
-                                                 _sandbox_dir(handle)))
+                _start_save_retry(pid, shown, account_id, cred, api, handle)
                 return
             # A refusal is named, because the vault was left intact on purpose
             # and only the user can clear that state; its reason string is
@@ -2290,6 +2292,59 @@ def isolated_login(provider, label="", account_id=None):
                 emit("error", where="ai_login_teardown",
                      err=type(exc).__name__)
         _login_release()
+
+
+# Waits (seconds) before each background retry of a failed vault save after a
+# sign-in: quick at first for a scanner lock, then every 5 min, ~1 h in total.
+_SAVE_RETRY_DELAYS = (2, 5, 15, 30, 60, 120) + (300,) * 11
+_save_retry_sleep = time.sleep  # patched in tests
+
+
+def _start_save_retry(pid, shown, account_id, cred, api, handle):
+    """Announce the failed save and retry it on a daemon thread.
+
+    The login slot is released by the caller's finally as usual; this thread
+    holds only the credential and the kept sandbox.
+    """
+    ai_accounts_emit(err="%s; retrying, sign-in kept at %s"
+                         % (core.AI_UNSAVED_DEFAULT, _sandbox_dir(handle)))
+    threading.Thread(target=_retry_save_later, name="ai-save-retry",
+                     args=(pid, shown, account_id, cred, api, handle),
+                     daemon=True).start()
+
+
+def _retry_save_later(pid, shown, account_id, cred, api, handle):
+    """Retry the vault write until it lands, a refusal, or the schedule ends.
+
+    Success tears the sandbox down; giving up leaves it for ailogin's atexit,
+    which removes it when the widget exits.
+    """
+    for delay in _SAVE_RETRY_DELAYS:
+        _save_retry_sleep(delay)
+        try:
+            if account_id:
+                ok = bool(core._vault.update_cred(account_id, cred))
+            else:
+                core._vault.add_account(pid, shown, cred, source="login")
+                ok = True
+        except Exception as exc:
+            reason = core._vault_refusal(exc)
+            if reason:  # deliberate refusal: no retry can clear it
+                ai_accounts_emit(err=reason)
+                return
+            ok = False
+        if ok:
+            ai_accounts_emit(note="account re-authenticated" if account_id
+                             else "account added")
+            _ai_now.set()
+            try:
+                _call(api, "teardown", handle)
+            except Exception as exc:
+                emit("error", where="ai_login_teardown", err=type(exc).__name__)
+            return
+    ai_accounts_emit(err="%s; retries exhausted, sign-in kept at %s until the "
+                         "widget exits" % (core.AI_UNSAVED_DEFAULT,
+                                           _sandbox_dir(handle)))
 
 
 def _default_login_label(pid):

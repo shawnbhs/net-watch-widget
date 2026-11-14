@@ -2989,9 +2989,22 @@ def _usage_failure(st, raw, hdrs):
     return None
 
 
+# A refreshed legacy credential whose file write failed, keyed by provider:
+# (path, doc). The refresh already killed the token on disk, so this is the
+# only live copy; its write is retried first and nothing refreshes past it.
+_LEGACY_PENDING = {}
+
+
 # ── Claude ────────────────────────────────────────────────────────────────────
 def _claude_token(lead=AI_REFRESH_LEAD):
-    path, doc, why = _pick_cred(
+    # Looked up through globals() so the tests that exec this one function on
+    # its own keep working; in the module this is the dict defined above.
+    pend = globals().setdefault("_LEGACY_PENDING", {})
+    pending = pend.get("claude")
+    if pending and _write_json_atomic(*pending):
+        pend.pop("claude", None)
+        pending = None
+    path, doc, why = pending + (None,) if pending else _pick_cred(
         CLAUDE_CRED_PATHS, lambda d: d.get("claudeAiOauth", {}).get("expiresAt", 0),
         expiry_ms=True)
     if not doc:
@@ -3004,6 +3017,10 @@ def _claude_token(lead=AI_REFRESH_LEAD):
     # passes a large lead so the swap happens well before anything expires.
     if o.get("expiresAt", 0) / 1000.0 - lead > time.time():
         return o.get("accessToken"), None
+    if pending:  # never refresh past an unsaved rotation
+        if o.get("expiresAt", 0) / 1000.0 > time.time():
+            return o.get("accessToken"), None
+        return None, "refreshed credential not saved"
     body = json.dumps({"grant_type": "refresh_token",
                        "refresh_token": o.get("refreshToken"),
                        "client_id": CLAUDE_CLIENT}).encode()
@@ -3016,7 +3033,8 @@ def _claude_token(lead=AI_REFRESH_LEAD):
             o["refreshToken"] = p["refresh_token"]
         if p.get("expires_in"):
             o["expiresAt"] = int(time.time() * 1000 + p["expires_in"] * 1000)
-        _write_json_atomic(path, doc)
+        if not _write_json_atomic(path, doc):
+            pend["claude"] = (path, doc)
         return o["accessToken"], None
     # Only a refusal of the grant itself proves the login is gone. A transport
     # failure (st == 0: no route, DNS, a dropped tunnel) says nothing about the
@@ -3095,9 +3113,16 @@ def fetch_claude_usage():
 
 # ── ChatGPT ───────────────────────────────────────────────────────────────────
 def _codex_token(lead=AI_REFRESH_LEAD):
+    # Looked up through globals() so the tests that exec this one function on
+    # its own keep working; in the module this is the dict defined above.
+    pend = globals().setdefault("_LEGACY_PENDING", {})
+    pending = pend.get("codex")
+    if pending and _write_json_atomic(*pending):
+        pend.pop("codex", None)
+        pending = None
     # Rank copies by access-token expiry, as _newest_cli_cred does; a bigger
     # file is not a fresher login.
-    path, doc, why = _pick_cred(
+    path, doc, why = pending + (None,) if pending else _pick_cred(
         CODEX_CRED_PATHS,
         lambda d: (_prov.cred_expiry("codex", d) or 0) if _prov is not None
         else len(json.dumps(d.get("tokens", {}))))
@@ -3114,11 +3139,16 @@ def _codex_token(lead=AI_REFRESH_LEAD):
         pass
     if exp and exp - lead > time.time():
         return t.get("access_token"), acct, None
+    if pending:  # never refresh past an unsaved rotation
+        if exp and exp > time.time():
+            return t.get("access_token"), acct, None
+        return None, None, "refreshed credential not saved"
     if _prov is not None:
         new, why = _prov.refresh_cred("codex", doc)
         if new:
             new["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
             if not _write_json_atomic(path, new):
+                pend["codex"] = (path, new)
                 return None, None, "refreshed credential not saved"
             return new["tokens"]["access_token"], acct, None
         if exp and exp > time.time():
@@ -3141,6 +3171,7 @@ def _codex_token(lead=AI_REFRESH_LEAD):
             t["id_token"] = p["id_token"]
         doc["last_refresh"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
         if not _write_json_atomic(path, doc):
+            pend["codex"] = (path, doc)
             return None, None, "refreshed credential not saved"
         return t["access_token"], acct, None
     if exp and exp > time.time():
@@ -3241,6 +3272,13 @@ def _vault_keepalive(lead=AI_REFRESH_LEAD):
             continue
         a = _adopt_cli_cred(a)
         cred = a.get("cred")
+        with _unsaved_lock:
+            pending = AI_PENDING.get(a.get("id"))
+        if pending is not None:
+            # An unsaved rotation: retry its save, never refresh past it.
+            if _vault_store_cred(a.get("id"), pending):
+                _cli_write_back(a, cred, pending)
+            continue
         try:
             if _prov.is_unrecoverable(pid, cred):
                 continue
@@ -3785,6 +3823,9 @@ def ai_migrate_once():
 # user has to be told about, so the reason string is carried with the latch.
 AI_UNSAVED = {}
 _unsaved_lock = threading.Lock()
+# The rotated credential itself, per account, while its save keeps failing.
+# Dropping it re-sends the grant the provider already killed. Same lock.
+AI_PENDING = {}
 
 # The fallback reason, used when nothing more specific is known.
 AI_UNSAVED_DEFAULT = "credential not saved"
@@ -3863,8 +3904,10 @@ def _vault_store_cred(aid, cred):
     with _unsaved_lock:
         if ok:
             AI_UNSAVED.pop(aid, None)
+            AI_PENDING.pop(aid, None)
         else:
             AI_UNSAVED[aid] = reason
+            AI_PENDING[aid] = cred
     return ok
 
 
@@ -3972,6 +4015,7 @@ def _adopt_cli_cred(acct):
             return acct
         with _unsaved_lock:
             AI_UNSAVED.pop(acct.get("id"), None)
+            AI_PENDING.pop(acct.get("id"), None)
         out = dict(acct)
         out["cred"] = cli
         return out
@@ -4089,6 +4133,16 @@ def ai_account_poll(acct, lead=AI_REFRESH_LEAD):
         return _acct_row(acct, cred, "error", None, "vault unavailable")
     acct = _adopt_cli_cred(acct)
     cred = acct.get("cred")
+    # Looked up through globals() so the tests that exec this one function on
+    # its own keep working; in the module this is the dict defined above.
+    with _unsaved_lock:
+        pending = globals().setdefault("AI_PENDING", {}).get(acct.get("id"))
+    if pending is not None and _vault_store_cred(acct.get("id"), pending):
+        # An earlier rotation finally reached the vault: use it and do not
+        # refresh again -- the grant it replaced is already dead.
+        _cli_write_back(acct, cred, pending)
+        acct = dict(acct, cred=pending)
+        cred = pending
     with _unsaved_lock:
         unsaved = AI_UNSAVED.get(acct.get("id"))
     if unsaved:
@@ -4797,6 +4851,7 @@ def ai_login_capture(provider, label=None, account_id=None, wait=AI_LOGIN_WAIT):
                 return False, AI_UNSAVED_DEFAULT
             with _unsaved_lock:
                 AI_UNSAVED.pop(account_id, None)
+                AI_PENDING.pop(account_id, None)
             # Only a dead-login hold is lifted; a 429 hold outlives a login.
             aipolicy.clear(aipolicy.key(pid, account_id))
             _AI_DEAD_FP.pop(aipolicy.key(pid, account_id), None)

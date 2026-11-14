@@ -17,6 +17,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from unittest.mock import patch
@@ -129,6 +130,8 @@ class LoginAdd(unittest.TestCase):
             patch.object(sidecar, "_login_gate", lambda w: ""),
             patch.object(sidecar.core, "ai_provider_login_error", lambda p: ""),
             patch.object(sidecar, "emit", lambda kind, **f: emits.append(f)),
+            # No background retry here: LoginSaveRetry covers it.
+            patch.object(sidecar, "_SAVE_RETRY_DELAYS", (), create=True),
         ]
         if not save_ok:
             patches.append(patch.object(aiaccounts, "save", return_value=False))
@@ -152,6 +155,124 @@ class LoginAdd(unittest.TestCase):
         emits, torn = self.run_login(save_ok=True)
         self.assertIn("account added", [e.get("note") for e in emits])
         self.assertEqual(len(torn), 1)
+
+
+class LoginSaveRetry(unittest.TestCase):
+    """A failed save is retried in the background until it lands (or gives up)."""
+
+    def run_login(self, account_id=None, extra=(), done=lambda log: False):
+        log, sleeps = [], []
+
+        def wait_for_cred(sandbox, proc=None, timeout=5):
+            return dict(CRED)
+
+        api = {
+            "supported": ("isolated_login_supported", lambda p: True),
+            "sandbox": ("create_sandbox", lambda p: _Box()),
+            "launch": ("launch_login", lambda p, h: None),
+            "wait": ("wait_for_cred", wait_for_cred),
+            "teardown": ("destroy_sandbox", lambda h: log.append(("teardown",))),
+            "duplicate": ("classify_account", lambda p, c, a: False),
+        }
+        patches = [
+            patch.object(sidecar, "_login_api", lambda: (api, "")),
+            patch.object(sidecar, "_login_gate", lambda w: ""),
+            patch.object(sidecar.core, "ai_provider_login_error", lambda p: ""),
+            patch.object(sidecar, "emit", lambda kind, **f: log.append(("emit", f))),
+            patch.object(sidecar, "_save_retry_sleep", sleeps.append, create=True),
+        ] + list(extra)
+        for p in patches:
+            p.start()
+        try:
+            sidecar.isolated_login("codex", label="t", account_id=account_id)
+            deadline = time.time() + 5
+            while time.time() < deadline and not done(log):
+                time.sleep(0.02)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return log, sleeps
+
+    @staticmethod
+    def notes(log):
+        return [f.get("note") for k, *a in log if k == "emit" for f in a]
+
+    @staticmethod
+    def errs(log):
+        return [f.get("err") or "" for k, *a in log if k == "emit" for f in a]
+
+    def test_add_fails_once_then_retry_saves_and_tears_down(self):
+        fresh_vault()
+        real_save, calls = aiaccounts.save, []
+
+        def flaky(doc):
+            calls.append(1)
+            return False if len(calls) == 1 else real_save(doc)
+
+        log, sleeps = self.run_login(
+            extra=[patch.object(aiaccounts, "save", flaky)],
+            done=lambda log: ("teardown",) in log)
+        self.assertIn("account added", self.notes(log))
+        self.assertEqual(log.count(("teardown",)), 1)
+        self.assertTrue(any("retrying" in e for e in self.errs(log)), self.errs(log))
+        self.assertTrue(sleeps, "retry did not go through the patchable sleep")
+        self.assertEqual(len(aiaccounts.list_accounts()), 1)
+        self.assertFalse(any("FAKE-" in e for e in self.errs(log)))
+
+    def test_reauth_update_false_then_true_tears_down_after_success(self):
+        fresh_vault()
+        acct = aiaccounts.add_account("codex", "old", {"tokens": {
+            "access_token": "FAKE-OLD", "refresh_token": "FAKE-OLD-R",
+            "account_id": "acct-fake-0001"}})
+        results = [False, True]
+        log, sleeps = self.run_login(
+            account_id=acct["id"],
+            extra=[patch.object(sidecar.core._vault, "update_cred",
+                                lambda aid, cred: results.pop(0))],
+            done=lambda log: ("teardown",) in log)
+        notes = self.notes(log)
+        self.assertIn("account re-authenticated", notes)
+        self.assertEqual(results, [], "update_cred not retried")
+        self.assertEqual(log.count(("teardown",)), 1)
+        i_note = next(i for i, x in enumerate(log) if x[0] == "emit"
+                      and x[1].get("note") == "account re-authenticated")
+        self.assertLess(i_note, log.index(("teardown",)),
+                        "sandbox torn down before the credential was saved")
+        self.assertTrue(sleeps)
+
+    def test_refusal_during_retry_stops_and_names_reason(self):
+        fresh_vault()
+        attempts = []
+
+        def add(*a, **k):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise aiaccounts.VaultNotSavedError("credential not saved")
+            raise aiaccounts.VaultVerificationError("refused")
+
+        reason = aiaccounts.refusal_reason(aiaccounts.VaultVerificationError())
+        log, sleeps = self.run_login(
+            extra=[patch.object(sidecar.core._vault, "add_account", add)],
+            done=lambda log: any(reason in e for e in self.errs(log)))
+        self.assertTrue(any(reason in e for e in self.errs(log)), self.errs(log))
+        time.sleep(0.2)
+        self.assertEqual(len(attempts), 2, "a refusal was retried")
+        self.assertNotIn(("teardown",), log)
+        self.assertNotIn("account added", self.notes(log))
+
+    def test_gives_up_after_schedule_and_keeps_sandbox(self):
+        fresh_vault()
+        log, sleeps = self.run_login(
+            extra=[patch.object(aiaccounts, "save", return_value=False),
+                   patch.object(sidecar, "_SAVE_RETRY_DELAYS", (0, 0), create=True)],
+            done=lambda log: any("kept" in e and "retrying" not in e
+                                 for e in self.errs(log)))
+        self.assertEqual(sleeps, [0, 0])
+        self.assertNotIn(("teardown",), log)
+        self.assertNotIn("account added", self.notes(log))
+        final = self.errs(log)[-1]
+        self.assertIn("not saved", final)
+        self.assertIn("kept", final)
 
 
 class RefusalWording(unittest.TestCase):
